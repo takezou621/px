@@ -1,0 +1,18 @@
+# Build artifacts
+/px
+/px-server
+/dist/
+
+# Local state
+*.db
+*.db-wal
+*.db-shm
+
+# Go
+*.test
+*.out
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

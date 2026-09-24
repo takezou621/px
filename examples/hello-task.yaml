@@ -1,0 +1,24 @@
+apiVersion: px.io/v1alpha1
+kind: Workspace
+metadata:
+  name: px-docs
+spec:
+  git:
+    repo: https://github.com/kawai/px.git
+    branch: main
+---
+apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: hello-px
+spec:
+  image: px-runner-debian12   # LXC template built by template/runner/build.sh
+  workspaces:
+    - name: px-docs
+      goal: "Summarize the architecture docs in one paragraph"
+  runner:
+    command: ["bash", "-lc", "echo \"GOAL: $GOAL\" && ls -la"]
+  resources:
+    cores: 1
+    memoryMB: 512
+  ttlSecondsAfterFinished: 600
