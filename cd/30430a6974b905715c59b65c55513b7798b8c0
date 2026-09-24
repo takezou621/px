@@ -1,0 +1,82 @@
+internal/apis/v1alpha1/manifest_test.go
+  s_c2f954a86dc8c5::t_d8aceeeb985f58 43,50-51,53-54,56-57,83-89
+  s_c2f954a86dc8c5::t_8f624c352ca4a0 1-42,44-49,52,55,58-82,90-111
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_232f1f2da0b38a 1-42
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_b938fc316f6bc0 1-217
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_710ed18a943618 1-133
+internal/apis/v1alpha1/types.go
+  s_c2f954a86dc8c5::t_44f3786725192e 1-25,27-73,91-110
+  s_c2f954a86dc8c5::t_41860d09c665d4 26,74-90
+template/runner/build.sh
+  s_c2f954a86dc8c5::t_929b115fdf17b2 1-51
+internal/store/store.go
+  s_c2f954a86dc8c5::t_e177972b51a588 1-142
+LICENSE
+  s_c2f954a86dc8c5::t_b8f1e7812cc108 1-202
+examples/hello-task.yaml
+  s_c2f954a86dc8c5::t_a28ba4f702e5b6 1-24
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_58721ebffb1fc3 1-152
+internal/apis/v1alpha1/manifest.go
+  s_c2f954a86dc8c5::t_f6baf554ef93ed 47,52
+  s_c2f954a86dc8c5::t_7c50e74c9a1213 1-10,21,23,25-36,39-40,96,100,102-103,106-113,116-118
+  s_c2f954a86dc8c5::t_6635ca3758a34e 11-20,22,24,37-38,41-46,48-51,53-95,97-99,101,104-105,114-115
+.gitignore
+  s_c2f954a86dc8c5::t_e9e586fdcd59ba 1-18
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_82ccd8b4d39527 1-3,5-18,23-34,36-44,46-48,50-75,77-88,90-107,109-119,121-124,126-133,136-141
+  s_c2f954a86dc8c5::t_82062498f9c358 125
+  s_c2f954a86dc8c5::t_897b257db1bfd6 4,19-22,35,45,49,76,89,108,120,134-135
+CLAUDE.md
+  s_c2f954a86dc8c5::t_19a7d5e3b8f847 1-30
+go.mod
+  s_c2f954a86dc8c5::t_bbe73887dd812f 1-3
+  s_c2f954a86dc8c5::t_db89e347dbbc0a 4-5
+  s_c2f954a86dc8c5::t_a09cf3f83617b4 6-8
+  s_c2f954a86dc8c5::t_ab9720b0c18af3 9-22
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_e17f7a2ea52c95 1-37,39-52,54-58,62-63,65-209
+  s_c2f954a86dc8c5::t_a8bb83431f01d7 59-61
+  s_c2f954a86dc8c5::t_f223a476e1f932 38,53,64
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_903e88d976e5a1 1-107,109-255
+  s_c2f954a86dc8c5::t_12cacd53a1ced8 108
+README.md
+  s_c2f954a86dc8c5::t_a0332ab6285cb9 1-100
+internal/server/server.go
+  s_c2f954a86dc8c5::t_9a30c3241b5b02 19-22,25-26
+  s_c2f954a86dc8c5::t_da1edb62e10685 1-18,23-24,27-149,151-169
+  s_c2f954a86dc8c5::t_0638a9f5e1ef4c 150
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_027e712aa7cc16 1-208
+internal/sshexec/exec.go
+  s_c2f954a86dc8c5::t_13eba8841ee4eb 1-106,109-131
+  s_c2f954a86dc8c5::t_72e8c8bebe3ec5 107-108
+docs/architecture.md
+  s_c2f954a86dc8c5::t_9a41d6786ecbdb 1-90
+cmd/px-server/main.go
+  s_c2f954a86dc8c5::t_dcb02cc4cf5c90 1-23,32-35,37-47,50-58,60-110
+  s_c2f954a86dc8c5::t_359864b76852c0 24-31,36,48-49
+  s_c2f954a86dc8c5::t_bdc2f56f2e2807 59
+go.sum
+  s_c2f954a86dc8c5::t_e2822cee10ff45 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cd30430a6974b905715c59b65c55513b7798b8c0",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
