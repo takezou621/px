@@ -371,3 +371,48 @@ func (c *Client) FindTemplateVMID(ctx context.Context, name string) (int, error)
 	}
 	return 0, fmt.Errorf("template %q not found on node %s", name, c.node)
 }
+
+// ClusterResource is one row of GET /cluster/resources — the cluster-wide
+// view that feeds multi-node scheduling and legacy vmid→node repair. Field
+// set differs by Type: nodes carry CPU/Mem load and "online" status; guests
+// (lxc/qemu) carry the VMID and the node they live on. Guests never expose
+// `template` when running, so missing keys decode as zero values by design.
+type ClusterResource struct {
+	Type     string  `json:"type"` // "node", "lxc" or "qemu"
+	Node     string  `json:"node"`
+	Status   string  `json:"status"` // node: "online" | "offline"; guest: "running" | "stopped"
+	VMID     int     `json:"vmid"`
+	Name     string  `json:"name"`
+	Template int     `json:"template"`
+	CPU      float64 `json:"cpu"` // load fraction 0..1
+	MaxCPU   int     `json:"maxcpu"`
+	Mem      float64 `json:"mem"`
+	MaxMem   float64 `json:"maxmem"`
+}
+
+// ClusterResources returns the cluster-wide resource view. One endpoint
+// serves every node: the PVE API proxies cross-node requests, which is what
+// lets one px-server token and endpoint reach the whole cluster.
+func (c *Client) ClusterResources(ctx context.Context) ([]ClusterResource, error) {
+	var list []ClusterResource
+	err := c.do(ctx, http.MethodGet, "/cluster/resources", nil, &list)
+	return list, err
+}
+
+// ContainerPID returns the container's init process PID on the node host —
+// the anchor for node-level cgroup operations (freeze/thaw), which must not
+// go through pct exec: a frozen cgroup blocks every process spawned into it,
+// including the one pct exec would use to inspect the freeze.
+func (c *Client) ContainerPID(ctx context.Context, vmid int) (int, error) {
+	var st struct {
+		Status string `json:"status"`
+		PID    int    `json:"pid"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/lxc/%d/status/current", c.node, vmid), nil, &st); err != nil {
+		return 0, err
+	}
+	if st.Status != "running" || st.PID == 0 {
+		return 0, fmt.Errorf("container %d on node %s is %s (pid %d)", vmid, c.node, st.Status, st.PID)
+	}
+	return st.PID, nil
+}

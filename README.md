@@ -86,6 +86,9 @@ fix-bug-123 Running -> Succeeded
 $ px logs -f fix-bug-123
 
 $ px exec fix-bug-123 -- ps aux     # peek into the live sandbox
+
+$ px suspend fix-bug-123            # freeze the container (cgroup v2)
+$ px resume fix-bug-123             # unfreeze it
 ```
 
 ## Quick start (target)
@@ -98,6 +101,11 @@ $ px-server \
     --pve-node pve1
 $ px apply -f examples/hello-task.yaml
 ```
+
+Omit `--pve-node` to run against a whole PVE cluster: tasks schedule
+onto whichever online node holds the image and has the most free
+memory (`--ssh-host-override "node1=10.0.0.1,node2=10.0.0.2"` maps
+PVE node names to SSH hosts, since node names are not DNS names).
 
 ## Status
 

@@ -37,6 +37,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/tasks/{name}", s.handleDeleteTask)
 	mux.HandleFunc("GET /v1/tasks/{name}/logs", s.handleTaskLogs)
 	mux.HandleFunc("POST /v1/tasks/{name}/exec", s.handleTaskExec)
+	mux.HandleFunc("POST /v1/tasks/{name}/suspend", s.handleTaskSuspend)
+	mux.HandleFunc("POST /v1/tasks/{name}/resume", s.handleTaskResume)
 	mux.HandleFunc("GET /v1/workspaces", s.handleListWorkspaces)
 	mux.HandleFunc("GET /v1/workspaces/{name}", s.handleGetWorkspace)
 	mux.HandleFunc("GET /v1/models", s.handleListModels)
@@ -199,6 +201,89 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleting"})
 }
 
+// handleTaskSuspend accepts a suspend request: like delete, the API only
+// flips the persisted phase (Suspending); reconcile does the freeze on its
+// next tick. Running is the only phase that starts a freeze — the already
+// suspended phases answer idempotently, and everything else (nothing to
+// freeze, a freeze already in flight the other way, or finished) is refused
+// rather than guessed about.
+func (s *Server) handleTaskSuspend(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	t, err := s.store.GetTask(name)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if t.Status.DeletionTimestamp != nil {
+		httpError(w, http.StatusConflict, "task %s is being deleted", name)
+		return
+	}
+	switch t.Status.Phase {
+	case v1alpha1.TaskRunning:
+		if err := s.ctl.RequestSuspend(name, t.Status.Phase); err != nil {
+			if errors.Is(err, store.ErrPhaseConflict) {
+				// Reconcile moved the task (typically to a terminal phase)
+				// between the read above and the mark; the caller's decision
+				// was made on stale state, so surface it instead of pretending
+				// the suspend was recorded.
+				httpError(w, http.StatusConflict, "task %s changed state before the suspend was recorded — retry", name)
+				return
+			}
+			httpError(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "suspending"})
+	case v1alpha1.TaskSuspending, v1alpha1.TaskSuspended:
+		// Already freezing or frozen; a repeat suspend is a no-op.
+		writeJSON(w, http.StatusOK, map[string]string{"status": string(t.Status.Phase)})
+	default:
+		httpError(w, http.StatusConflict, "task %s is in phase %s — only a running task can suspend", name, t.Status.Phase)
+	}
+}
+
+// handleTaskResume accepts a resume request: Suspended flips to Resuming and
+// reconcile thaws on its next tick. A running task (or one already resuming)
+// answers idempotently — resume is a convergence request, not a toggle —
+// while Suspending is refused: a freeze is in flight and thawing under it
+// would race the reconciler.
+func (s *Server) handleTaskResume(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	t, err := s.store.GetTask(name)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if t.Status.DeletionTimestamp != nil {
+		httpError(w, http.StatusConflict, "task %s is being deleted", name)
+		return
+	}
+	switch t.Status.Phase {
+	case v1alpha1.TaskSuspended:
+		if err := s.ctl.RequestResume(name, t.Status.Phase); err != nil {
+			if errors.Is(err, store.ErrPhaseConflict) {
+				httpError(w, http.StatusConflict, "task %s changed state before the resume was recorded — retry", name)
+				return
+			}
+			httpError(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "resuming"})
+	case v1alpha1.TaskRunning, v1alpha1.TaskResuming:
+		// Already thawed or thawing; a repeat resume is a no-op.
+		writeJSON(w, http.StatusOK, map[string]string{"status": string(t.Status.Phase)})
+	default:
+		httpError(w, http.StatusConflict, "task %s is in phase %s — only a suspended task can resume", name, t.Status.Phase)
+	}
+}
+
 func (s *Server) handleTaskLogs(w http.ResponseWriter, r *http.Request) {
 	t, err := s.store.GetTask(r.PathValue("name"))
 	if errors.Is(err, store.ErrNotFound) {
@@ -213,7 +298,16 @@ func (s *Server) handleTaskLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "(container gone; task already cleaned up)\n", http.StatusOK)
 		return
 	}
-	logs, err := s.prov.Logs(r.Context(), t.Status.Container)
+	switch t.Status.Phase {
+	case v1alpha1.TaskSuspending, v1alpha1.TaskSuspended, v1alpha1.TaskResuming:
+		// Logs ride pct exec, which blocks inside a frozen cgroup until
+		// thaw — same reason exec refuses these phases. In Suspending and
+		// Resuming the container may or may not still be frozen, so refuse
+		// all three rather than hang until the exec timeout.
+		httpError(w, http.StatusConflict, "task %s is %s — logs are unavailable while suspended (resume first)", t.Metadata.Name, t.Status.Phase)
+		return
+	}
+	logs, err := s.prov.Logs(r.Context(), t.Status.Node, t.Status.Container)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, "fetch logs: %v", err)
 		return
@@ -232,10 +326,12 @@ const (
 )
 
 // execReady reports whether the task state names a live sandbox exec can use.
-// Checked twice per request: once on entry, once just before dispatch — the
-// body read is a window in which the task can be deleted.
+// An empty node means the record predates multi-node and reconcile has not
+// repaired it yet — dispatch would need a node it cannot name. Checked twice
+// per request: once on entry, once just before dispatch — the body read is a
+// window in which the task can be deleted.
 func execReady(t *v1alpha1.Task) bool {
-	return t.Status.Phase == v1alpha1.TaskRunning && t.Status.Container != 0 && t.Status.DeletionTimestamp == nil
+	return t.Status.Phase == v1alpha1.TaskRunning && t.Status.Container != 0 && t.Status.Node != "" && t.Status.DeletionTimestamp == nil
 }
 
 func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
@@ -321,7 +417,7 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, "task %s is not running (phase %s) — exec needs a live sandbox", t.Metadata.Name, t.Status.Phase)
 		return
 	}
-	owned, err := s.prov.Owned(r.Context(), name, t.Status.Container)
+	owned, err := s.prov.Owned(r.Context(), name, t.Status.Node, t.Status.Container)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, "check ownership of ct %d: %v", t.Status.Container, err)
 		return
@@ -330,7 +426,7 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusConflict, "container %d no longer belongs to task %s — refusing to exec", t.Status.Container, name)
 		return
 	}
-	res, err := s.prov.Exec(r.Context(), t.Status.Container, req.Command)
+	res, err := s.prov.Exec(r.Context(), t.Status.Node, t.Status.Container, req.Command)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, "exec: %v", err)
 		return

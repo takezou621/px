@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,7 +22,17 @@ import (
 // foreign one.
 var ErrNotOwned = errors.New("container is not owned by the task")
 
-// Provisioner drives one Task's sandbox through its lifecycle.
+// ErrGuestGone reports that no guest with a given VMID exists anywhere in
+// the cluster — the container a record still names was removed out of band
+// (manual pct destroy, node reinstall). The controller fails such a task
+// instead of wedging on a node it can never determine.
+var ErrGuestGone = errors.New("no guest with that VMID exists in the cluster")
+
+// Provisioner drives one Task's sandbox through its lifecycle. node is the
+// PVE cluster node the container lives on: single-node deployments always
+// pass their configured node, cluster mode the node Schedule picked. px
+// reaches every node through one API endpoint (PVE proxies cross-node
+// requests) and one SSH pool (one connection per node, dialed lazily).
 type Provisioner interface {
 	// Allocate returns a free VMID before any node-side work, so the task
 	// record names the container from the first moment: a crash mid-provision
@@ -29,57 +40,249 @@ type Provisioner interface {
 	// is a suggestion, not a reservation — see the controller's handling of a
 	// failed Create.
 	Allocate(ctx context.Context) (int, error)
-	// Create clones the template into vmid, starts the container and boots
-	// the runner. mounts are workspace repos cloned into the container before
-	// the runner starts; model, when non-nil, carries provider credentials
-	// the runner gets as environment variables; gw, when non-nil, puts the
-	// container behind an egress allowlist (LXC firewall, default-deny out).
-	// On failure it destroys any partial work, so the vmid no longer names a
-	// container of ours.
-	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error
+	// Schedule picks the node a new task's container clones onto. In cluster
+	// mode (no fixed node) candidates are the nodes that are online AND hold
+	// the task's image as an LXC template — restricting to template-holding
+	// nodes sidesteps cross-node cloning, whose endpoint cannot name a target
+	// storage; among them the one with the most free memory wins, tie-broken
+	// by lower CPU load, then by name, so the choice is deterministic.
+	// Single-node mode returns its fixed node without cluster calls.
+	Schedule(ctx context.Context, image string) (string, error)
+	// NodeOf reports which cluster node currently hosts the guest with the
+	// given VMID — the repair path for records persisted before Status.Node
+	// existed. A VMID that names no guest returns an error wrapping
+	// ErrGuestGone.
+	NodeOf(ctx context.Context, vmid int) (string, error)
+	// Create clones the template into vmid on node, starts the container and
+	// boots the runner. mounts are workspace repos cloned into the container
+	// before the runner starts; model, when non-nil, carries provider
+	// credentials the runner gets as environment variables; gw, when non-nil,
+	// puts the container behind an egress allowlist (LXC firewall,
+	// default-deny out). On failure it destroys any partial work, so the vmid
+	// no longer names a container of ours.
+	Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error
 	// Booted reports whether the container's boot script reached the runner
 	// spawn step and touched its marker (/run/px/booted) — see runnerScript
 	// for why the marker sits after the spawn. A provision interrupted by a
 	// restart leaves either a live runner (marker present — adopt the task)
 	// or a partial clone without a runner (marker absent — clean up).
-	Booted(ctx context.Context, vmid int) (bool, error)
+	Booted(ctx context.Context, node string, vmid int) (bool, error)
 	// Exit polls the runner's exit code; nil means still running.
 	// A non-nil error means the probe itself failed (e.g. container gone).
-	Exit(ctx context.Context, vmid int) (*int, error)
+	Exit(ctx context.Context, node string, vmid int) (*int, error)
 	// Running reports whether the task container is still up.
-	Running(ctx context.Context, vmid int) (bool, error)
+	Running(ctx context.Context, node string, vmid int) (bool, error)
 	// Logs returns the runner's combined output so far.
-	Logs(ctx context.Context, vmid int) (string, error)
+	Logs(ctx context.Context, node string, vmid int) (string, error)
 	// Exec runs one command in the task's container and returns its output
 	// and exit code. A non-zero exit is a result, not an error.
-	Exec(ctx context.Context, vmid int, argv []string) (*ExecResult, error)
+	Exec(ctx context.Context, node string, vmid int, argv []string) (*ExecResult, error)
 	// Destroy stops and deletes the container.
-	Destroy(ctx context.Context, vmid int) error
+	Destroy(ctx context.Context, node string, vmid int) error
 	// DestroyOwned stops and deletes the task container, but only after
 	// verifying by hostname that the VMID really names this task's sandbox —
 	// PVE's nextid is a suggestion, not a reservation, so a VMID px lost
 	// track of (crash between persist and Create) may have been reused by
 	// someone else. A mismatch returns an error wrapping ErrNotOwned.
-	DestroyOwned(ctx context.Context, taskName string, vmid int) error
+	DestroyOwned(ctx context.Context, taskName, node string, vmid int) error
 	// Owned reports whether the VMID names the task's own sandbox, by
 	// hostname — same check as DestroyOwned, without destroying. A container
 	// that does not exist is reported as not owned (false, nil).
-	Owned(ctx context.Context, taskName string, vmid int) (bool, error)
+	Owned(ctx context.Context, taskName, node string, vmid int) (bool, error)
+	// Frozen reports whether the container's cgroup is currently frozen.
+	// It goes through the node host (API pid → /proc/<pid>/cgroup), never
+	// pct exec: a frozen cgroup blocks every process spawned into it,
+	// including the one pct exec would use to inspect the freeze.
+	Frozen(ctx context.Context, node string, vmid int) (bool, error)
+	// Freeze freezes the container's cgroup (echo 1 into cgroup.freeze),
+	// the memory-resident pause suspend/resume is built on. The write is
+	// synchronous; the caller verifies with Frozen on a later tick.
+	Freeze(ctx context.Context, node string, vmid int) error
+	// Thaw lifts a Freeze (echo 0).
+	Thaw(ctx context.Context, node string, vmid int) error
 }
 
 type provisioner struct {
+	// pve is the cluster-wide client (NextID, ClusterResources) — calls whose
+	// path is /cluster/* and node-independent.
 	pve *proxmox.Client
-	ssh *sshexec.Executor
+	// nodePVE yields the API client for one node. Every client shares the
+	// endpoint and token (PVE proxies cross-node requests); the factory
+	// exists so node-scoped paths (/nodes/<node>/...) always name the node
+	// the container actually lives on. Single-node mode and tests wrap one
+	// fixed client — see fixedNodePVE.
+	nodePVE func(node string) *proxmox.Client
+	// ssh is the per-node command channel, dialed lazily: in cluster mode a
+	// node no task ever lands on is never SSH'd.
+	ssh *sshexec.Pool
+	// fixedNode is set in single-node mode (-pve-node): Schedule returns it
+	// untouched and no cluster discovery runs.
+	fixedNode string
 	// egressGate runs between start and boot for gateway tasks; nil falls
 	// back to waitForEgressEnforcement. Tests stub it to keep the flow
 	// deterministic without a live node.
-	egressGate func(ctx context.Context, vmid int) error
+	egressGate func(ctx context.Context, node string, vmid int) error
 }
 
-func NewProvisioner(pve *proxmox.Client, ssh *sshexec.Executor) Provisioner {
-	p := &provisioner{pve: pve, ssh: ssh}
+func NewProvisioner(pve *proxmox.Client, nodePVE func(string) *proxmox.Client, ssh *sshexec.Pool, fixedNode string) Provisioner {
+	p := &provisioner{pve: pve, nodePVE: nodePVE, ssh: ssh, fixedNode: fixedNode}
 	p.egressGate = p.waitForEgressEnforcement
 	return p
+}
+
+// fixedNodePVE wraps one client as the per-node factory — what single-node
+// deployments and tests use.
+func fixedNodePVE(c *proxmox.Client) func(string) *proxmox.Client {
+	return func(string) *proxmox.Client { return c }
+}
+
+// nodeSSH runs one command on the given node, dialing that node's executor
+// on first use.
+func (p *provisioner) nodeSSH(node, cmd string, timeout time.Duration) (string, int, error) {
+	e, err := p.ssh.Executor(node)
+	if err != nil {
+		return "", -1, err
+	}
+	return e.Run(cmd, timeout)
+}
+
+// cgroupOpTimeout bounds one node-level cgroup probe or write: a single SSH
+// round trip, no container work involved.
+const cgroupOpTimeout = 15 * time.Second
+
+// Schedule picks the node a new task's container clones onto — see the
+// interface comment for the scoring.
+func (p *provisioner) Schedule(ctx context.Context, image string) (string, error) {
+	if p.fixedNode != "" {
+		return p.fixedNode, nil
+	}
+	res, err := p.pve.ClusterResources(ctx)
+	if err != nil {
+		return "", fmt.Errorf("cluster resources: %w", err)
+	}
+	type candidate struct {
+		node string
+		free float64 // MaxMem-Mem on the node row
+		cpu  float64
+	}
+	online := map[string]candidate{}
+	var tmplNodes []string
+	for _, r := range res {
+		switch {
+		case r.Type == "node" && r.Status == "online":
+			online[r.Node] = candidate{node: r.Node, free: r.MaxMem - r.Mem, cpu: r.CPU}
+		case r.Type == "lxc" && r.Template == 1 && r.Name == image:
+			tmplNodes = append(tmplNodes, r.Node)
+		}
+	}
+	var scored []candidate
+	for _, node := range tmplNodes {
+		c, ok := online[node]
+		if !ok {
+			continue
+		}
+		scored = append(scored, c)
+	}
+	if len(scored) == 0 {
+		return "", fmt.Errorf("no online node holds template %q (check spec.image and the template's storage)", image)
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].free != scored[j].free {
+			return scored[i].free > scored[j].free
+		}
+		if scored[i].cpu != scored[j].cpu {
+			return scored[i].cpu < scored[j].cpu
+		}
+		return scored[i].node < scored[j].node
+	})
+	return scored[0].node, nil
+}
+
+// NodeOf reports which node hosts a guest — the repair path for records
+// persisted before Status.Node existed.
+func (p *provisioner) NodeOf(ctx context.Context, vmid int) (string, error) {
+	res, err := p.pve.ClusterResources(ctx)
+	if err != nil {
+		return "", fmt.Errorf("cluster resources: %w", err)
+	}
+	for _, r := range res {
+		if r.VMID == vmid && (r.Type == "lxc" || r.Type == "qemu") {
+			return r.Node, nil
+		}
+	}
+	return "", fmt.Errorf("vmid %d: %w", vmid, ErrGuestGone)
+}
+
+// setFrozen writes 1/0 into the container's cgroup.freeze, via the node
+// host: API pid → /proc/<pid>/cgroup → the init's unified cgroup →
+// cgroup.freeze. Freezing the init's cgroup stops every process in the
+// container, they are all its descendants. The write is synchronous; the
+// controller verifies with Frozen on a later tick rather than here, so a
+// crashed write is just retried state, not a lost one.
+func (p *provisioner) setFrozen(ctx context.Context, node string, vmid int, freeze bool) error {
+	pid, err := p.nodePVE(node).ContainerPID(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	want := "0"
+	if freeze {
+		want = "1"
+	}
+	out, code, err := p.nodeSSH(node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
+[ -n "$p" ] || { echo PX_NO_CGROUP; exit 1; }
+echo %s > "/sys/fs/cgroup$p/cgroup.freeze"`, pid, want), cgroupOpTimeout)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, "PX_NO_CGROUP") {
+		return fmt.Errorf("ct %d: init pid %d has no unified cgroup", vmid, pid)
+	}
+	if code != 0 {
+		return fmt.Errorf("write cgroup.freeze=%s on node %s: exit=%d out=%q", want, node, code, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+func (p *provisioner) Freeze(ctx context.Context, node string, vmid int) error {
+	return p.setFrozen(ctx, node, vmid, true)
+}
+
+func (p *provisioner) Thaw(ctx context.Context, node string, vmid int) error {
+	return p.setFrozen(ctx, node, vmid, false)
+}
+
+func (p *provisioner) Frozen(ctx context.Context, node string, vmid int) (bool, error) {
+	pid, err := p.nodePVE(node).ContainerPID(ctx, vmid)
+	if err != nil {
+		return false, err
+	}
+	out, code, err := p.nodeSSH(node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
+[ -n "$p" ] || { echo PX_NO_CGROUP; exit 1; }
+[ -r "/sys/fs/cgroup$p/cgroup.events" ] || { echo PX_NO_EVENTS; exit 1; }
+grep -qx 'frozen 1' "/sys/fs/cgroup$p/cgroup.events" && echo PX_FROZEN=1 || echo PX_FROZEN=0`, pid), cgroupOpTimeout)
+	if err != nil {
+		return false, err
+	}
+	if strings.Contains(out, "PX_NO_CGROUP") {
+		return false, fmt.Errorf("ct %d: init pid %d has no unified cgroup", vmid, pid)
+	}
+	if strings.Contains(out, "PX_NO_EVENTS") {
+		// An unreadable cgroup.events must not read as "not frozen": that
+		// would confirm a Resuming task while the cgroup may still be frozen,
+		// and the next pct exec would hang inside the freezer.
+		return false, fmt.Errorf("ct %d: cgroup.events unreadable (cgroup path %q)", vmid, strings.TrimSpace(out))
+	}
+	if code != 0 {
+		return false, fmt.Errorf("freeze probe on node %s: exit=%d out=%q", node, code, strings.TrimSpace(out))
+	}
+	switch {
+	case strings.Contains(out, "PX_FROZEN=1"):
+		return true, nil
+	case strings.Contains(out, "PX_FROZEN=0"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("freeze probe: unexpected output %q", strings.TrimSpace(out))
+	}
 }
 
 // ResolvedWorkspace is a task workspace reference resolved against the
@@ -242,12 +445,13 @@ func (p *provisioner) Allocate(ctx context.Context) (int, error) {
 	return p.pve.NextID(ctx)
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
-	templateVMID, err := p.pve.FindTemplateVMID(ctx, t.Spec.Image)
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
+	pve := p.nodePVE(node)
+	templateVMID, err := pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
 		return fmt.Errorf("find template: %w", err)
 	}
-	if err := p.pve.CloneContainer(ctx, templateVMID, vmid, "px-"+t.Metadata.Name); err != nil {
+	if err := pve.CloneContainer(ctx, templateVMID, vmid, "px-"+t.Metadata.Name); err != nil {
 		return fmt.Errorf("clone: %w", err)
 	}
 	// The sandbox contract is an unprivileged uid mapping, but the clone
@@ -255,30 +459,30 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 	// inherits the flag from the template. Verify the inheritance so a
 	// privileged template fails the provision instead of shipping a
 	// sandbox the threat model does not cover.
-	unpriv, err := p.pve.ContainerUnprivileged(ctx, vmid)
+	unpriv, err := pve.ContainerUnprivileged(ctx, vmid)
 	if err != nil {
-		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return fmt.Errorf("read container config: %w", err)
 	}
 	if !unpriv {
-		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return fmt.Errorf("template %q produced a privileged container; rebuild it with --unprivileged 1 (see docs/threat-model.md)", t.Spec.Image)
 	}
 	// Apply resource limits post-clone (clone inherits template resources).
-	if err := p.applyResources(ctx, vmid, t); err != nil {
-		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+	if err := p.applyResources(ctx, node, vmid, t); err != nil {
+		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return err
 	}
 	// The egress policy must be in place before the container starts — a
 	// sandbox that boots wide open even for a second is not deny-by-default.
 	if gw != nil {
-		if err := p.applyEgressPolicy(ctx, vmid, gw); err != nil {
-			_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		if err := p.applyEgressPolicy(ctx, node, vmid, gw); err != nil {
+			_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 			return fmt.Errorf("apply egress policy %q: %w", gw.Name, err)
 		}
 	}
-	if err := p.pve.StartContainer(ctx, vmid); err != nil {
-		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+	if err := pve.StartContainer(ctx, vmid); err != nil {
+		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return fmt.Errorf("start: %w", err)
 	}
 	// The .fw config is in pmxcfs before start, but pve-firewall programs
@@ -290,17 +494,17 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 		if gate == nil {
 			gate = p.waitForEgressEnforcement
 		}
-		if err := gate(ctx, vmid); err != nil {
-			_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		if err := gate(ctx, node, vmid); err != nil {
+			_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 			return fmt.Errorf("wait for egress enforcement: %w", err)
 		}
 	}
 	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
 	// top of the plain boot, so give each workspace its own 30s budget.
 	bootTimeout := 60*time.Second + time.Duration(len(mounts))*30*time.Second
-	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts, model)), bootTimeout)
+	out, code, err := p.nodeSSH(node, bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts, model)), bootTimeout)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
-		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
 	}
 	return nil
@@ -312,15 +516,16 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 // (enable + policy_out=DROP), then the implicit DNS/DHCP allows and one
 // ACCEPT rule per spec rule. The container is still stopped, so no
 // hot-apply ordering concerns.
-func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *ResolvedGateway) error {
-	enabled, err := p.pve.ClusterFirewallEnabled(ctx)
+func (p *provisioner) applyEgressPolicy(ctx context.Context, node string, vmid int, gw *ResolvedGateway) error {
+	pve := p.nodePVE(node)
+	enabled, err := pve.ClusterFirewallEnabled(ctx)
 	if err != nil {
 		return fmt.Errorf("check cluster firewall: %w", err)
 	}
 	if !enabled {
 		return fmt.Errorf("cluster firewall is disabled — guest egress rules are inert without it; enable it first (Datacenter > Firewall > Options, or: pvesh set /cluster/firewall/options -enable 1)")
 	}
-	net0, err := p.pve.ContainerNet0(ctx, vmid)
+	net0, err := pve.ContainerNet0(ctx, vmid)
 	if err != nil {
 		return fmt.Errorf("read net0: %w", err)
 	}
@@ -328,10 +533,10 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 	if err != nil {
 		return err
 	}
-	if err := p.pve.EnableFirewall(ctx, vmid, net0); err != nil {
+	if err := pve.EnableFirewall(ctx, vmid, net0); err != nil {
 		return fmt.Errorf("enable firewall: %w", err)
 	}
-	if err := p.pve.SetEgressDropPolicy(ctx, vmid); err != nil {
+	if err := pve.SetEgressDropPolicy(ctx, vmid); err != nil {
 		return fmt.Errorf("set egress drop policy: %w", err)
 	}
 	// Name resolution and the DHCP lease must survive the firewall: nearly
@@ -342,7 +547,7 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 		{Proto: "udp", Dport: "67", Comment: "px: dhcp"},
 	}
 	for _, r := range implicit {
-		if err := p.pve.AddFirewallRule(ctx, vmid, r); err != nil {
+		if err := pve.AddFirewallRule(ctx, vmid, r); err != nil {
 			return fmt.Errorf("add %s/%s rule: %w", r.Proto, r.Dport, err)
 		}
 	}
@@ -353,7 +558,7 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 			Dport:   r.Ports,
 			Comment: "px: gateway " + gw.Name,
 		}
-		if err := p.pve.AddFirewallRule(ctx, vmid, fr); err != nil {
+		if err := pve.AddFirewallRule(ctx, vmid, fr); err != nil {
 			return fmt.Errorf("add egress rule for %s: %w", r.CIDR, err)
 		}
 	}
@@ -369,13 +574,13 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 // on the v4 chain alone could still talk over IPv6 in the gap. The v6 chain
 // is generated unconditionally (v6 routing is not needed for it to exist),
 // so this never wedges on a v4-only node.
-func (p *provisioner) waitForEgressEnforcement(ctx context.Context, vmid int) error {
+func (p *provisioner) waitForEgressEnforcement(ctx context.Context, node string, vmid int) error {
 	chain := fmt.Sprintf(":veth%di0-OUT", vmid)
 	probe := fmt.Sprintf("iptables-save | grep -qF %s && ip6tables-save | grep -qF %s",
 		shellQuote(chain), shellQuote(chain))
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		_, code, err := p.ssh.Run(probe, 10*time.Second)
+		_, code, err := p.nodeSSH(node, probe, 10*time.Second)
 		if err == nil && code == 0 {
 			return nil
 		}
@@ -412,7 +617,7 @@ func net0WithFirewall(net0 string) (string, error) {
 	return strings.Join(parts, ","), nil
 }
 
-func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.Task) error {
+func (p *provisioner) applyResources(ctx context.Context, node string, vmid int, t *v1alpha1.Task) error {
 	var parts []string
 	if t.Spec.Resources.Cores > 0 {
 		parts = append(parts, fmt.Sprintf("--cores %d", t.Spec.Resources.Cores))
@@ -423,7 +628,7 @@ func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.
 	if len(parts) == 0 {
 		return nil
 	}
-	out, code, err := p.ssh.Run(fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
+	out, code, err := p.nodeSSH(node, fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -433,8 +638,8 @@ func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.
 	return nil
 }
 
-func (p *provisioner) Exit(ctx context.Context, vmid int) (*int, error) {
-	out, code, err := p.ssh.Run(
+func (p *provisioner) Exit(ctx context.Context, node string, vmid int) (*int, error) {
+	out, code, err := p.nodeSSH(node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("cat /run/px/exit 2>/dev/null || echo __RUNNING__")),
 		30*time.Second)
 	if err != nil {
@@ -457,19 +662,19 @@ func (p *provisioner) Exit(ctx context.Context, vmid int) (*int, error) {
 }
 
 // Running reports whether the task container is still up.
-func (p *provisioner) Running(ctx context.Context, vmid int) (bool, error) {
-	return p.pve.ContainerRunning(ctx, vmid)
+func (p *provisioner) Running(ctx context.Context, node string, vmid int) (bool, error) {
+	return p.nodePVE(node).ContainerRunning(ctx, vmid)
 }
 
 // Booted checks for the marker the boot script touches right after it spawns
 // the runner (see runnerScript).
-func (p *provisioner) Booted(ctx context.Context, vmid int) (bool, error) {
+func (p *provisioner) Booted(ctx context.Context, node string, vmid int) (bool, error) {
 	// The probe prints test's exit status, so a successful exec is
 	// distinguishable from pct exec itself failing — a live container whose
 	// clone step died prints "no" and is cleaned up, while a transient pct
 	// failure on a live container must not be read as "unbooted" (that would
 	// destroy a runner that may be mid-boot).
-	out, code, err := p.ssh.Run(
+	out, code, err := p.nodeSSH(node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("test -f /run/px/booted; echo PX_PROBE:$?")),
 		30*time.Second)
 	if err != nil {
@@ -483,7 +688,7 @@ func (p *provisioner) Booted(ctx context.Context, vmid int) (bool, error) {
 	// on a live container (retry next tick rather than destroy). A container
 	// that is gone entirely counts as unbooted too, so recovery of a record
 	// whose clone was already destroyed does not wedge.
-	running, rerr := p.pve.ContainerRunning(ctx, vmid)
+	running, rerr := p.nodePVE(node).ContainerRunning(ctx, vmid)
 	if rerr != nil {
 		if proxmox.IsNotFound(rerr) {
 			return false, nil
@@ -507,8 +712,8 @@ func probeVerdict(out string) (bool, error) {
 	return strings.TrimSpace(out[i+len("PX_PROBE:"):]) == "0", nil
 }
 
-func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {
-	out, _, err := p.ssh.Run(
+func (p *provisioner) Logs(ctx context.Context, node string, vmid int) (string, error) {
+	out, _, err := p.nodeSSH(node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("cat /run/px/task.log 2>/dev/null || echo '(no log yet)'")),
 		30*time.Second)
 	return out, err
@@ -533,15 +738,19 @@ type ExecResult struct {
 	Truncated bool
 }
 
-func (p *provisioner) Exec(ctx context.Context, vmid int, argv []string) (*ExecResult, error) {
+func (p *provisioner) Exec(ctx context.Context, node string, vmid int, argv []string) (*ExecResult, error) {
 	// max must be set explicitly: the zero value (0) would drop every byte.
 	stdout := &cappedWriter{max: maxExecStreamBytes}
 	stderr := &cappedWriter{max: maxExecStreamBytes}
+	e, err := p.ssh.Executor(node)
+	if err != nil {
+		return nil, err
+	}
 	// RunStreamsOnce, never a retrying path: a retry would re-run a command
 	// that may have already started (repeating its side effects) and splice
 	// the first attempt's partial output into the result. A failed exec is
 	// final — the user re-runs it.
-	code, err := p.ssh.RunStreamsOnce(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
+	code, err := e.RunStreamsOnce(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -593,16 +802,17 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 
 func (w *cappedWriter) String() string { return w.buf.String() }
 
-func (p *provisioner) Destroy(ctx context.Context, vmid int) error {
-	_ = p.pve.StopContainer(ctx, vmid)
-	return p.pve.DestroyContainer(ctx, vmid)
+func (p *provisioner) Destroy(ctx context.Context, node string, vmid int) error {
+	pve := p.nodePVE(node)
+	_ = pve.StopContainer(ctx, vmid)
+	return pve.DestroyContainer(ctx, vmid)
 }
 
 // DestroyOwned verifies the container's hostname before destroying — see the
 // interface comment for why. A container that does not exist counts as
 // already destroyed, so deletes stay idempotent.
-func (p *provisioner) DestroyOwned(ctx context.Context, taskName string, vmid int) error {
-	host, err := p.pve.ContainerHostname(ctx, vmid)
+func (p *provisioner) DestroyOwned(ctx context.Context, taskName, node string, vmid int) error {
+	host, err := p.nodePVE(node).ContainerHostname(ctx, vmid)
 	if err != nil {
 		if proxmox.IsNotFound(err) {
 			return nil
@@ -612,14 +822,14 @@ func (p *provisioner) DestroyOwned(ctx context.Context, taskName string, vmid in
 	if host != "px-"+taskName {
 		return fmt.Errorf("%w: ct %d hostname %q is not %q", ErrNotOwned, vmid, host, "px-"+taskName)
 	}
-	return p.Destroy(ctx, vmid)
+	return p.Destroy(ctx, node, vmid)
 }
 
 // Owned reports whether the VMID names the task's own sandbox, by hostname —
 // the adoption check for interrupted provisioning, which must not adopt a
 // reused VMID just because it happens to carry a boot marker.
-func (p *provisioner) Owned(ctx context.Context, taskName string, vmid int) (bool, error) {
-	host, err := p.pve.ContainerHostname(ctx, vmid)
+func (p *provisioner) Owned(ctx context.Context, taskName, node string, vmid int) (bool, error) {
+	host, err := p.nodePVE(node).ContainerHostname(ctx, vmid)
 	if err != nil {
 		if proxmox.IsNotFound(err) {
 			return false, nil

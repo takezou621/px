@@ -57,6 +57,30 @@ On startup px-server dials the PVE API and the node SSH once and fails
 fast if either is unreachable; it then serves the (unauthenticated,
 loopback-bound) REST API and runs the reconcile loop.
 
+### Cluster mode
+
+Leave `-pve-node` unset and px-server schedules each new task onto a
+cluster node instead of pinning one: candidates are nodes that are
+online AND hold the task's `spec.image` as an LXC template (from one
+`GET /cluster/resources`), and the pick is most free memory, tie-broken
+by lower CPU load then node name. Every node is reached through the
+same API endpoint (PVE proxies cross-node requests) and one SSH
+connection per node, dialed lazily — a node no task ever lands on is
+never SSH'd.
+
+PVE node names are not DNS names, so map each node to its SSH host:
+
+```sh
+unset PX_PVE_NODE
+go run ./cmd/px-server -tls-insecure \
+  -ssh-host-override "third=192.168.2.100,second=192.168.2.183"
+```
+
+Host key pinning stays per host in cluster mode: a pin-file line in
+known_hosts format (`host key...`) pins only that host, while an
+authorized_keys-format line (no hostname field) pins every host px
+dials, so a single-node pin file keeps working verbatim.
+
 ## 3. Run the smoke test
 
 ```sh
@@ -159,6 +183,54 @@ deterministic), and request validation rejects a NUL byte in argv and
 trailing garbage after the JSON body. Cleanup waits the asynchronous
 destroy out before checking the node for leftover containers.
 
+## 3e. Suspend/resume test
+
+With the same server running (single-node or cluster mode both
+exercise the same node-level freeze path):
+
+```sh
+./scripts/e2e-suspend.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks)
+```
+
+It exercises: suspend lands `Suspended` with the container's cgroup v2
+cgroup.events reading `frozen 1` on the node (verified through the same
+node-level path the controller uses — API pid → `/proc/<pid>/cgroup` →
+`cgroup.events`, never `pct exec`, which would hang inside a frozen
+cgroup), exec refuses with 409 while frozen (it would hang otherwise),
+second suspend and resume-while-running are idempotent 200s, after
+resume the runner is alive again (process tree and memory never left),
+a Suspended task thawed out of band is re-frozen by the controller
+within a few ticks (the phase is declarative, not a one-shot command),
+deleting a frozen task thaws first and leaves no container, and a
+terminal (`ProvisionFailed`) task refuses suspend.
+
+## 3f. Multi-node test
+
+With a px-server running in **cluster mode** (no `-pve-node`, node
+names mapped via `-ssh-host-override`):
+
+```sh
+./scripts/e2e-multi-node.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default
+#      root@192.168.2.100, empty disables node checks);
+#      NODE_HOST_MAP (default mirrors the -ssh-host-override example);
+#      TEMPLATE_NODES (default "third second" — nodes holding the image)
+```
+
+It exercises: the task schedules onto an online, template-bearing node
+(`px get tasks` carries a NODE column; nodes without the template are
+never picked), the NODE column is stable across polls, the container
+really exists on that node (resolved through the same node→host map),
+exec and logs cross the node boundary over the lazy per-node SSH
+connection, suspend freezes and resume unfreezes the task's cgroup on
+its own node, and delete removes the container from that same node.
+The scheduling order itself (most free memory first) is environment
+dependent and not asserted — pinning it deterministically needs
+control over each node's load, which is what the unit tests cover with
+fake cluster views.
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it
@@ -176,6 +248,11 @@ happen once:
    the destroy completes. Restart: the deletion timestamp is
    persisted in SQLite, so the controller resumes and finishes the
    destroy.
+3. **Suspend-across-restart**: suspend a running task, wait for
+   `Suspended`, and restart px-server. The freeze lives in the
+   container's cgroup (not in px-server's memory), so the task stays
+   frozen, and the controller re-verifies it on its next ticks —
+   `Suspended` stays `Suspended`, `px resume` brings it back.
 
 ## Troubleshooting
 

@@ -22,19 +22,28 @@ import (
 type nopProv struct{}
 
 func (nopProv) Allocate(_ context.Context) (int, error) { return 0, nil }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway) error {
+func (nopProv) Schedule(_ context.Context, _ string) (string, error) {
+	return "n1", nil
+}
+func (nopProv) NodeOf(_ context.Context, _ int) (string, error) {
+	return "n1", nil
+}
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway) error {
 	return nil
 }
-func (nopProv) Booted(_ context.Context, _ int) (bool, error)  { return false, nil }
-func (nopProv) Exit(_ context.Context, _ int) (*int, error)    { return nil, nil }
-func (nopProv) Running(_ context.Context, _ int) (bool, error) { return true, nil }
-func (nopProv) Logs(_ context.Context, _ int) (string, error)  { return "", nil }
-func (nopProv) Exec(_ context.Context, _ int, _ []string) (*controller.ExecResult, error) {
+func (nopProv) Booted(_ context.Context, _ string, _ int) (bool, error) { return false, nil }
+func (nopProv) Exit(_ context.Context, _ string, _ int) (*int, error)   { return nil, nil }
+func (nopProv) Running(_ context.Context, _ string, _ int) (bool, error) { return true, nil }
+func (nopProv) Logs(_ context.Context, _ string, _ int) (string, error)  { return "", nil }
+func (nopProv) Exec(_ context.Context, _ string, _ int, _ []string) (*controller.ExecResult, error) {
 	return &controller.ExecResult{}, nil
 }
-func (nopProv) Destroy(_ context.Context, _ int) error                 { return nil }
-func (nopProv) DestroyOwned(_ context.Context, _ string, _ int) error  { return nil }
-func (nopProv) Owned(_ context.Context, _ string, _ int) (bool, error) { return true, nil }
+func (nopProv) Destroy(_ context.Context, _ string, _ int) error                { return nil }
+func (nopProv) DestroyOwned(_ context.Context, _, _ string, _ int) error        { return nil }
+func (nopProv) Owned(_ context.Context, _, _ string, _ int) (bool, error)       { return true, nil }
+func (nopProv) Frozen(_ context.Context, _ string, _ int) (bool, error)         { return false, nil }
+func (nopProv) Freeze(_ context.Context, _ string, _ int) error                 { return nil }
+func (nopProv) Thaw(_ context.Context, _ string, _ int) error                   { return nil }
 
 const manifest = `
 apiVersion: px.io/v1alpha1
@@ -404,7 +413,7 @@ type execProv struct {
 	ownErr error
 }
 
-func (p *execProv) Exec(_ context.Context, _ int, argv []string) (*controller.ExecResult, error) {
+func (p *execProv) Exec(_ context.Context, _ string, _ int, argv []string) (*controller.ExecResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.argv = argv
@@ -414,7 +423,7 @@ func (p *execProv) Exec(_ context.Context, _ int, argv []string) (*controller.Ex
 	return &controller.ExecResult{Stdout: p.stdout, Stderr: p.stderr, ExitCode: p.exitCode}, nil
 }
 
-func (p *execProv) Owned(_ context.Context, _ string, _ int) (bool, error) {
+func (p *execProv) Owned(_ context.Context, _, _ string, _ int) (bool, error) {
 	return !p.noOwn, p.ownErr
 }
 
@@ -431,14 +440,14 @@ func newExecServer(t *testing.T, prov *execProv) (*httptest.Server, *store.Store
 	return srv, st
 }
 
-func seedExecTask(t *testing.T, st *store.Store, phase v1alpha1.TaskPhase, container int) {
+func seedExecTask(t *testing.T, st *store.Store, phase v1alpha1.TaskPhase, container int, node string) {
 	t.Helper()
 	tk := &v1alpha1.Task{
 		APIVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindTask,
 		Metadata:   v1alpha1.ObjectMeta{Name: "t1"},
 		Spec:       v1alpha1.TaskSpec{Image: "tmpl", Runner: v1alpha1.RunnerSpec{Command: []string{"true"}}},
-		Status:     v1alpha1.TaskStatus{Phase: phase, Container: container},
+		Status:     v1alpha1.TaskStatus{Phase: phase, Container: container, Node: node},
 	}
 	if err := st.UpsertTask(tk); err != nil {
 		t.Fatal(err)
@@ -466,16 +475,18 @@ func TestTaskExecRequiresRunningSandbox(t *testing.T) {
 		name      string
 		phase     v1alpha1.TaskPhase
 		container int
+		node      string
 		want      int
 	}{
-		{"running", v1alpha1.TaskRunning, 42, http.StatusOK},
-		{"pending", v1alpha1.TaskPending, 0, http.StatusConflict},
-		{"running but no container", v1alpha1.TaskRunning, 0, http.StatusConflict},
-		{"failed", v1alpha1.TaskFailed, 42, http.StatusConflict},
+		{"running", v1alpha1.TaskRunning, 42, "n1", http.StatusOK},
+		{"running but no node", v1alpha1.TaskRunning, 42, "", http.StatusConflict},
+		{"pending", v1alpha1.TaskPending, 0, "n1", http.StatusConflict},
+		{"running but no container", v1alpha1.TaskRunning, 0, "n1", http.StatusConflict},
+		{"failed", v1alpha1.TaskFailed, 42, "n1", http.StatusConflict},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			seedExecTask(t, st, c.phase, c.container)
+			seedExecTask(t, st, c.phase, c.container, c.node)
 			resp, body := postExec(t, srv, `{"command": ["true"]}`)
 			if resp.StatusCode != c.want {
 				t.Fatalf("want %d, got %d: %s", c.want, resp.StatusCode, body)
@@ -485,7 +496,7 @@ func TestTaskExecRequiresRunningSandbox(t *testing.T) {
 
 	// A task marked for deletion is going away — exec must refuse even while
 	// the phase still reads Running.
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 	if err := st.MarkTaskDeleted("t1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +518,7 @@ func TestTaskExecRequiresRunningSandbox(t *testing.T) {
 func TestTaskExecReturnsResult(t *testing.T) {
 	prov := &execProv{stdout: "out\n", stderr: "err\n", exitCode: 3}
 	srv, st := newExecServer(t, prov)
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 
 	resp, body := postExec(t, srv, `{"command": ["sh", "-c", "echo out; echo err >&2; exit 3"]}`)
 	if resp.StatusCode != http.StatusOK {
@@ -538,7 +549,7 @@ func TestTaskExecReturnsResult(t *testing.T) {
 func TestTaskExecProvError(t *testing.T) {
 	prov := &execProv{err: errors.New("ssh down")}
 	srv, st := newExecServer(t, prov)
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 	resp, body := postExec(t, srv, `{"command": ["true"]}`)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("want 502, got %d: %s", resp.StatusCode, body)
@@ -550,7 +561,7 @@ func TestTaskExecProvError(t *testing.T) {
 func TestTaskExecRejectsBadRequests(t *testing.T) {
 	prov := &execProv{}
 	srv, st := newExecServer(t, prov)
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 
 	cases := []struct {
 		name string
@@ -587,7 +598,7 @@ func TestTaskExecRejectsBadRequests(t *testing.T) {
 func TestTaskExecAcceptsEmptyArguments(t *testing.T) {
 	prov := &execProv{}
 	srv, st := newExecServer(t, prov)
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 	resp, body := postExec(t, srv, `{"command": ["printf", "%s", ""]}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
@@ -605,7 +616,7 @@ func TestTaskExecAcceptsEmptyArguments(t *testing.T) {
 func TestTaskExecRefusesForeignContainer(t *testing.T) {
 	prov := &execProv{noOwn: true}
 	srv, st := newExecServer(t, prov)
-	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
 	resp, body := postExec(t, srv, `{"command": ["true"]}`)
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("want 409, got %d: %s", resp.StatusCode, body)
@@ -620,15 +631,51 @@ func TestTaskExecRefusesForeignContainer(t *testing.T) {
 	// An ownership probe failure (node unreachable) is a 502, not a guess.
 	prov2 := &execProv{ownErr: errors.New("pve down")}
 	srv2, st2 := newExecServer(t, prov2)
-	seedExecTask(t, st2, v1alpha1.TaskRunning, 42)
+	seedExecTask(t, st2, v1alpha1.TaskRunning, 42, "n1")
 	resp2, body := postExec(t, srv2, `{"command": ["true"]}`)
 	if resp2.StatusCode != http.StatusBadGateway {
 		t.Fatalf("want 502, got %d: %s", resp2.StatusCode, body)
 	}
 }
 
-func cmpArgs(got, want []string) string {
-	if len(got) != len(want) {
+// Logs ride pct exec into the container, and a pct exec into a frozen cgroup
+// blocks in the freezer until the probe timeout — so a suspended task must be
+// refused at the API (409) instead of stalling the request.
+func TestTaskLogsRefusedWhileSuspended(t *testing.T) {
+	srv, st := newExecServer(t, &execProv{})
+
+	phases := []v1alpha1.TaskPhase{
+		v1alpha1.TaskSuspending,
+		v1alpha1.TaskSuspended,
+		v1alpha1.TaskResuming,
+	}
+	for _, phase := range phases {
+		seedExecTask(t, st, phase, 42, "n1")
+		resp, err := http.Get(srv.URL + "/v1/tasks/t1/logs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("%s: want 409, got %d: %s", phase, resp.StatusCode, body)
+		}
+	}
+
+	// A running task still gets its logs (nop-style prov returns empty logs
+	// with a 200 here via execProv).
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
+	resp, err := http.Get(srv.URL + "/v1/tasks/t1/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("running task: want 200, got %d", resp.StatusCode)
+	}
+}
+
+func cmpArgs(got, want []string) string {	if len(got) != len(want) {
 		return fmt.Sprintf("len %d != %d (%q vs %q)", len(got), len(want), got, want)
 	}
 	for i := range got {

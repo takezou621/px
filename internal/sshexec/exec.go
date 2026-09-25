@@ -27,13 +27,24 @@ type Config struct {
 	HostKeyPath string // optional file of pinned host public keys; empty accepts any key
 }
 
-// Executor holds one SSH connection to the node and re-dials lazily if the
+// pinnedKey is one parsed pin-file line. Hosts names the hosts the key
+// applies to (known_hosts-format lines carry a hostname field); an empty
+// list means every host (authorized_keys-format lines), which is what keeps
+// a single-node pin file working unchanged in cluster mode. Matching is by
+// exact hostname string — px dials nodes by their name or an overridden
+// address, and no wildcard resolution is worth the ambiguity here.
+type pinnedKey struct {
+	hosts []string
+	key   ssh.PublicKey
+}
+
+// Executor holds one SSH connection to a host and re-dials lazily if the
 // connection drops, so a network blip does not kill the control plane until
-// restart.
+// restart. A Pool creates one Executor per PVE node.
 type Executor struct {
 	cfg         Config
 	dialTimeout time.Duration
-	hostKeys    []ssh.PublicKey // pinned keys; empty accepts any host key
+	hostKeys    []pinnedKey // pinned keys; empty accepts any host key
 
 	mu     sync.Mutex
 	client *ssh.Client
@@ -73,9 +84,20 @@ func (e *Executor) dial() (*ssh.Client, error) {
 	}
 	var hostKeyCallback ssh.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 	var hostKeyAlgos []string
-	if len(e.hostKeys) > 0 {
-		hostKeyCallback = pinnedHostKeyCallback(e.hostKeys)
-		hostKeyAlgos = pinnedAlgos(e.hostKeys)
+	keys := keysForHost(e.hostKeys, e.cfg.Host)
+	switch {
+	case len(e.hostKeys) > 0 && len(keys) == 0:
+		// A pin file is in use but names no key for this host: dialing
+		// insecurely here would silently drop verification for a whole node
+		// just because its line is missing (or misspelled) from the file.
+		return nil, fmt.Errorf("no pinned host key for %s (check -ssh-host-key)", e.cfg.Host)
+	case len(keys) > 0:
+		hostKeyCallback = pinnedHostKeyCallback(keys)
+		plain := make([]ssh.PublicKey, len(keys))
+		for i, k := range keys {
+			plain[i] = k.key
+		}
+		hostKeyAlgos = pinnedAlgos(plain)
 	}
 	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", e.cfg.Host, e.cfg.Port), &ssh.ClientConfig{
 		User:              e.cfg.User,
@@ -122,10 +144,12 @@ func algoNames(k ssh.PublicKey) []string {
 // format (`ssh-ed25519 AAAA... comment`) and ssh-keyscan output
 // (`host ssh-ed25519 AAAA...`) parse. Blank lines and `#` comments are
 // skipped, and several keys are allowed so a rotation window keeps working.
-// Only the key bytes are pinned — the line's hostname field, if any, is not
-// compared, because px talks to exactly one node.
-func parseHostKeys(data []byte) ([]ssh.PublicKey, error) {
-	var keys []ssh.PublicKey
+// A known_hosts-format line's hostname field (comma-separated, exact match
+// only) scopes the pin to those hosts; a line without one applies to every
+// host px dials. Hashed-hostname lines cannot be scoped, so they are
+// rejected at parse time rather than silently never matching.
+func parseHostKeys(data []byte) ([]pinnedKey, error) {
+	var keys []pinnedKey
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -136,15 +160,21 @@ func parseHostKeys(data []byte) ([]ssh.PublicKey, error) {
 			// accepting them as plain keys would silently never match.
 			return nil, fmt.Errorf("line %q: @-marker lines are not supported (pin the host's public key itself)", line)
 		}
-		if _, _, pub, _, _, err := ssh.ParseKnownHosts([]byte(line)); err == nil {
-			keys = append(keys, pub)
+		// authorized_keys format first (the key type itself is field one);
+		// anything else is tried as a known_hosts line with a hostname
+		// scope. The scope is split by hand instead of via
+		// ssh.ParseKnownHosts: which of its string-vs-slice returns a given
+		// call site sees has proven toolchain-dependent, and the field is a
+		// plain comma-separated list anyway.
+		if pub, err := parseKeyLine(line); err == nil {
+			keys = append(keys, pinnedKey{key: pub})
 			continue
 		}
-		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		hosts, pub, err := parseScopedKeyLine(line)
 		if err != nil {
 			return nil, fmt.Errorf("line %q: %w", line, err)
 		}
-		keys = append(keys, pub)
+		keys = append(keys, pinnedKey{hosts: hosts, key: pub})
 	}
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("no host keys found")
@@ -152,18 +182,83 @@ func parseHostKeys(data []byte) ([]ssh.PublicKey, error) {
 	return keys, nil
 }
 
+// parseKeyLine parses an authorized_keys-format line (no hostname field).
+// The returned pin applies to every host px dials. ParseAuthorizedKey
+// tolerates a leading options field, which would swallow a known_hosts
+// line's hostname — so field one must equal the key's own type, or the
+// caller re-tries the line as scoped.
+func parseKeyLine(line string) (ssh.PublicKey, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("empty line")
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(line))
+	if err != nil {
+		return nil, err
+	}
+	if fields[0] != pub.Type() {
+		return nil, fmt.Errorf("key type %q does not match the line's first field %q", pub.Type(), fields[0])
+	}
+	return pub, nil
+}
+
+// parseScopedKeyLine parses a known_hosts-format line: a comma-separated
+// hostname list is field one, the key follows. Hostname matching is by exact
+// string, so a hashed hostname can never match and is rejected up front.
+func parseScopedKeyLine(line string) ([]string, ssh.PublicKey, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return nil, nil, fmt.Errorf("too few fields")
+	}
+	names := strings.Split(fields[0], ",")
+	for _, h := range names {
+		if strings.HasPrefix(h, "|1|") {
+			return nil, nil, fmt.Errorf("hashed hostname %q is not supported (add the host in plain form)", h)
+		}
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(strings.Join(fields[1:], " ")))
+	if err != nil {
+		return nil, nil, err
+	}
+	return names, pub, nil
+}
+
+// keysForHost narrows the pinned keys to those that apply to one host —
+// the callback and the handshake algorithm list must not consider keys
+// scoped to other nodes, or a foreign pin would change this host's
+// negotiation (or accept a key it was never pinned for).
+func keysForHost(keys []pinnedKey, host string) []pinnedKey {
+	var out []pinnedKey
+	for _, pk := range keys {
+		if len(pk.hosts) == 0 || containsHost(pk.hosts, host) {
+			out = append(out, pk)
+		}
+	}
+	return out
+}
+
+func containsHost(hosts []string, host string) bool {
+	for _, h := range hosts {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
 // pinnedHostKeyCallback accepts only the given keys; a mismatch fails the
 // handshake with the offending key's fingerprint, so a wrong pin or a
-// man-in-the-middle is diagnosable from the error alone.
-func pinnedHostKeyCallback(keys []ssh.PublicKey) ssh.HostKeyCallback {
-	return func(_ string, _ net.Addr, k ssh.PublicKey) error {
+// man-in-the-middle is diagnosable from the error alone. Installed only when
+// at least one key applies, so the zero-key case never reaches here.
+func pinnedHostKeyCallback(keys []pinnedKey) ssh.HostKeyCallback {
+	return func(host string, _ net.Addr, k ssh.PublicKey) error {
 		got := k.Marshal()
 		for _, pinned := range keys {
-			if bytes.Equal(pinned.Marshal(), got) {
+			if bytes.Equal(pinned.key.Marshal(), got) {
 				return nil
 			}
 		}
-		return fmt.Errorf("host key %s is not pinned (check -ssh-host-key)", ssh.FingerprintSHA256(k))
+		return fmt.Errorf("host %s key %s is not pinned (check -ssh-host-key)", host, ssh.FingerprintSHA256(k))
 	}
 }
 
@@ -174,6 +269,69 @@ func (e *Executor) Close() error {
 		return e.client.Close()
 	}
 	return nil
+}
+
+// Pool keeps one Executor per PVE node, dialed lazily: a node no task ever
+// lands on is never SSH'd, so cluster mode costs no connections until a
+// sandbox is provisioned there. The base Config supplies user/key/pins;
+// each node's host comes from hosts (the px-server's node→host override
+// map) or the node name itself — PVE node names are not guaranteed to
+// resolve, which is what the override map exists for.
+type Pool struct {
+	base        Config
+	dialTimeout time.Duration
+	hosts       map[string]string
+
+	mu    sync.Mutex
+	execs map[string]*Executor
+}
+
+func NewPool(dialTimeout time.Duration, base Config, hosts map[string]string) *Pool {
+	return &Pool{base: base, dialTimeout: dialTimeout, hosts: hosts, execs: map[string]*Executor{}}
+}
+
+// Executor returns the (dialed-on-first-use) executor for a node.
+func (p *Pool) Executor(node string) (*Executor, error) {
+	p.mu.Lock()
+	e, ok := p.execs[node]
+	p.mu.Unlock()
+	if ok {
+		return e, nil
+	}
+	cfg := p.base
+	cfg.Host = node
+	if p.hosts != nil {
+		if h, ok := p.hosts[node]; ok {
+			cfg.Host = h
+		}
+	}
+	e, err := Dial(p.dialTimeout, cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	if existing, ok := p.execs[node]; ok {
+		p.mu.Unlock()
+		e.Close()
+		return existing, nil
+	}
+	p.execs[node] = e
+	p.mu.Unlock()
+	return e, nil
+}
+
+func (p *Pool) Close() error {
+	p.mu.Lock()
+	execs := p.execs
+	p.execs = map[string]*Executor{}
+	p.mu.Unlock()
+	var first error
+	for _, e := range execs {
+		if err := e.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // lockedWriter is a concurrency-safe buffer: one writer receiving both session

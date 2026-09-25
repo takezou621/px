@@ -3,11 +3,14 @@ package controller
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/proxmox"
@@ -116,12 +119,13 @@ func TestApplyEgressPolicyRules(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)}
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	p := &provisioner{pve: pve, nodePVE: fixedNodePVE(pve)}
 
 	gw := &ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{
 		{CIDR: "10.0.0.0/8", Ports: "443", Proto: "tcp"},
 	}}
-	if err := p.applyEgressPolicy(context.Background(), 123, gw); err != nil {
+	if err := p.applyEgressPolicy(context.Background(), "n1", 123, gw); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := []proxmox.FirewallRule{
@@ -168,9 +172,10 @@ func TestApplyEgressPolicyRequiresClusterFirewall(t *testing.T) {
 	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)}
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	p := &provisioner{pve: pve, nodePVE: fixedNodePVE(pve)}
 
-	err := p.applyEgressPolicy(context.Background(), 123, &ResolvedGateway{Name: "locked"})
+	err := p.applyEgressPolicy(context.Background(), "n1", 123, &ResolvedGateway{Name: "locked"})
 	if err == nil {
 		t.Fatal("a disabled cluster firewall must be refused")
 	}
@@ -185,8 +190,9 @@ func TestApplyEgressPolicyRequiresClusterFirewall(t *testing.T) {
 // Create must have the deny-by-default policy fully installed before the
 // container ever boots — a sandbox that starts wide open even briefly is
 // not a sandbox. The final SSH boot step needs a real node, so the flow
-// ends in the destroy-on-boot-failure path (a zero-value Executor never
-// connects); the recorded PVE call order is the point.
+// ends in the destroy-on-boot-failure path (the pool's host override points
+// at an address that can never open an SSH connection); the recorded PVE
+// call order is the point.
 func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 	var mu sync.Mutex
 	var events []string
@@ -248,8 +254,18 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 	t.Cleanup(srv.Close)
 	// The real gate polls the node's iptables; a stub keeps the test
 	// deterministic while still pinning WHEN enforcement is awaited.
-	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), ssh: &sshexec.Executor{},
-		egressGate: func(_ context.Context, vmid int) error {
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	p := &provisioner{
+		pve:    pve,
+		nodePVE: fixedNodePVE(pve),
+		// The ":1" port glued onto the host makes the pool's dial address
+		// ("127.0.0.1:1:22") unparseable, so the boot step fails fast and
+		// deterministically without ever touching the network.
+		ssh: sshexec.NewPool(time.Second, sshexec.Config{}, map[string]string{"n1": "127.0.0.1:1"}),
+		egressGate: func(_ context.Context, node string, vmid int) error {
+			if node != "n1" {
+				t.Errorf("egress gate called with node %q, want n1", node)
+			}
 			if vmid != 142 {
 				t.Errorf("egress gate called with vmid %d, want 142", vmid)
 			}
@@ -257,7 +273,7 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 			return nil
 		}}
 
-	err := p.Create(context.Background(), testProvTask(), 142, nil, nil,
+	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil,
 		&ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443"}}})
 	if err == nil || !strings.Contains(err.Error(), "boot runner") {
 		t.Fatalf("Create must fail at the (unreachable) SSH boot step, got: %v", err)
@@ -319,9 +335,10 @@ func TestCreateRefusesPrivilegedClone(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	p := NewProvisioner(proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), &sshexec.Executor{})
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	p := NewProvisioner(pve, fixedNodePVE(pve), sshexec.NewPool(time.Second, sshexec.Config{}, nil), "")
 
-	err := p.Create(context.Background(), testProvTask(), 142, nil, nil, nil)
+	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "privileged") {
 		t.Fatalf("a privileged clone must fail the provision naming the problem, got: %v", err)
 	}
@@ -600,5 +617,123 @@ func TestRunnerScriptWithoutModel(t *testing.T) {
 	}
 	if !strings.Contains(script, "if [ -f /run/px/model.env ]; then . /run/px/model.env; fi;") {
 		t.Errorf("spawn must tolerate a missing model.env (dash exits on a failed dot-builtin):\n%s", script)
+	}
+}
+
+// scheduleSrv serves a fake /cluster/resources and returns a provisioner
+// pointed at it. Cluster-mode scheduling and NodeOf both read this view, so
+// the tests below exercise them without a live cluster.
+func scheduleSrv(t *testing.T, res []proxmox.ClusterResource) *provisioner {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/cluster/resources", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{"data": res}); err != nil {
+			t.Errorf("encode resources: %v", err)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	pve := proxmox.New(srv.URL, "third", "root@pam!px=fake", false)
+	return &provisioner{pve: pve, nodePVE: fixedNodePVE(pve)}
+}
+
+// The tie-break order is free memory (most first), then load (least first).
+// second and forth tie on free memory; the lower-load node must win even
+// though second sorts first alphabetically.
+func TestScheduleScoresFreeMemoryThenLoad(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9, Mem: 5e9, CPU: 0.2},
+		{Type: "node", Node: "second", Status: "online", MaxMem: 8e9, Mem: 2e9, CPU: 0.9},
+		{Type: "node", Node: "forth", Status: "online", MaxMem: 8e9, Mem: 2e9, CPU: 0.1},
+		{Type: "node", Node: "pve", Status: "online", MaxMem: 4e9, Mem: 0},
+		{Type: "lxc", Node: "third", VMID: 999, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "second", VMID: 998, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "forth", VMID: 997, Name: "tmpl", Template: 1},
+	})
+	node, err := p.Schedule(context.Background(), "tmpl")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "forth" {
+		t.Fatalf("scheduled %q, want forth (memory tie broken by load)", node)
+	}
+}
+
+// An offline node never schedules even when it is the freest host holding
+// the template, and an online node without the template is not a candidate
+// either: cloning would fail there.
+func TestScheduleIgnoresOfflineAndTemplatelessNodes(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "down", Status: "offline", MaxMem: 64e9, Mem: 0},
+		{Type: "node", Node: "bare", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9, Mem: 7e9},
+		{Type: "lxc", Node: "down", VMID: 900, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "third", VMID: 999, Name: "tmpl", Template: 1},
+	})
+	node, err := p.Schedule(context.Background(), "tmpl")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "third" {
+		t.Fatalf("scheduled %q, want third", node)
+	}
+}
+
+// No online node holds the image: the request must fail up front with a
+// diagnosable error instead of provisioning toward a doomed clone.
+func TestScheduleRefusesWhenNoOnlineNodeHoldsTemplate(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9},
+		{Type: "node", Node: "down", Status: "offline", MaxMem: 8e9},
+		{Type: "lxc", Node: "down", VMID: 900, Name: "tmpl", Template: 1},
+	})
+	_, err := p.Schedule(context.Background(), "tmpl")
+	if err == nil || !strings.Contains(err.Error(), "no online node holds template") {
+		t.Fatalf("must refuse with a diagnosable error, got: %v", err)
+	}
+}
+
+// Fixed-node mode is the old single-node contract: Schedule answers from the
+// flag alone and must never consult the cluster view.
+func TestScheduleSingleNodeModeSkipsClusterView(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("single-node mode must not consult the cluster view, got %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	p := &provisioner{pve: pve, nodePVE: fixedNodePVE(pve), fixedNode: "n1"}
+	node, err := p.Schedule(context.Background(), "tmpl")
+	if err != nil || node != "n1" {
+		t.Fatalf("Schedule = (%q, %v), want (n1, nil)", node, err)
+	}
+}
+
+// NodeOf is the repair path for pre-multi-node records: it must find both
+// container and VM guests (a foreign qemu VM occupying a px VMID must not
+// make the repair path fail the task).
+func TestNodeOfResolvesGuestNode(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online"},
+		{Type: "lxc", Node: "second", VMID: 142, Name: "t-abc", Status: "running"},
+		{Type: "qemu", Node: "forth", VMID: 203, Name: "some-vm"},
+	})
+	if node, err := p.NodeOf(context.Background(), 142); err != nil || node != "second" {
+		t.Fatalf("NodeOf(142) = (%q, %v), want (second, nil)", node, err)
+	}
+	if node, err := p.NodeOf(context.Background(), 203); err != nil || node != "forth" {
+		t.Fatalf("NodeOf(203) = (%q, %v), want (forth, nil)", node, err)
+	}
+}
+
+func TestNodeOfReportsGuestGone(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online"},
+	})
+	if _, err := p.NodeOf(context.Background(), 142); !errors.Is(err, ErrGuestGone) {
+		t.Fatalf("missing guest must map to ErrGuestGone, got: %v", err)
 	}
 }

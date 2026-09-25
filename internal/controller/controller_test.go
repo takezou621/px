@@ -11,19 +11,33 @@ import (
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/store"
 )
+
+// The fake schedules every task onto node "n1" and ignores node arguments,
+// so the node dimension of the provisioner interface is untested here —
+// cluster scheduling has its own tests in provisioner_test.go.
+const fakeNode = "n1"
 
 type fakeProv struct {
 	mu          sync.Mutex
 	allocateErr error        // returned by Allocate as a provision failure
 	createErr   error        // returned by Create as a provision failure
+	scheduleErr error        // returned by Schedule as a provision failure
+	nodeOfErr   error        // returned by NodeOf (wrap ErrGuestGone for a vanished container)
 	exitErr     error        // returned by Exit as a probe failure
 	bootedErr   error        // returned by Booted as a probe failure
+	frozenErr   error        // returned by Frozen as a probe failure
+	freezeErr   error        // returned by Freeze
+	thawErr     error        // returned by Thaw
+	runningErr  error        // returned by Running as a probe failure
 	destroyErr  error        // returned by Destroy until cleared
 	exits       map[int]int  // vmid -> exit code; missing = still running
 	dead        map[int]bool // vmids whose container is not running
 	booted      map[int]bool // vmids whose container reached the runner launch
+	frozen      map[int]bool // vmids whose cgroup is currently frozen
 	created     []int
+	thaws       []int               // vmids passed to Thaw, in call order
 	mounts      []ResolvedWorkspace // mounts passed to the last Create
 	model       *ResolvedModel      // model passed to the last Create
 	gw          *ResolvedGateway    // gateway passed to the last Create
@@ -38,7 +52,21 @@ func (f *fakeProv) Allocate(_ context.Context) (int, error) {
 	return 100 + len(f.created), nil
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
+func (f *fakeProv) Schedule(_ context.Context, _ string) (string, error) {
+	if f.scheduleErr != nil {
+		return "", f.scheduleErr
+	}
+	return fakeNode, nil
+}
+
+func (f *fakeProv) NodeOf(_ context.Context, _ int) (string, error) {
+	if f.nodeOfErr != nil {
+		return "", f.nodeOfErr
+	}
+	return fakeNode, nil
+}
+
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -51,7 +79,7 @@ func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts 
 	return nil
 }
 
-func (f *fakeProv) Booted(_ context.Context, vmid int) (bool, error) {
+func (f *fakeProv) Booted(_ context.Context, _ string, vmid int) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.bootedErr != nil {
@@ -60,7 +88,7 @@ func (f *fakeProv) Booted(_ context.Context, vmid int) (bool, error) {
 	return f.booted[vmid], nil
 }
 
-func (f *fakeProv) Exit(_ context.Context, vmid int) (*int, error) {
+func (f *fakeProv) Exit(_ context.Context, _ string, vmid int) (*int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.exitErr != nil {
@@ -73,19 +101,58 @@ func (f *fakeProv) Exit(_ context.Context, vmid int) (*int, error) {
 	return nil, nil
 }
 
-func (f *fakeProv) Running(_ context.Context, vmid int) (bool, error) {
+func (f *fakeProv) Running(_ context.Context, _ string, vmid int) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.runningErr != nil {
+		return false, f.runningErr
+	}
 	return !f.dead[vmid], nil
 }
 
-func (f *fakeProv) Logs(_ context.Context, _ int) (string, error) { return "log\n", nil }
+func (f *fakeProv) Logs(_ context.Context, _ string, _ int) (string, error) { return "log\n", nil }
 
-func (f *fakeProv) Exec(_ context.Context, _ int, _ []string) (*ExecResult, error) {
+func (f *fakeProv) Exec(_ context.Context, _ string, _ int, _ []string) (*ExecResult, error) {
 	return &ExecResult{}, nil
 }
 
-func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
+func (f *fakeProv) Frozen(_ context.Context, _ string, vmid int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.frozenErr != nil {
+		return false, f.frozenErr
+	}
+	return f.frozen[vmid], nil
+}
+
+func (f *fakeProv) Freeze(_ context.Context, _ string, vmid int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.freezeErr != nil {
+		return f.freezeErr
+	}
+	if f.frozen == nil {
+		f.frozen = map[int]bool{}
+	}
+	f.frozen[vmid] = true
+	return nil
+}
+
+func (f *fakeProv) Thaw(_ context.Context, _ string, vmid int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.thaws = append(f.thaws, vmid)
+	if f.thawErr != nil {
+		return f.thawErr
+	}
+	if f.frozen == nil {
+		f.frozen = map[int]bool{}
+	}
+	f.frozen[vmid] = false
+	return nil
+}
+
+func (f *fakeProv) Destroy(_ context.Context, _ string, vmid int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.destroyErr != nil {
@@ -95,19 +162,19 @@ func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
 	return nil
 }
 
-func (f *fakeProv) DestroyOwned(ctx context.Context, taskName string, vmid int) error {
+func (f *fakeProv) DestroyOwned(ctx context.Context, taskName, _ string, vmid int) error {
 	f.mu.Lock()
 	host := f.hostnames[vmid]
 	f.mu.Unlock()
 	if host != "" && host != "px-"+taskName {
 		return fmt.Errorf("%w: ct %d hostname %q is not %q", ErrNotOwned, vmid, host, "px-"+taskName)
 	}
-	return f.Destroy(ctx, vmid)
+	return f.Destroy(ctx, fakeNode, vmid)
 }
 
 // Owned mirrors DestroyOwned's hostname check without destroying: empty or
 // missing means owned, since plain tests never set a hostname.
-func (f *fakeProv) Owned(_ context.Context, taskName string, vmid int) (bool, error) {
+func (f *fakeProv) Owned(_ context.Context, taskName, _ string, vmid int) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	host := f.hostnames[vmid]
@@ -210,6 +277,24 @@ func (m *memStore) MarkTaskDeleted(name string, at time.Time) error {
 	}
 	mark := at
 	cur.Status.DeletionTimestamp = &mark
+	return nil
+}
+
+// MarkTaskPhase mirrors the real store's compare-and-set semantics: phase
+// and reason move together, nothing else on the record is touched, and a
+// mismatched expect writes nothing.
+func (m *memStore) MarkTaskPhase(name string, expect, phase v1alpha1.TaskPhase, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.tasks[name]
+	if !ok {
+		return store.ErrPhaseConflict
+	}
+	if cur.Status.Phase != expect {
+		return store.ErrPhaseConflict
+	}
+	cur.Status.Phase = phase
+	cur.Status.Reason = reason
 	return nil
 }
 
@@ -402,6 +487,11 @@ func TestDeleteRefusesForeignContainer(t *testing.T) {
 	if len(prov.destroyed) != 0 {
 		t.Fatalf("foreign container must not be destroyed, got %v", prov.destroyed)
 	}
+	// The pre-destroy thaw is guarded by the same ownership check: thawing a
+	// container px does not own would unfreeze someone else's workload.
+	if len(prov.thaws) != 0 {
+		t.Fatalf("foreign container must not be thawed, got %v", prov.thaws)
+	}
 }
 
 func TestTTLSkipsForeignContainer(t *testing.T) {
@@ -443,6 +533,7 @@ func TestInterruptedProvisioningForeignContainer(t *testing.T) {
 	}
 	task := testTask(0)
 	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Node = fakeNode
 	task.Status.Container = 100
 	_ = st.UpsertTask(task)
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
@@ -789,6 +880,7 @@ func TestInterruptedProvisioningUnbooted(t *testing.T) {
 	prov := &fakeProv{exits: map[int]int{}}
 	task := testTask(0)
 	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Node = fakeNode
 	task.Status.Container = 100
 	_ = st.UpsertTask(task)
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
@@ -816,6 +908,7 @@ func TestAdoptBootedProvisioning(t *testing.T) {
 	prov := &fakeProv{exits: map[int]int{}, booted: map[int]bool{100: true}}
 	task := testTask(0)
 	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Node = fakeNode
 	task.Status.Container = 100
 	_ = st.UpsertTask(task)
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
@@ -844,6 +937,7 @@ func TestBootProbeErrorRetries(t *testing.T) {
 	}
 	task := testTask(0)
 	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Node = fakeNode
 	task.Status.Container = 100
 	_ = st.UpsertTask(task)
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
@@ -870,6 +964,7 @@ func TestAdoptRefusesForeignContainer(t *testing.T) {
 	}
 	task := testTask(0)
 	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Node = fakeNode
 	task.Status.Container = 100
 	_ = st.UpsertTask(task)
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
@@ -1046,5 +1141,367 @@ func TestExitProbeErrorWithLiveContainerKeepsRunning(t *testing.T) {
 	task := get(t, st, "t1")
 	if task.Status.Phase != v1alpha1.TaskRunning {
 		t.Fatalf("want still Running, got %s", task.Status.Phase)
+	}
+}
+
+// A Schedule failure (no online node holds the template) is a provision
+// failure before any container exists: no VMID is recorded, nothing created.
+func TestScheduleError(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, scheduleErr: errors.New("no online node holds template tmpl")}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run after a failed Schedule, created %v", prov.created)
+	}
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container 0, got %d", task.Status.Container)
+	}
+	if !strings.Contains(task.Status.Reason, "schedule") {
+		t.Fatalf("Reason should name the scheduling failure, got %q", task.Status.Reason)
+	}
+}
+
+// Provision records the scheduled node, and the whole lifecycle keeps it.
+func TestProvisionRecordsNode(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	task := get(t, st, "t1")
+	if task.Status.Node != fakeNode {
+		t.Fatalf("want node %s, got %q", fakeNode, task.Status.Node)
+	}
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Node != fakeNode {
+		t.Fatalf("node must survive the finish transition, got %q", task.Status.Node)
+	}
+}
+
+// suspend drives Running -> Suspending -> Suspended, resume drives
+// Suspended -> Resuming -> Running, each state change confirmed by a Frozen
+// probe on a later tick — and a suspended task is not polled, so its runner
+// cannot report an exit underneath the freeze.
+func TestSuspendResumeFlow(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s", task.Status.Phase)
+	}
+
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // Suspending: freezes, defers confirmation to the next tick
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspending {
+		t.Fatalf("want Suspending after the freeze tick, got %s", task.Status.Phase)
+	}
+	runOnce(ctl) // confirms frozen -> Suspended
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspended {
+		t.Fatalf("want Suspended, got %s", task.Status.Phase)
+	}
+
+	// The runner was told to exit while suspended: a frozen cgroup cannot
+	// report it, and the suspended watch deliberately does not ask.
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl)
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspended {
+		t.Fatalf("a suspended task must not observe runner exit, got %s", task.Status.Phase)
+	}
+
+	if err := ctl.RequestResume("t1", v1alpha1.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // Resuming: thaws, defers confirmation
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskResuming {
+		t.Fatalf("want Resuming after the thaw tick, got %s", task.Status.Phase)
+	}
+	runOnce(ctl) // confirms thawed -> Running
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running after resume confirms, got %s", task.Status.Phase)
+	}
+
+	runOnce(ctl) // back to polling: the pending exit surfaces now
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSucceeded {
+		t.Fatalf("want Succeeded after resume drains the exit, got %s", task.Status.Phase)
+	}
+}
+
+// An external thaw while Suspended (pct on the node, host restart) is
+// re-frozen instead of silently un-suspending the task.
+func TestSuspendedReFreezesAfterExternalThaw(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // freeze
+	runOnce(ctl) // confirm -> Suspended
+
+	prov.mu.Lock()
+	prov.frozen[100] = false // thaw out-of-band
+	prov.mu.Unlock()
+	runOnce(ctl) // re-freeze
+	prov.mu.Lock()
+	frozen := prov.frozen[100]
+	prov.mu.Unlock()
+	if !frozen {
+		t.Fatal("an externally thawed suspended container must be re-frozen")
+	}
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspended {
+		t.Fatalf("want still Suspended, got %s", task.Status.Phase)
+	}
+}
+
+// A container frozen out-of-band while the task shows Running is adopted as
+// Suspended: every pct exec into it would hang until thaw, so polling is
+// impossible and the freeze means a suspend.
+func TestRunningAdoptsFrozenContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.frozen = map[int]bool{100: true}
+	prov.mu.Unlock()
+	runOnce(ctl)
+
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspended {
+		t.Fatalf("want Suspended, got %s", task.Status.Phase)
+	}
+}
+
+// Records persisted before Status.Node existed are repaired from the cluster
+// view on the first tick, then proceed as if they had always carried it.
+// A Frozen-probe failure during any suspend phase is ambiguous (SSH blip vs
+// dead guest); the decider is Running. A dead container must settle the task
+// as Failed instead of retrying the probe forever — a Suspending/Suspended/
+// Resuming record wedged on a vanished container never reaches a terminal
+// phase, and resume would 409 against it.
+func TestSuspendPhaseFailsOnDeadContainer(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(ctl *Controller)
+	}{
+		{
+			name: "suspending",
+			setup: func(ctl *Controller) {
+				runOnce(ctl) // -> Running
+				if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+					t.Fatal(err)
+				}
+				runOnce(ctl) // freeze -> Suspending
+			},
+		},
+		{
+			name: "suspended",
+			setup: func(ctl *Controller) {
+				runOnce(ctl) // -> Running
+				if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+					t.Fatal(err)
+				}
+				runOnce(ctl) // freeze -> Suspending
+				runOnce(ctl) // confirm -> Suspended
+			},
+		},
+		{
+			name: "resuming",
+			setup: func(ctl *Controller) {
+				runOnce(ctl) // -> Running
+				if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+					t.Fatal(err)
+				}
+				runOnce(ctl) // freeze
+				runOnce(ctl) // confirm -> Suspended
+				if err := ctl.RequestResume("t1", v1alpha1.TaskSuspended); err != nil {
+					t.Fatal(err)
+				}
+				runOnce(ctl) // thaw -> Resuming
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newMemStore()
+			prov := &fakeProv{exits: map[int]int{}, dead: map[int]bool{}}
+			_ = st.UpsertTask(testTask(0))
+			ctl := New(st, prov, slog.New(slog.DiscardHandler))
+			tc.setup(ctl)
+
+			prov.mu.Lock()
+			prov.dead[100] = true
+			prov.frozenErr = errors.New("cgroup.events unreadable")
+			prov.mu.Unlock()
+			runOnce(ctl)
+
+			task := get(t, st, "t1")
+			if task.Status.Phase != v1alpha1.TaskFailed {
+				t.Fatalf("want Failed, got %s", task.Status.Phase)
+			}
+			if task.Status.EndedAt == nil {
+				t.Fatal("EndedAt should be set")
+			}
+			if !strings.Contains(task.Status.Reason, "not running while "+tc.name) {
+				t.Fatalf("Reason should name the dead container during %s, got %q", tc.name, task.Status.Reason)
+			}
+		})
+	}
+}
+
+// A Frozen-probe failure with the container still alive is a transient error
+// (SSH blip): the suspend phase must hold, not fail the task.
+func TestSuspendPhaseSurvivesProbeErrorWithLiveContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, frozenErr: errors.New("ssh connection reset")}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // freeze -> Suspending
+	runOnce(ctl) // probe fails, but container is up
+
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspending {
+		t.Fatalf("want still Suspending, got %s", task.Status.Phase)
+	}
+}
+
+// A Frozen-probe failure where Running cannot be checked either (SSH down for
+// both) is still treated as transient: settling the task as Failed on a
+// dead-check error would kill live tasks on every node blip.
+func TestSuspendPhaseSurvivesDeadCheckError(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, frozenErr: errors.New("cgroup.events unreadable"),
+		runningErr: errors.New("ssh down")}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // freeze -> Suspending
+	runOnce(ctl) // probe fails; Running check fails too
+
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSuspending {
+		t.Fatalf("want still Suspending, got %s", task.Status.Phase)
+	}
+}
+
+// RequestSuspend is a compare-and-set on the phase: a mark computed from a
+// stale read — reconcile finished the task between the caller's read and the
+// request — must fail instead of freezing an exited task into a Suspending
+// zombie whose only exit is delete.
+func TestSuspendRequestRejectsStalePhase(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // runner exits -> Succeeded
+
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); !errors.Is(err, store.ErrPhaseConflict) {
+		t.Fatalf("want ErrPhaseConflict, got %v", err)
+	}
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSucceeded {
+		t.Fatalf("task must stay Succeeded, got %s", task.Status.Phase)
+	}
+}
+
+func TestRepairNode(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskRunning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // repair only
+	task = get(t, st, "t1")
+	if task.Status.Node != fakeNode {
+		t.Fatalf("want node repaired to %s, got %q", fakeNode, task.Status.Node)
+	}
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("repair must not move the phase, got %s", task.Status.Phase)
+	}
+
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // now polls normally
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskSucceeded {
+		t.Fatalf("want Succeeded after repair, got %s", task.Status.Phase)
+	}
+}
+
+// A pre-multi-node record whose VMID no longer names any guest cannot be
+// repaired: the task fails instead of wedging on an undeterminable node.
+func TestRepairNodeGuestGone(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:     map[int]int{},
+		nodeOfErr: fmt.Errorf("lookup: %w", ErrGuestGone),
+	}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskRunning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskFailed {
+		t.Fatalf("want Failed, got %s", task.Status.Phase)
+	}
+	if !strings.Contains(task.Status.Reason, "vanished") {
+		t.Fatalf("Reason should note the vanished container, got %q", task.Status.Reason)
+	}
+	if task.Status.EndedAt == nil {
+		t.Fatal("EndedAt should be set")
 	}
 }

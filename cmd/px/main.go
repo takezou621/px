@@ -45,6 +45,10 @@ func main() {
 		err = cmdWatch(fs, args)
 	case "delete":
 		err = cmdDelete(fs, args)
+	case "suspend":
+		err = cmdSuspendResume(fs, args, "suspend")
+	case "resume":
+		err = cmdSuspendResume(fs, args, "resume")
 	case "version":
 		fmt.Println("px v0.0.1 (px.io/v1alpha1)")
 	case "help", "-h", "--help":
@@ -106,10 +110,14 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 		if err := doJSON(http.MethodGet, "/v1/tasks", nil, &tasks); err != nil {
 			return err
 		}
-		fmt.Printf("%-24s %-16s %-8s %s\n", "NAME", "PHASE", "CT", "AGE")
+		fmt.Printf("%-24s %-16s %-12s %-8s %s\n", "NAME", "PHASE", "NODE", "CT", "AGE")
 		for _, t := range tasks {
-			fmt.Printf("%-24s %-16s %-8d %s\n",
-				t.Metadata.Name, t.Status.Phase, t.Status.Container, age(t.Status.StartedAt))
+			node := t.Status.Node
+			if node == "" {
+				node = "-"
+			}
+			fmt.Printf("%-24s %-16s %-12s %-8d %s\n",
+				t.Metadata.Name, t.Status.Phase, node, t.Status.Container, age(t.Status.StartedAt))
 		}
 		return nil
 	case "workspaces":
@@ -372,6 +380,28 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
+// cmdSuspendResume posts the phase-flip request; the server gates on the
+// current phase (409 for the wrong one), so the CLI is a thin pass-through.
+// Accepts both `px suspend task NAME` and `px suspend NAME`.
+func cmdSuspendResume(fs *flag.FlagSet, args []string, op string) error {
+	if len(args) > 0 && args[0] == "task" {
+		args = args[1:]
+	}
+	name, rest, err := popName(args)
+	if err != nil {
+		return fmt.Errorf("usage: px %s task NAME", op)
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	var out map[string]string
+	if err := doJSON(http.MethodPost, "/v1/tasks/"+name+"/"+op, nil, &out); err != nil {
+		return err
+	}
+	fmt.Printf("task.px.io/%s %s\n", name, out["status"])
+	return nil
+}
+
 func cmdWatch(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -557,6 +587,8 @@ Usage:
   px delete task NAME             Delete a task and its container
   px delete model NAME            Delete a model
   px delete gateway NAME          Delete a gateway
+  px suspend task NAME            Suspend a running task (freezes its container)
+  px resume task NAME             Resume a suspended task
   px version                      Show version
 
 Flags:

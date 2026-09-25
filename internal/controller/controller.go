@@ -42,6 +42,11 @@ type GatewayReader interface {
 type TaskWriter interface {
 	UpsertTask(*v1alpha1.Task) error
 	MarkTaskDeleted(name string, at time.Time) error
+	// MarkTaskPhase is a compare-and-set on expect: the write lands only if
+	// the persisted phase still matches what the caller read, so a phase mark
+	// racing a reconcile transition fails instead of freezing a task that
+	// already finished.
+	MarkTaskPhase(name string, expect, phase v1alpha1.TaskPhase, reason string) error
 	DeleteTask(name string) error
 }
 
@@ -101,6 +106,24 @@ func (c *Controller) RequestDestroy(name string) error {
 	return c.store.MarkTaskDeleted(name, c.now())
 }
 
+// RequestSuspend persists the Suspending phase; reconcile drives the freeze
+// on its next tick — the same async model as RequestDestroy, and the same
+// single-statement discipline so it cannot clobber a VMID reconcile persists
+// concurrently. expect is the phase the caller read before deciding: if
+// reconcile moved the task since (typically to a terminal phase), the mark
+// fails with store.ErrPhaseConflict rather than freezing a finished task
+// into Suspending. The mark lives in the store, so an in-flight suspend
+// survives a px-server restart.
+func (c *Controller) RequestSuspend(name string, expect v1alpha1.TaskPhase) error {
+	return c.store.MarkTaskPhase(name, expect, v1alpha1.TaskSuspending, "suspend requested")
+}
+
+// RequestResume persists the Resuming phase; reconcile drives the thaw.
+// Same compare-and-set discipline as RequestSuspend.
+func (c *Controller) RequestResume(name string, expect v1alpha1.TaskPhase) error {
+	return c.store.MarkTaskPhase(name, expect, v1alpha1.TaskResuming, "resume requested")
+}
+
 func (c *Controller) reconcileAll(ctx context.Context) {
 	tasks, err := c.store.ListTasks()
 	if err != nil {
@@ -115,6 +138,15 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	if t.Status.DeletionTimestamp != nil {
 		c.destroyTask(ctx, t)
+		return
+	}
+
+	// Records provisioned before Status.Node existed carry an empty node;
+	// repair them from the cluster view before anything node-scoped runs.
+	// repairNode either persists the node or fails the task, so this pass
+	// runs at most once per record.
+	if t.Status.Container != 0 && t.Status.Node == "" {
+		c.repairNode(ctx, t)
 		return
 	}
 
@@ -137,7 +169,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 		// have died with the SSH session. Adopt the task only if the runner
 		// actually launched; otherwise the container is a partial clone —
 		// clean it up rather than spin in a fake Running.
-		booted, err := c.prov.Booted(ctx, t.Status.Container)
+		booted, err := c.prov.Booted(ctx, t.Status.Node, t.Status.Container)
 		if err != nil {
 			// Transient probe failure; retry on the next tick. A container
 			// that is gone or stopped makes pct exec fail with a non-zero
@@ -149,7 +181,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			// A reused VMID can carry a foreign boot marker; adoption must not
 			// run someone else's runner as this task. A container that is not
 			// ours (by hostname) is left alone and the task fails.
-			owned, oerr := c.prov.Owned(ctx, t.Metadata.Name, t.Status.Container)
+			owned, oerr := c.prov.Owned(ctx, t.Metadata.Name, t.Status.Node, t.Status.Container)
 			if oerr != nil {
 				c.log.Error("check ownership before adoption", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", oerr)
 				return
@@ -171,7 +203,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			c.persist(t)
 			return
 		}
-		if err := c.prov.DestroyOwned(ctx, t.Metadata.Name, t.Status.Container); err != nil {
+		if err := c.prov.DestroyOwned(ctx, t.Metadata.Name, t.Status.Node, t.Status.Container); err != nil {
 			if !errors.Is(err, ErrNotOwned) {
 				c.log.Error("cleanup interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
 				return
@@ -193,9 +225,41 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 		c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name, "cleaned", "partial container destroyed")
 		c.persist(t)
 	case v1alpha1.TaskRunning:
-		c.poll(ctx, t)
+		c.reconcileRunning(ctx, t)
+	case v1alpha1.TaskSuspending:
+		c.reconcileSuspending(ctx, t)
+	case v1alpha1.TaskSuspended:
+		c.reconcileSuspended(ctx, t)
+	case v1alpha1.TaskResuming:
+		c.reconcileResuming(ctx, t)
 	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
 		c.cleanupAfterTTL(ctx, t)
+	}
+}
+
+// repairNode fills Status.Node for records persisted before multi-node
+// existed: the cluster resource view maps the recorded VMID to the node it
+// lives on. One persist and the record looks exactly like a scheduled one.
+func (c *Controller) repairNode(ctx context.Context, t *v1alpha1.Task) {
+	node, err := c.prov.NodeOf(ctx, t.Status.Container)
+	switch {
+	case errors.Is(err, ErrGuestGone):
+		// The container is gone while the record still claims it exists —
+		// fail the task rather than wedge on a node that cannot be
+		// determined.
+		end := c.now()
+		t.Status.EndedAt = &end
+		t.Status.Phase = v1alpha1.TaskFailed
+		t.Status.Reason = "container vanished from the cluster: " + err.Error()
+		c.log.Warn("container vanished", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		c.persist(t)
+	case err != nil:
+		// Cluster view unavailable; retry next tick.
+		c.log.Warn("repair node", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+	default:
+		t.Status.Node = node
+		c.log.Info("repaired missing node", "task", t.Metadata.Name, "vmid", t.Status.Container, "node", node)
+		c.persist(t)
 	}
 }
 
@@ -203,27 +267,82 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 // succeeds the record keeps its DeletionTimestamp, so a failure or a crash
 // mid-destroy retries on the next tick.
 func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
-	if vmid := t.Status.Container; vmid != 0 {
-		err := c.prov.DestroyOwned(ctx, t.Metadata.Name, vmid)
+	vmid := t.Status.Container
+	if vmid == 0 {
+		if t.Status.Phase == v1alpha1.TaskProvisioning {
+			c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
+		}
+		if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
+			c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
+		}
+		return
+	}
+
+	// Destroy is node-scoped, so the node must be known before anything else.
+	// Records from before multi-node (or a crashed write) may lack it.
+	if t.Status.Node == "" {
+		node, err := c.prov.NodeOf(ctx, vmid)
 		switch {
-		case errors.Is(err, ErrNotOwned):
-			// The VMID names a container that is not ours (PVE nextid is
-			// unreserved); it is not px's to destroy, so drop the record
-			// rather than retry forever.
-			c.log.Warn("destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+		case errors.Is(err, ErrGuestGone):
+			// Nothing on the cluster answers to this VMID: destroy is
+			// already complete as far as the guest is concerned.
+			c.log.Warn("destroy: container already gone from cluster", "task", t.Metadata.Name, "vmid", vmid)
 			t.Status.Container = 0
 			c.persist(t)
+			if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
+				c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
+			}
+			return
 		case err != nil:
-			// Keep the record and retry next tick; deleting it now
-			// would orphan the container with nothing left to retry.
-			c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+			// Cluster view unavailable; retry next tick.
+			c.log.Warn("destroy: repair node", "task", t.Metadata.Name, "vmid", vmid, "err", err)
 			return
 		default:
-			t.Status.Container = 0
+			t.Status.Node = node
+			c.log.Info("repaired missing node", "task", t.Metadata.Name, "vmid", vmid, "node", node)
 			c.persist(t)
 		}
-	} else if t.Status.Phase == v1alpha1.TaskProvisioning {
-		c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
+	}
+	node := t.Status.Node
+
+	// Guard ownership before thawing too: a recorded VMID another container
+	// now holds must not be thawed any more than destroyed. DestroyOwned
+	// re-checks, which shrinks (not closes) the window between the two
+	// checks — the same residual race the M3 guards accept.
+	switch owned, oerr := c.prov.Owned(ctx, t.Metadata.Name, node, vmid); {
+	case oerr != nil:
+		c.log.Error("destroy: check ownership", "task", t.Metadata.Name, "vmid", vmid, "err", oerr)
+		return
+	case !owned:
+		c.log.Warn("destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid)
+		t.Status.Container = 0
+		c.persist(t)
+	default:
+		// A suspended container cannot be stopped or destroyed through pct
+		// while frozen: thaw first. A stopped container fails the PID lookup,
+		// which is fine — only a frozen one needs the thaw.
+		if err := c.prov.Thaw(ctx, node, vmid); err != nil {
+			c.log.Warn("thaw before destroy (ignored unless destroy also fails)", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+		}
+	}
+
+	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, node, vmid)
+	switch {
+	case errors.Is(err, ErrNotOwned):
+		// The VMID names a container that is not ours (PVE nextid is
+		// unreserved); it is not px's to destroy, so drop the record
+		// rather than retry forever.
+		c.log.Warn("destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+		t.Status.Container = 0
+		c.persist(t)
+	case err != nil:
+		// Keep the record and retry next tick; deleting it now
+		// would orphan the container with nothing left to retry.
+		c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+		return
+	default:
+		t.Status.Container = 0
+		c.persist(t)
 	}
 	if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 		c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
@@ -253,6 +372,13 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Reason = "cloning template and starting container"
 	c.persist(t)
 
+	node, err := c.prov.Schedule(ctx, t.Spec.Image)
+	if err != nil {
+		c.failProvision(t, fmt.Errorf("schedule: %w", err))
+		return
+	}
+	t.Status.Node = node
+
 	vmid, err := c.prov.Allocate(ctx)
 	if err != nil {
 		c.failProvision(t, fmt.Errorf("allocate: %w", err))
@@ -273,7 +399,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
-	if err := c.prov.Create(ctx, t, vmid, mounts, model, gw); err != nil {
+	if err := c.prov.Create(ctx, t, node, vmid, mounts, model, gw); err != nil {
 		// Create cleans up its own partial work, so the VMID no longer names
 		// a container of ours. Clear it: a later destroy must never target an
 		// id that Create may have lost to another owner (PVE's nextid is a
@@ -351,11 +477,11 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 	if t.Status.Container == 0 {
 		return
 	}
-	code, err := c.prov.Exit(ctx, t.Status.Container)
+	code, err := c.prov.Exit(ctx, t.Status.Node, t.Status.Container)
 	if err != nil {
 		// The container may have died without writing an exit file (OOM,
 		// node reboot); distinguish that from a transient probe failure.
-		if running, rerr := c.prov.Running(ctx, t.Status.Container); rerr == nil && !running {
+		if running, rerr := c.prov.Running(ctx, t.Status.Node, t.Status.Container); rerr == nil && !running {
 			end := c.now()
 			t.Status.EndedAt = &end
 			t.Status.Phase = v1alpha1.TaskFailed
@@ -384,6 +510,118 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 	c.persist(t)
 }
 
+// reconcileRunning polls the runner, but first adopts any container found
+// frozen. A container frozen out-of-band (pct on the node, a host reboot
+// restoring a frozen state) would hang every pct exec — including poll's —
+// until it thaws, so the freeze is claimed as a suspend before probing.
+func (c *Controller) reconcileRunning(ctx context.Context, t *v1alpha1.Task) {
+	frozen, err := c.prov.Frozen(ctx, t.Status.Node, t.Status.Container)
+	if err == nil && frozen {
+		t.Status.Phase = v1alpha1.TaskSuspended
+		t.Status.Reason = "adopted container found frozen"
+		c.log.Info("adopted frozen container as suspended", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		c.persist(t)
+		return
+	}
+	if err != nil {
+		// Probe failures (SSH blip, container stopped) fall through to poll,
+		// which decides whether the container died.
+		c.log.Warn("frozen probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+	}
+	c.poll(ctx, t)
+}
+
+// deadDuringSuspend settles a suspend-phase task whose container has
+// stopped or vanished: the freeze probe fails for a dead guest as surely as
+// for an SSH blip, and without this check the phase would retry forever and
+// resume would never land (the PID the thaw path needs is gone). Same rule
+// as poll's dead-container path: Failed, with EndedAt set. Returns true when
+// it settled the task; callers should then not touch it further this tick.
+func (c *Controller) deadDuringSuspend(ctx context.Context, t *v1alpha1.Task, during string) bool {
+	running, err := c.prov.Running(ctx, t.Status.Node, t.Status.Container)
+	if err != nil || running {
+		return false
+	}
+	end := c.now()
+	t.Status.EndedAt = &end
+	t.Status.Phase = v1alpha1.TaskFailed
+	t.Status.Reason = "container not running while " + during
+	c.log.Warn("container died", "task", t.Metadata.Name, "vmid", t.Status.Container, "during", during)
+	c.persist(t)
+	return true
+}
+
+// reconcileSuspending drives Suspending → Suspended: freeze, then confirm on
+// the next tick. Each step is idempotent, so a crash between them resumes
+// correctly from the persisted phase.
+func (c *Controller) reconcileSuspending(ctx context.Context, t *v1alpha1.Task) {
+	frozen, err := c.prov.Frozen(ctx, t.Status.Node, t.Status.Container)
+	if err != nil {
+		if !c.deadDuringSuspend(ctx, t, "suspending") {
+			c.log.Warn("suspend probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		}
+		return
+	}
+	if !frozen {
+		if err := c.prov.Freeze(ctx, t.Status.Node, t.Status.Container); err != nil {
+			c.log.Error("freeze", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			return
+		}
+		// Verify on the next tick rather than trusting the write.
+		return
+	}
+	t.Status.Phase = v1alpha1.TaskSuspended
+	t.Status.Reason = "container frozen"
+	c.log.Info("task suspended", "task", t.Metadata.Name, "vmid", t.Status.Container)
+	c.persist(t)
+}
+
+// reconcileSuspended keeps watching a suspended container: an external thaw
+// (pct, host restart) would silently un-suspend the task, so re-freeze. It
+// deliberately does not poll the runner: a frozen runner cannot report an
+// exit anyway, and an exit-file check would have to spawn into the frozen
+// cgroup and block until thaw.
+func (c *Controller) reconcileSuspended(ctx context.Context, t *v1alpha1.Task) {
+	frozen, err := c.prov.Frozen(ctx, t.Status.Node, t.Status.Container)
+	if err != nil {
+		if !c.deadDuringSuspend(ctx, t, "suspended") {
+			c.log.Warn("suspended probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		}
+		return
+	}
+	if !frozen {
+		c.log.Warn("suspended container thawed externally; re-freezing", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		if err := c.prov.Freeze(ctx, t.Status.Node, t.Status.Container); err != nil {
+			c.log.Error("re-freeze", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		}
+	}
+}
+
+// reconcileResuming drives Resuming → Running: thaw, then confirm on the
+// next tick. The runner was frozen mid-flight, so the resume returns the
+// task to Running regardless of how long it was suspended.
+func (c *Controller) reconcileResuming(ctx context.Context, t *v1alpha1.Task) {
+	frozen, err := c.prov.Frozen(ctx, t.Status.Node, t.Status.Container)
+	if err != nil {
+		if !c.deadDuringSuspend(ctx, t, "resuming") {
+			c.log.Warn("resume probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		}
+		return
+	}
+	if frozen {
+		if err := c.prov.Thaw(ctx, t.Status.Node, t.Status.Container); err != nil {
+			c.log.Error("thaw", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			return
+		}
+		// Verify on the next tick rather than trusting the write.
+		return
+	}
+	t.Status.Phase = v1alpha1.TaskRunning
+	t.Status.Reason = "container thawed"
+	c.log.Info("task resumed", "task", t.Metadata.Name, "vmid", t.Status.Container)
+	c.persist(t)
+}
+
 func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 	ttl := t.Spec.TTLSecondsAfterFinished
 	if ttl <= 0 || t.Status.Container == 0 || t.Status.EndedAt == nil {
@@ -394,7 +632,7 @@ func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	vmid := t.Status.Container
-	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, vmid)
+	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, t.Status.Node, vmid)
 	switch {
 	case errors.Is(err, ErrNotOwned):
 		c.log.Warn("ttl destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid, "err", err)

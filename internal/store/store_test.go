@@ -128,6 +128,47 @@ func TestMarkTaskDeleted(t *testing.T) {
 	}
 }
 
+// MarkTaskPhase is a compare-and-set on the phase the caller read: a mark
+// computed from a stale read (reconcile finished the task in between) must
+// write nothing — freezing a task that already exited into a Suspending
+// record is exactly the failure this guards against.
+func TestMarkTaskPhaseCAS(t *testing.T) {
+	st := openTestStore(t)
+	task := testTask("t1")
+	task.Status.Phase = v1alpha1.TaskRunning
+	if err := st.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Matching expect: the write lands.
+	if err := st.MarkTaskPhase("t1", v1alpha1.TaskRunning, v1alpha1.TaskSuspending, "suspend requested"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetTask("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != v1alpha1.TaskSuspending || got.Status.Reason != "suspend requested" {
+		t.Fatalf("want Suspending/suspend requested, got %s/%s", got.Status.Phase, got.Status.Reason)
+	}
+
+	// Stale expect: nothing is written, ErrPhaseConflict comes back.
+	if err := st.MarkTaskPhase("t1", v1alpha1.TaskRunning, v1alpha1.TaskSuspending, "stale"); !errors.Is(err, ErrPhaseConflict) {
+		t.Fatalf("want ErrPhaseConflict, got %v", err)
+	}
+	got, err = st.GetTask("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != v1alpha1.TaskSuspending || got.Status.Reason != "suspend requested" {
+		t.Fatalf("conflicting mark must not touch the task, got %s/%s", got.Status.Phase, got.Status.Reason)
+	}
+
+	if err := st.MarkTaskPhase("nope", v1alpha1.TaskRunning, v1alpha1.TaskSuspending, "x"); !errors.Is(err, ErrPhaseConflict) {
+		t.Fatalf("missing task must conflict too, got %v", err)
+	}
+}
+
 // UpsertTask must never erase a deletion request that was persisted while the
 // caller held a stale snapshot. Also exercises json_set/json_extract, which
 // the mark-preserving UPSERT depends on.

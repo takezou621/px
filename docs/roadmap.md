@@ -1,6 +1,6 @@
 # px roadmap
 
-Status: 2026-09-25. Owner: Claude (acting PO).
+Status: 2026-09-26. Owner: Claude (acting PO).
 
 ## M0 — Foundation (done)
 
@@ -276,8 +276,93 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     body read cannot aim exec at a recycled CTID (residual race accepted,
     threat model). Empty argv elements are legal; NUL bytes and trailing
     JSON garbage are rejected.
-- [ ] Multi-node scheduling (PVE cluster, pick node by free resources)
-- [ ] `px suspend` / `px resume` (PVE snapshot / CT freeze)
+- [x] Multi-node scheduling (PVE cluster, pick node by free resources)
+  - Landed 2026-09-26, E2E-verified live against the lab cluster
+    (`akebono-cluster`, nodes third/second; `scripts/e2e-multi-node.sh`,
+    docs/e2e.md §3f, 13/13): the NODE column is populated and stable,
+    the schedule lands on a template-bearing online node, the clone
+    really lives on that node, exec/logs/suspend/resume cross the node
+    boundary, and delete removes the container from that same node.
+    Single-node mode unchanged (smoke 14/14 regression on `third`).
+  - Design: `-pve-node` becomes optional. Set, px-server is single-node
+    (today's behavior: one proxmox.Client, one SSH executor, fail-fast
+    dial at boot). Empty, px-server runs in cluster mode: the PVE API
+    proxies every node through one endpoint (the GUI depends on this),
+    so one token reaches all of them; SSH is per node. Scheduling
+    happens at provision time from one `GET /cluster/resources`:
+    candidates are nodes that are both `online` and carry the task's
+    `spec.image` template (`FindTemplateVMID` per candidate) —
+    restricting to template-bearing nodes also sidesteps cross-node
+    clone (the clone `target` parameter's behavior varies across PVE
+    versions; cloning from the template's own node does not). The pick
+    is most free memory (`maxmem-mem`), tie-broken by lower `cpu` load
+    then node name, so it is deterministic. No candidate is a
+    ProvisionFailed reason like any other provision error. The winning
+    node persists to a new `Status.Node` (status is a JSON blob in
+    SQLite, so no schema migration); every later provisioner call
+    (poll, logs, exec, destroy) carries it, and legacy records
+    persisted before this change hold an empty Node that the controller
+    repairs once via a vmid→node lookup, so a pre-cluster px-server
+    keeps managing its tasks across upgrade. Connections: a small pool
+    keys one `*proxmox.Client` and one `*sshexec.Executor` per node —
+    the SSH dial is lazy, so a node no task ever lands on is never
+    dialed; single-node mode keeps its boot fail-fast, cluster mode
+    fails fast on the API only. Node names are not DNS names (the lab
+    cluster's `third` has no /etc/hosts entry for `second`), so
+    `-ssh-host-override "second=192.168.2.183,forth=192.168.2.214"`
+    maps node→SSH host; unset means the node's own name. Host key
+    pinning becomes per host: pin-file lines in known_hosts format
+    carry a hostname field — a line with one pins only that host;
+    authorized_keys-format lines (no hostname) pin every host, so a
+    single-node pin file keeps working verbatim. `px get tasks` gains
+    a NODE column.
+- [x] `px suspend` / `px resume` (CT freeze)
+  - Landed 2026-09-26, E2E-verified live in both cluster mode (task on
+    `second`, checked through its own node's SSH) and single-node mode
+    (`scripts/e2e-suspend.sh`, docs/e2e.md §3e, 22/22 each): Suspended
+    lands with the cgroup actually frozen, exec refuses 409 while
+    frozen, resume restores Running with exec working, idempotent
+    suspend/resume are 200s, an out-of-band thaw is re-frozen by the
+    controller, deleting a frozen task thaws first and leaves no
+    container, terminal tasks refuse suspend. Suspend-across-restart
+    verified live (px-server killed and restarted while a task was
+    Suspended: phase held, cgroup stayed frozen, resume ran the
+    container back to Running). The first live run caught a real bug:
+    `/proc/<pid>/cgroup`'s v2 line is `0::<path>` with no spaces, so
+    the awk field-split never matched — the parser is now
+    `sed -n 's/^0:://p'` on both sides (provisioner and E2E).
+  - Design: cgroup-v2 freeze, not snapshots — PVE snapshots are a QEMU
+    feature; freezing keeps the process tree and memory in place,
+    resumes instantly, and survives px-server restarts (the CT holds
+    its state; only the phase record needs the controller). Constraint
+    discovered while designing: `pct exec` cannot enter a frozen
+    cgroup — the spawned process blocks in the freezer until thaw, so
+    an exec-based probe would hang every reconcile tick — therefore
+    all freeze operations run at node level: `GET
+    /nodes/{n}/lxc/{vmid}/status/current` yields the container's pid,
+    `/proc/<pid>/cgroup`'s `0::` line names the CT's cgroup v2 path,
+    writing 1/0 to that directory's `cgroup.freeze` freezes/thaws, and
+    `cgroup.events`' `frozen` line verifies (all PVE 9 nodes ship
+    cgroup v2 unified — verified on the lab cluster). Three new phases
+    make intent declarative, matching the delete model: `POST
+    /v1/tasks/{name}/suspend` / `/resume` handlers only persist the
+    phase (single-statement json_set, the deletionTimestamp
+    discipline) and touch no SSH — the reconcile loop runs the state
+    machine: Suspending → freeze → verify → Suspended; Resuming →
+    thaw → verify → Running; Suspended re-verifies every tick and
+    re-freezes if thawed externally (declarative maintenance); a
+    Running task that is in fact frozen (someone froze it by hand) is
+    adopted into Suspended at its next poll — which must precede any
+    pct exec, since that would hang. Suspend/resume on a deleting or
+    terminal task is a 409; suspend while suspended and resume while
+    running are idempotent 200s. exec stays Running-only (409 on
+    Suspended — that is exactly the case that would hang). Destroy
+    thaws first: stop+destroy of a frozen CT is undefined territory.
+    TTL cleanup and watch are untouched (suspended is non-terminal, so
+    TTL never fires and watch keeps streaming). `px suspend task NAME`
+    / `px resume task NAME` join the kubectl-style CLI. Threat-model
+    note: a suspended CT keeps its whole memory resident on the node —
+    suspend is pause, not save-to-disk.
 
 ## Explicitly deferred
 

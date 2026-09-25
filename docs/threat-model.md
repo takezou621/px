@@ -128,7 +128,31 @@ step rides `pct exec` over SSH. `ssh-key`/host-key pinning (M3) is
 opt-in and stricter than TOFU — no first-use trust is ever recorded:
 without a pin file, every host key is accepted on every connection, so
 a MITM between px-server and the node gets node root. Pin it in
-anything but a throwaway lab.
+anything but a throwaway lab. Cluster mode widens this to one root SSH
+per cluster node (dialed lazily, but with root the moment a task lands
+there), and the host-key pin file becomes per host: a known_hosts
+line scopes its key to the named hosts, an authorized_keys-format line
+pins every node — a single-node pin file carries over verbatim. With a
+pin file in use the check is fail-closed: a host the file never names
+(missing or misspelled line) is refused at dial time, not silently
+accepted.
+
+## Suspend/resume
+
+`px suspend` freezes the container's cgroup v2, which is a *pause*,
+not a quiesce: every process and page of the task stays resident in
+the node's memory, and the freeze is as authoritative as the runner
+itself. Three properties follow. First, a suspended task's secret
+material (model keys in /run/px, workspace state) sits in RAM of a
+node an operator with root access can already read — the token
+boundary does not change. Second, the freeze survives px-server
+restarts (it lives in the container's cgroup, not in px-server's
+memory), and the controller re-freezes a Suspended task that was
+thawed out of band — so "suspended" is maintained, declaratively,
+until resumed or deleted. Third, exec refuses a frozen task outright
+(it would block inside the freezer), so a suspended task cannot be
+probed into hanging; destroy thaws before stopping, since stop+destroy
+of a frozen CT is undefined territory.
 
 ## Destroy guards
 

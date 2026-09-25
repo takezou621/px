@@ -142,6 +142,9 @@ const (
 	TaskPending       TaskPhase = "Pending"
 	TaskProvisioning  TaskPhase = "Provisioning"
 	TaskRunning       TaskPhase = "Running"
+	TaskSuspending    TaskPhase = "Suspending"
+	TaskSuspended     TaskPhase = "Suspended"
+	TaskResuming      TaskPhase = "Resuming"
 	TaskSucceeded     TaskPhase = "Succeeded"
 	TaskFailed        TaskPhase = "Failed"
 	TaskProvisionFail TaskPhase = "ProvisionFailed"
@@ -166,8 +169,13 @@ type Workspace struct {
 
 // TaskStatus is the observed state of a Task.
 type TaskStatus struct {
-	Phase     TaskPhase  `json:"phase" yaml:"phase"`
-	Reason    string     `json:"reason,omitempty" yaml:"reason,omitempty"`
+	Phase  TaskPhase `json:"phase" yaml:"phase"`
+	Reason string    `json:"reason,omitempty" yaml:"reason,omitempty"`
+	// Node is the PVE cluster node the container lives on, fixed at
+	// provision time (cluster mode schedules it; single-node mode stores
+	// the configured node). Empty only on records provisioned before
+	// multi-node existed — the controller repairs those in place.
+	Node      string     `json:"node,omitempty" yaml:"node,omitempty"`
 	Container int        `json:"container,omitempty" yaml:"container,omitempty"` // PVE VMID
 	StartedAt *time.Time `json:"startedAt,omitempty" yaml:"startedAt,omitempty"`
 	EndedAt   *time.Time `json:"endedAt,omitempty" yaml:"endedAt,omitempty"`

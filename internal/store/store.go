@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrExists   = errors.New("already exists")
+	ErrNotFound      = errors.New("not found")
+	ErrExists        = errors.New("already exists")
+	ErrPhaseConflict = errors.New("task phase changed since it was read")
 )
 
 // executor is the subset of *sql.DB and *sql.Tx the store needs, so InTx can
@@ -134,6 +135,29 @@ func (s *Store) MarkTaskDeleted(name string, at time.Time) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkTaskPhase sets one task's phase and reason in a single statement —
+// same reasoning as MarkTaskDeleted: suspend/resume requests are API-side
+// writes that reconcile observes later, so they must never overwrite a
+// VMID or timestamps a concurrent persist just landed. The update is guarded
+// on the phase the caller read: if reconcile transitioned the task (say to
+// Succeeded) between the caller's read and this write, the row does not
+// match, nothing is written, and ErrPhaseConflict tells the caller the
+// decision was made on stale state instead of letting the mark freeze a
+// finished task into Suspending forever.
+func (s *Store) MarkTaskPhase(name string, expect, phase v1alpha1.TaskPhase, reason string) error {
+	res, err := s.db.Exec(
+		`UPDATE tasks SET status = json_set(json_set(status, '$.phase', ?), '$.reason', ?), updated_at=datetime('now')
+		 WHERE name = ? AND json_extract(status,'$.phase') = ?`,
+		string(phase), reason, name, string(expect))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrPhaseConflict
 	}
 	return nil
 }
