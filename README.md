@@ -84,6 +84,8 @@ fix-bug-123 Provisioning -> Running
 fix-bug-123 Running -> Succeeded
 
 $ px logs -f fix-bug-123
+
+$ px exec fix-bug-123 -- ps aux     # peek into the live sandbox
 ```
 
 ## Quick start (target)

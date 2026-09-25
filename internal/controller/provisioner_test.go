@@ -420,6 +420,47 @@ func TestQuoteCommandExportsGoalAndQuotesArgv(t *testing.T) {
 	}
 }
 
+// The exec command line must quote every argument for both shells it crosses:
+// metacharacters, whitespace and quotes reach pct's argv byte-exact, and the
+// caller's `; rm -rf /` stays an inert argument, never a second command.
+func TestPctExecCommandQuotesArgv(t *testing.T) {
+	out := pctExecCommand(142, []string{"sh", "-c", "echo hi; rm -rf /"})
+	if out != `pct exec 142 -- 'sh' '-c' 'echo hi; rm -rf /'` {
+		t.Fatalf("got %q", out)
+	}
+	out = pctExecCommand(7, []string{"it's", "a b", `"q"`})
+	if out != `pct exec 7 -- 'it'\''s' 'a b' '"q"'` {
+		t.Fatalf("got %q", out)
+	}
+	if out := pctExecCommand(7, nil); out != "pct exec 7 --" {
+		t.Fatalf("empty argv got %q", out)
+	}
+}
+
+// Once a stream overflows the cap the excess is dropped but the write keeps
+// succeeding: the ssh copy goroutine must not stall or kill the command over
+// output the caller will not see anyway.
+func TestCappedWriterTruncatesAndKeepsWriting(t *testing.T) {
+	w := &cappedWriter{max: 8}
+	n, err := w.Write([]byte("1234567890"))
+	if n != 10 || err != nil {
+		t.Fatalf("Write = (%d, %v), want (10, nil)", n, err)
+	}
+	if w.String() != "12345678" {
+		t.Fatalf("kept %q, want the first 8 bytes", w.String())
+	}
+	if !w.truncated {
+		t.Fatal("truncated flag not set")
+	}
+	// Past the cap nothing more is kept — but writes stay healthy.
+	if n, err := w.Write([]byte("abc")); n != 3 || err != nil {
+		t.Fatalf("overflow Write = (%d, %v)", n, err)
+	}
+	if w.String() != "12345678" {
+		t.Fatalf("post-cap write leaked: %q", w.String())
+	}
+}
+
 func TestBootCommandMkdirBeforeRedirect(t *testing.T) {
 	cmd := bootCommand(142, "", "echo hi")
 	um := strings.Index(cmd, "umask 077")

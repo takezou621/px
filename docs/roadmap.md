@@ -247,9 +247,29 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 
 ## M4 — Beyond one node
 
+- [x] `px exec` (run a debug command in a running task's container)
+  - Design: `px exec NAME -- COMMAND [ARG...]` posts to
+    `POST /v1/tasks/{name}/exec` with `{"command": [...]}`; the server
+    requires a live sandbox (phase Running, container set — anything else
+    is a 409) and runs the command via the existing node SSH + `pct exec`
+    path, returning `{"stdout", "stderr", "exitCode", "truncated"}` in one
+    JSON response. The command crosses both shells (the SSH transport's
+    remote shell, then pct's argv) safely: each argument is single-quoted
+    POSIX-style (`'` → `'\''`), so metacharacters and spaces reach the
+    container byte-exact — a debug tool must not be the quoting hole the
+    boot script's base64 embedding was built to avoid. Output is capped at
+    1 MiB per stream (a hung `cat /dev/zero` must not fill px-server's
+    memory; overflow sets `truncated` and keeps going), the whole call is
+    bounded by a 2-minute timeout, and a non-zero command exit is a result,
+    not an error — the CLI exits with the command's code, like kubectl.
+    Request caps match the apply style: 16 arguments, 4 KiB each, 32 KiB
+    total. `px exec` is an operator tool on the same trust level as apply
+    (the token holder already specifies arbitrary commands at apply time);
+    noted in the threat model. stdin/TTY relay is deliberately out: it
+    needs a second channel or raw HTTP plumbing that no other verb uses —
+    one-shot commands cover debugging (`px exec NAME -- sh -c 'ps aux'`).
 - [ ] Multi-node scheduling (PVE cluster, pick node by free resources)
 - [ ] `px suspend` / `px resume` (PVE snapshot / CT freeze)
-- [ ] `px exec` (debug shell into a running task)
 
 ## Explicitly deferred
 

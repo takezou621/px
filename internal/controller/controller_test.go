@@ -81,6 +81,10 @@ func (f *fakeProv) Running(_ context.Context, vmid int) (bool, error) {
 
 func (f *fakeProv) Logs(_ context.Context, _ int) (string, error) { return "log\n", nil }
 
+func (f *fakeProv) Exec(_ context.Context, _ int, _ []string) (*ExecResult, error) {
+	return &ExecResult{}, nil
+}
+
 func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

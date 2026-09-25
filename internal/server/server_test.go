@@ -2,12 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/controller"
@@ -20,10 +25,13 @@ func (nopProv) Allocate(_ context.Context) (int, error) { return 0, nil }
 func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway) error {
 	return nil
 }
-func (nopProv) Booted(_ context.Context, _ int) (bool, error)          { return false, nil }
-func (nopProv) Exit(_ context.Context, _ int) (*int, error)            { return nil, nil }
-func (nopProv) Running(_ context.Context, _ int) (bool, error)         { return true, nil }
-func (nopProv) Logs(_ context.Context, _ int) (string, error)          { return "", nil }
+func (nopProv) Booted(_ context.Context, _ int) (bool, error)  { return false, nil }
+func (nopProv) Exit(_ context.Context, _ int) (*int, error)    { return nil, nil }
+func (nopProv) Running(_ context.Context, _ int) (bool, error) { return true, nil }
+func (nopProv) Logs(_ context.Context, _ int) (string, error)  { return "", nil }
+func (nopProv) Exec(_ context.Context, _ int, _ []string) (*controller.ExecResult, error) {
+	return &controller.ExecResult{}, nil
+}
 func (nopProv) Destroy(_ context.Context, _ int) error                 { return nil }
 func (nopProv) DestroyOwned(_ context.Context, _ string, _ int) error  { return nil }
 func (nopProv) Owned(_ context.Context, _ string, _ int) (bool, error) { return true, nil }
@@ -380,4 +388,200 @@ func TestModels(t *testing.T) {
 	if goneResp.StatusCode != 404 {
 		t.Fatalf("want 404 after delete, got %d", goneResp.StatusCode)
 	}
+}
+
+// execProv records the argv an exec handed it and returns canned results.
+type execProv struct {
+	nopProv
+	mu       sync.Mutex
+	argv     []string
+	stdout   string
+	stderr   string
+	exitCode int
+	err      error
+}
+
+func (p *execProv) Exec(_ context.Context, _ int, argv []string) (*controller.ExecResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.argv = argv
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &controller.ExecResult{Stdout: p.stdout, Stderr: p.stderr, ExitCode: p.exitCode}, nil
+}
+
+func newExecServer(t *testing.T, prov *execProv) (*httptest.Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/px.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctl := controller.New(st, prov, slog.New(slog.DiscardHandler))
+	srv := httptest.NewServer(New(st, ctl, prov, slog.New(slog.DiscardHandler)).Handler())
+	t.Cleanup(srv.Close)
+	return srv, st
+}
+
+func seedExecTask(t *testing.T, st *store.Store, phase v1alpha1.TaskPhase, container int) {
+	t.Helper()
+	tk := &v1alpha1.Task{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   v1alpha1.ObjectMeta{Name: "t1"},
+		Spec:       v1alpha1.TaskSpec{Image: "tmpl", Runner: v1alpha1.RunnerSpec{Command: []string{"true"}}},
+		Status:     v1alpha1.TaskStatus{Phase: phase, Container: container},
+	}
+	if err := st.UpsertTask(tk); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func postExec(t *testing.T, srv *httptest.Server, body string) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := http.Post(srv.URL+"/v1/tasks/t1/exec", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, data
+}
+
+// Exec needs a live sandbox: anything else is a loud 409, never a silent
+// success or a hit on a container the record no longer owns.
+func TestTaskExecRequiresRunningSandbox(t *testing.T) {
+	prov := &execProv{}
+	srv, st := newExecServer(t, prov)
+
+	cases := []struct {
+		name      string
+		phase     v1alpha1.TaskPhase
+		container int
+		want      int
+	}{
+		{"running", v1alpha1.TaskRunning, 42, http.StatusOK},
+		{"pending", v1alpha1.TaskPending, 0, http.StatusConflict},
+		{"running but no container", v1alpha1.TaskRunning, 0, http.StatusConflict},
+		{"failed", v1alpha1.TaskFailed, 42, http.StatusConflict},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			seedExecTask(t, st, c.phase, c.container)
+			resp, body := postExec(t, srv, `{"command": ["true"]}`)
+			if resp.StatusCode != c.want {
+				t.Fatalf("want %d, got %d: %s", c.want, resp.StatusCode, body)
+			}
+		})
+	}
+
+	// A task marked for deletion is going away — exec must refuse even while
+	// the phase still reads Running.
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	if err := st.MarkTaskDeleted("t1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := postExec(t, srv, `{"command": ["true"]}`)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("deleting task: want 409, got %d: %s", resp.StatusCode, body)
+	}
+
+	// A task that does not exist is 404, not a confusion with 409.
+	resp404, _ := http.Post(srv.URL+"/v1/tasks/nope/exec", "application/json", strings.NewReader(`{"command": ["true"]}`))
+	resp404.Body.Close()
+	if resp404.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing task: want 404, got %d", resp404.StatusCode)
+	}
+}
+
+// The result carries the streams and the command's exit code; a non-zero exit
+// is a result (200), not an error.
+func TestTaskExecReturnsResult(t *testing.T) {
+	prov := &execProv{stdout: "out\n", stderr: "err\n", exitCode: 3}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+
+	resp, body := postExec(t, srv, `{"command": ["sh", "-c", "echo out; echo err >&2; exit 3"]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	prov.mu.Lock()
+	gotArgv := prov.argv
+	prov.mu.Unlock()
+	if diff := cmpArgs(gotArgv, []string{"sh", "-c", "echo out; echo err >&2; exit 3"}); diff != "" {
+		t.Fatalf("argv mangled: %s", diff)
+	}
+	var out struct {
+		Stdout    string `json:"stdout"`
+		Stderr    string `json:"stderr"`
+		ExitCode  int    `json:"exitCode"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if out.Stdout != "out\n" || out.Stderr != "err\n" || out.ExitCode != 3 || out.Truncated {
+		t.Fatalf("result = %+v", out)
+	}
+}
+
+// A provisioner failure (node unreachable) is a 502 — distinct from the
+// command's own non-zero exit.
+func TestTaskExecProvError(t *testing.T) {
+	prov := &execProv{err: errors.New("ssh down")}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	resp, body := postExec(t, srv, `{"command": ["true"]}`)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("want 502, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+// Request caps, in the apply style: an empty command, too many arguments, an
+// oversized argument, a malformed body.
+func TestTaskExecRejectsBadRequests(t *testing.T) {
+	prov := &execProv{}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"no command", `{}`},
+		{"empty command", `{"command": []}`},
+		{"empty argument", `{"command": ["sh", ""]}`},
+		{"too many arguments", `{"command": [` + strings.TrimSuffix(strings.Repeat(`"a",`, 17), ",") + `]}`},
+		{"oversize argument", `{"command": ["` + strings.Repeat("x", 4<<10+1) + `"]}`},
+		{"malformed body", `{"command":`},
+		{"not a list", `{"command": "true"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, body := postExec(t, srv, c.body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d: %s", resp.StatusCode, body)
+			}
+		})
+	}
+	// Nothing rejected above may have reached the provisioner.
+	prov.mu.Lock()
+	reached := prov.argv != nil
+	prov.mu.Unlock()
+	if reached {
+		t.Fatal("a rejected request must not reach the provisioner")
+	}
+}
+
+func cmpArgs(got, want []string) string {
+	if len(got) != len(want) {
+		return fmt.Sprintf("len %d != %d (%q vs %q)", len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return fmt.Sprintf("arg %d: %q != %q", i, got[i], want[i])
+		}
+	}
+	return ""
 }

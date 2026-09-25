@@ -93,6 +93,21 @@ expose it, put TLS-terminating auth in front (px does none) and treat
 the token as the only barrier, since every task's command is
 apply-on-the-wire by design.
 
+`px exec` raises that bar by exactly nothing and is deliberate about
+it: the same token that already specifies an arbitrary runner command
+at apply time can now run an arbitrary command in a running
+container's sandbox, through `POST /v1/tasks/{name}/exec`. It is an
+operator tool on the same trust level as apply — it runs only inside
+the task's own container (never on the node shell: the argv crosses
+two shells as single-quoted words), it is bounded (2-minute timeout,
+1 MiB per output stream, request-size caps), and it adds no new
+credential to protect. What it does change is the window: apply
+specifies a command for a *future* container, exec runs one in a
+*live* one — anything the task's runner wrote (keys in /run/px,
+workspace state) is readable by an exec'd `cat`. That is already true
+of the runner itself, so the boundary stays: the token is the
+operator.
+
 ## Node SSH
 
 px-server holds **root SSH access to the PVE node** — the largest

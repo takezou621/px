@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -49,6 +50,9 @@ type Provisioner interface {
 	Running(ctx context.Context, vmid int) (bool, error)
 	// Logs returns the runner's combined output so far.
 	Logs(ctx context.Context, vmid int) (string, error)
+	// Exec runs one command in the task's container and returns its output
+	// and exit code. A non-zero exit is a result, not an error.
+	Exec(ctx context.Context, vmid int, argv []string) (*ExecResult, error)
 	// Destroy stops and deletes the container.
 	Destroy(ctx context.Context, vmid int) error
 	// DestroyOwned stops and deletes the task container, but only after
@@ -509,6 +513,75 @@ func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {
 		30*time.Second)
 	return out, err
 }
+
+// execTimeout bounds one `px exec` call: a command that hangs (a wrong
+// foreground process, a wait on input that cannot arrive without a TTY) must
+// release the SSH session and the HTTP request.
+const execTimeout = 2 * time.Minute
+
+// maxExecStreamBytes caps each exec stream; overflow sets ExecResult.Truncated
+// rather than failing — partial output beats none for a debug tool.
+const maxExecStreamBytes = 1 << 20
+
+// ExecResult is one `px exec` invocation's outcome. Truncated marks a stream
+// that overflowed maxExecStreamBytes (the excess is discarded, the command
+// keeps running to completion).
+type ExecResult struct {
+	Stdout    string
+	Stderr    string
+	ExitCode  int
+	Truncated bool
+}
+
+func (p *provisioner) Exec(ctx context.Context, vmid int, argv []string) (*ExecResult, error) {
+	var stdout, stderr cappedWriter
+	code, err := p.ssh.RunStreams(pctExecCommand(vmid, argv), execTimeout, &stdout, &stderr)
+	if err != nil {
+		return nil, err
+	}
+	return &ExecResult{
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		ExitCode:  code,
+		Truncated: stdout.truncated || stderr.truncated,
+	}, nil
+}
+
+// pctExecCommand builds the node-side command line. Each argument crosses two
+// shells (SSH's remote shell, then pct's argv) as a POSIX single-quoted word,
+// so what the caller wrote reaches the container byte-exact — same discipline
+// the boot script enforces by embedding everything base64.
+func pctExecCommand(vmid int, argv []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "pct exec %d --", vmid)
+	for _, a := range argv {
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(a))
+	}
+	return b.String()
+}
+
+// cappedWriter keeps the first max bytes of a stream and silently drops the
+// rest: the ssh library copies from a pipe, so a short write or an error would
+// stall or kill the command mid-run.
+type cappedWriter struct {
+	max       int
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.buf.Len(); room < len(p) {
+		if room > 0 {
+			w.buf.Write(p[:room])
+		}
+		w.truncated = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+func (w *cappedWriter) String() string { return w.buf.String() }
 
 func (p *provisioner) Destroy(ctx context.Context, vmid int) error {
 	_ = p.pve.StopContainer(ctx, vmid)

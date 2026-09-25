@@ -35,6 +35,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/tasks/{name}", s.handleGetTask)
 	mux.HandleFunc("DELETE /v1/tasks/{name}", s.handleDeleteTask)
 	mux.HandleFunc("GET /v1/tasks/{name}/logs", s.handleTaskLogs)
+	mux.HandleFunc("POST /v1/tasks/{name}/exec", s.handleTaskExec)
 	mux.HandleFunc("GET /v1/workspaces", s.handleListWorkspaces)
 	mux.HandleFunc("GET /v1/workspaces/{name}", s.handleGetWorkspace)
 	mux.HandleFunc("GET /v1/models", s.handleListModels)
@@ -218,6 +219,83 @@ func (s *Server) handleTaskLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte(logs))
+}
+
+// exec request caps, in the apply style: enough for any debug command line,
+// small enough that a hostile body cannot inflate the SSH command line past
+// what sshd's limits allow.
+const (
+	execMaxArgs     = 16
+	execMaxArgBytes = 4 << 10
+	execMaxCmdBytes = 32 << 10
+)
+
+func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
+	t, err := s.store.GetTask(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if t.Status.Phase != v1alpha1.TaskRunning || t.Status.Container == 0 || t.Status.DeletionTimestamp != nil {
+		httpError(w, http.StatusConflict, "task %s is not running (phase %s) — exec needs a live sandbox", t.Metadata.Name, t.Status.Phase)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "read body: %v", err)
+		return
+	}
+	if len(body) > maxBodyBytes {
+		httpError(w, http.StatusRequestEntityTooLarge, "body exceeds %d bytes", maxBodyBytes)
+		return
+	}
+	var req struct {
+		Command []string `json:"command"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "parse body: %v", err)
+		return
+	}
+	if len(req.Command) == 0 {
+		httpError(w, http.StatusBadRequest, "command must be a non-empty list of arguments")
+		return
+	}
+	if len(req.Command) > execMaxArgs {
+		httpError(w, http.StatusBadRequest, "command has %d arguments, at most %d", len(req.Command), execMaxArgs)
+		return
+	}
+	total := 0
+	for i, a := range req.Command {
+		if len(a) == 0 {
+			httpError(w, http.StatusBadRequest, "command argument %d is empty", i)
+			return
+		}
+		if len(a) > execMaxArgBytes {
+			httpError(w, http.StatusBadRequest, "command argument %d exceeds %d bytes", i, execMaxArgBytes)
+			return
+		}
+		total += len(a)
+	}
+	if total > execMaxCmdBytes {
+		httpError(w, http.StatusBadRequest, "command totals %d bytes, at most %d", total, execMaxCmdBytes)
+		return
+	}
+	res, err := s.prov.Exec(r.Context(), t.Status.Container, req.Command)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, "exec: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"stdout":    res.Stdout,
+		"stderr":    res.Stderr,
+		"exitCode":  res.ExitCode,
+		"truncated": res.Truncated,
+	})
 }
 
 func (s *Server) handleListWorkspaces(w http.ResponseWriter, _ *http.Request) {

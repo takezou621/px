@@ -6,6 +6,7 @@ package sshexec
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -175,44 +176,80 @@ func (e *Executor) Close() error {
 	return nil
 }
 
+// lockedWriter is a concurrency-safe buffer: one writer receiving both session
+// streams is written from two goroutines (ssh copies stdout and stderr on
+// separate ones), so plain bytes.Buffer would race.
+type lockedWriter struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *lockedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
 // Run executes a command on the node, returning combined output and exit code.
 // A dead connection is re-dialed once before giving up; a remote command that
 // exits non-zero is not a connection failure and is not retried.
 func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
-	out, code, err := e.runOnce(cmd, timeout)
-	if err != nil && e.redial() {
-		out, code, err = e.runOnce(cmd, timeout)
-	}
-	return out, code, err
+	var out lockedWriter
+	code, err := e.RunStreams(cmd, timeout, &out, &out)
+	return out.String(), code, err
 }
 
-func (e *Executor) runOnce(cmd string, timeout time.Duration) (string, int, error) {
+// RunStreams is Run with stdout and stderr routed to separate writers (the
+// same single writer receives both streams interleaved when it is passed
+// twice), so a caller can keep the streams apart — `px exec` does.
+func (e *Executor) RunStreams(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
+	code, err := e.runStreamsOnce(cmd, timeout, stdout, stderr)
+	if err != nil && e.redial() {
+		code, err = e.runStreamsOnce(cmd, timeout, stdout, stderr)
+	}
+	return code, err
+}
+
+func (e *Executor) runStreamsOnce(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
 	e.mu.Lock()
 	client := e.client
 	e.mu.Unlock()
 	if client == nil {
-		return "", -1, fmt.Errorf("ssh not connected")
+		return -1, fmt.Errorf("ssh not connected")
 	}
 	sess, err := client.NewSession()
 	if err != nil {
-		return "", -1, err
+		return -1, err
 	}
 	defer sess.Close()
 	if timeout > 0 {
 		t := time.AfterFunc(timeout, func() { _ = sess.Close() })
 		defer t.Stop()
 	}
-	out, err := sess.CombinedOutput(cmd)
-	code := 0
+	// Leaving a stream unset would wire the session to os.Stdout of this
+	// process; everything must land in the caller's writers.
+	sess.Stdout = io.Discard
+	sess.Stderr = io.Discard
+	if stdout != nil {
+		sess.Stdout = stdout
+	}
+	if stderr != nil {
+		sess.Stderr = stderr
+	}
+	err = sess.Run(cmd)
 	if err != nil {
 		if ee, ok := err.(*ssh.ExitError); ok {
-			code = ee.ExitStatus()
-			err = nil
-		} else {
-			return string(out), -1, err
+			return ee.ExitStatus(), nil
 		}
+		return -1, err
 	}
-	return string(out), code, nil
+	return 0, nil
 }
 
 func (e *Executor) redial() bool {

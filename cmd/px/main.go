@@ -39,6 +39,8 @@ func main() {
 		err = cmdDescribe(fs, args)
 	case "logs":
 		err = cmdLogs(fs, args)
+	case "exec":
+		err = cmdExec(fs, args)
 	case "watch":
 		err = cmdWatch(fs, args)
 	case "delete":
@@ -268,6 +270,72 @@ func cmdLogs(fs *flag.FlagSet, args []string) error {
 	}
 }
 
+func cmdExec(fs *flag.FlagSet, args []string) error {
+	name, rest, err := popName(args)
+	if err != nil || len(rest) == 0 {
+		return fmt.Errorf("usage: px exec NAME -- COMMAND [ARG...]")
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	// flag parsing stops at "--" (and drops it), so what follows arrives here
+	// verbatim — the command must not be mangled into flags.
+	argv := fs.Args()
+	if len(argv) == 0 {
+		return fmt.Errorf("usage: px exec NAME -- COMMAND [ARG...]")
+	}
+	body, err := json.Marshal(map[string]any{"command": argv})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost,
+		strings.TrimRight(serverURL, "/")+"/v1/tasks/"+name+"/exec", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	// application/json, not doJSON's apply-style YAML content type.
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(data, &e)
+		if e.Error != "" {
+			return fmt.Errorf("%d: %s", resp.StatusCode, e.Error)
+		}
+		return fmt.Errorf("%d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var out struct {
+		Stdout    string `json:"stdout"`
+		Stderr    string `json:"stderr"`
+		ExitCode  int    `json:"exitCode"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	_, _ = os.Stdout.WriteString(out.Stdout)
+	_, _ = os.Stderr.WriteString(out.Stderr)
+	if out.Truncated {
+		fmt.Fprintln(os.Stderr, "(px exec: output truncated at 1 MiB per stream)")
+	}
+	// Like kubectl, exit with the command's code. Everything above is already
+	// written synchronously, so skipping the deferred close hurts nothing.
+	if out.ExitCode != 0 {
+		os.Exit(out.ExitCode)
+	}
+	return nil
+}
+
 func cmdDelete(fs *flag.FlagSet, args []string) error {
 	kind := "task"
 	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway") {
@@ -483,6 +551,8 @@ Usage:
   px describe model NAME          Show one model as JSON (API key redacted)
   px describe gateway NAME        Show one gateway as JSON
   px logs NAME [-f]               Stream runner logs
+  px exec NAME -- CMD [ARG...]    Run a command in a running task's container
+                                  (exits with the command's exit code)
   px watch                        Stream task phase transitions
   px delete task NAME             Delete a task and its container
   px delete model NAME            Delete a model
