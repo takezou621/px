@@ -1,0 +1,46 @@
+cmd/px-server/main.go
+  s_c2f954a86dc8c5::t_9e80203c5eb9f0 26,28
+  s_c2f954a86dc8c5::t_bff8c9201a4ac1 114-127
+  s_c2f954a86dc8c5::t_1a76003cbe90b3 70-80,83
+internal/server/server.go
+  s_c2f954a86dc8c5::t_d0deaab515e8c5 40
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_8247dfe41e9dc9 42-43
+  s_c2f954a86dc8c5::t_025dc66c91b995 17-20,31
+  s_c2f954a86dc8c5::t_714f9ad1c72a4f 245-248,252-256,258,262-265,269-271
+  s_c2f954a86dc8c5::t_cc9a1e2aa49236 405,411
+  s_c2f954a86dc8c5::t_9ef9444b7edb40 232-244,249-251,257,259-261,266-268,272-303,312,314,335-351,353,355-359
+internal/server/auth.go
+  s_c2f954a86dc8c5::t_59a653d54308a6 1-18,23-31
+  s_c2f954a86dc8c5::t_8071ae2283b2b9 19-22
+README.md
+  s_c2f954a86dc8c5::t_e7e1ba0a48a0ff 82-85
+  s_c2f954a86dc8c5::t_0386a2446bcde6 107-110
+internal/server/watch.go
+  s_c2f954a86dc8c5::t_9184227173b9c3 1-28,30-42,49-50,59-65,68-69,71-73
+  s_c2f954a86dc8c5::t_7befab7c8a6fca 29,43-48,51-58,66-67,70
+internal/server/auth_test.go
+  s_c2f954a86dc8c5::t_2a404e1204778d 1-3,5-98,103,105
+  s_c2f954a86dc8c5::t_209f42a78890f7 4
+  s_c2f954a86dc8c5::t_a702bf7d4ac174 99-102,104
+internal/server/watch_test.go
+  s_c2f954a86dc8c5::t_3a6d23f6c5768a 1-58
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_d923a28f576ca4 47-52,54-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "43e7d4508e9f51458bf00e35fbd7b0219b290e26",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
