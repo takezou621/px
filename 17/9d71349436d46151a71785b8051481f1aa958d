@@ -1,0 +1,40 @@
+docs/e2e.md
+  s_c2f954a86dc8c5::t_02bd269f3af3fd 69-85
+scripts/e2e-model.sh
+  s_c2f954a86dc8c5::t_bd6c5e5f98d13c 198-200,202
+  s_c2f954a86dc8c5::t_e30f570b3cacad 169-171,176-177
+  s_c2f954a86dc8c5::t_cf17a22cda645b 94,96
+  s_c2f954a86dc8c5::t_d88db4cbae9fb2 30
+  s_c2f954a86dc8c5::t_c9706cd4ea0d13 15-16
+  s_c2f954a86dc8c5::t_26052e3d9671c4 54,56-61
+  s_c2f954a86dc8c5::t_cf38e1ce0192ea 137
+  s_c2f954a86dc8c5::t_11b97ff6bdb1eb 92-93,95,101-103,108-110,112-113,115
+  s_c2f954a86dc8c5::t_070306b43bddc8 166
+  s_c2f954a86dc8c5::t_b32debd8060eb0 1-14,17-29,31-53,55,62-91,97-100,104-107,111,114,116-136,138-142,146,152-154,156-159,161-165,167,172-175,178-186,193,195-197,201,203-207
+  s_c2f954a86dc8c5::t_2659ab9f266e11 187-192,194
+  s_c2f954a86dc8c5::t_ae8af71ae8c4de 143-145,147-151,155,160
+  s_c2f954a86dc8c5::t_b1e09debb350fb 168
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_9df063aa47d907 179,185,191,200-204
+  s_c2f954a86dc8c5::t_1120df6cf9d714 196-199
+  s_c2f954a86dc8c5::t_baeec4ad031c85 205-206
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_42989ea423e561 144-151,154-155
+  s_c2f954a86dc8c5::t_8c92a459b762f6 152-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "179d71349436d46151a71785b8051481f1aa958d",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
