@@ -1,0 +1,32 @@
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_22113139be398f 34-35
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_1038496010662e 71-75
+  s_c2f954a86dc8c5::t_d66de4f2835c00 187-188
+  s_c2f954a86dc8c5::t_a30028279fe10a 27-31
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_7cb9d017c840ce 191-194
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_03e7dfce42c2ee 43-49
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_6a0642d4d3953e 115-117
+  s_c2f954a86dc8c5::t_82c6fcff21216f 386-388,403-409
+  s_c2f954a86dc8c5::t_45fb7ce5fed19a 83-85
+  s_c2f954a86dc8c5::t_5d5067c12a4a4d 396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e67e9cdd96bcc59e6e92f60541980c6fb3d8675",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
