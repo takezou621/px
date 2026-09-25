@@ -206,7 +206,7 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			w.Write([]byte(`{"data": {"net0": "name=eth0,bridge=vmbr0,hwaddr=AA,ip=dhcp,type=veth"}}`))
+			w.Write([]byte(`{"data": {"unprivileged": 1, "net0": "name=eth0,bridge=vmbr0,hwaddr=AA,ip=dhcp,type=veth"}}`))
 		case http.MethodPut:
 			if err := r.ParseForm(); err != nil {
 				t.Fatal(err)
@@ -290,6 +290,43 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 		if first(pair[0]) >= first(pair[1]) {
 			t.Errorf("%s must precede %s; events: %v", pair[0], pair[1], events)
 		}
+	}
+}
+
+// The sandbox contract is an unprivileged uid mapping: a template that
+// clones into a privileged container must fail the provision (and destroy
+// the clone), not ship a sandbox the threat model does not cover.
+func TestCreateRefusesPrivilegedClone(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/nodes/n1/lxc", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": [{"vmid": 9000, "name": "tmpl", "template": 1}]}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/9000/clone", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": "UPID:n1:1:1:clone"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": {"unprivileged": 0}}`))
+	})
+	var destroyed bool
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			destroyed = true
+		}
+		w.Write([]byte(`{"data": "UPID:n1:2:2:destroy"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": {"status": "stopped", "exitstatus": "OK"}}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	p := NewProvisioner(proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), &sshexec.Executor{})
+
+	err := p.Create(context.Background(), testProvTask(), 142, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "privileged") {
+		t.Fatalf("a privileged clone must fail the provision naming the problem, got: %v", err)
+	}
+	if !destroyed {
+		t.Fatal("a privileged clone must be destroyed before the provision fails")
 	}
 }
 

@@ -221,15 +221,29 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     strips trailing newlines — such a value would reach the runner mutated);
     and apply rejects the literal `<redacted>` placeholder, so re-applying
     a fetched Model fails loudly instead of silently replacing the real key.
-- [ ] unprivileged CT default; docs on threat model
-  - Content the doc must cover: DNS-tunnel exfil through the implicit DNS
-    allow (accepted trade-off); image-init traffic runs ahead of the egress
-    gate (the gate holds only the px runner — during the dataplane-loading
-    window the container's init can transmit, which is safe solely because
+- [x] unprivileged CT default; threat model doc (`docs/threat-model.md`)
+  - Design: the build script already created the template with
+    `--unprivileged 1`, but the clone inherited the flag implicitly — and
+    live testing showed the clone endpoint cannot *set* it (PVE's clone_vm
+    schema rejects unknown parameters; the flag only inherits from the
+    source), so px verifies the inheritance instead: after clone, before
+    start, the provision reads the container config and fails the task
+    (destroying the clone) if `unprivileged` is not set. The guarantee rests
+    on px's verification, not on the template author's discipline or the
+    PVE release's default. The doc covers the three accepted
+    trade-offs noted below plus the full boundary map: LXC's shared-kernel
+    weakness and `nesting=1` as the platform's risk budget; DNS-tunnel exfil
+    through the implicit DNS allow (accepted — closing it needs stale
+    hostname rules); image-init traffic runs ahead of the egress gate (the
+    gate holds only the px runner — during the dataplane-loading window the
+    container's init can transmit, which is safe solely because
     `spec.image` is the trusted px-built template; a user-supplied image
     would need the gate before start, which PVE cannot do since the
-    dataplane only exists once the veth does); px.db is operator territory
-    (0600) — Model APIKeys sit in SQLite by the single-binary axis.
+    dataplane only exists once the veth does); px.db is a credential
+    store — px enforces 0600 on it (and its WAL/SHM siblings) at open —
+    Model APIKeys sit in SQLite by the single-binary axis; node
+    root SSH as the largest credential (pin it); destroy guards keep px's
+    blast radius to containers it named.
 
 ## M4 — Beyond one node
 

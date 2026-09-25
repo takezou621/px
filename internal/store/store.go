@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -62,6 +63,15 @@ func Open(path string) (*Store, error) {
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
+	// The database holds Model API keys in plaintext, so it is a credential
+	// store: enforce 0600 regardless of the umask that created it. The WAL
+	// and SHM siblings carry recently written pages, so they get the same
+	// mode; they may be absent after a clean close.
+	for _, f := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(f, 0o600); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("chmod %s: %w", f, err)
 		}
 	}
 	return &Store{db: db}, nil

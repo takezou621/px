@@ -79,8 +79,10 @@ The shim inside the template:
 1. **M1**: resource limits only (cores/memory), rootless-by-config runner user.
 2. **M2**: Gateway kind — egress allowlist enforced via LXC firewall rules on
    the PVE node.
-3. **M3**: per-task unprivileged CT (default), optional privileged for
-   docker-in-sandbox use cases.
+3. **M3**: unprivileged CT default — the template is built unprivileged and
+   every clone is verified unprivileged before start; optional privileged
+   (docker-in-sandbox) remains future work. Full boundary map and accepted
+   trade-offs: `docs/threat-model.md`.
 
 ## Non-goals
 

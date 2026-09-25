@@ -246,6 +246,20 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 	if err := p.pve.CloneContainer(ctx, templateVMID, vmid, "px-"+t.Metadata.Name); err != nil {
 		return fmt.Errorf("clone: %w", err)
 	}
+	// The sandbox contract is an unprivileged uid mapping, but the clone
+	// endpoint cannot request one (PVE rejects unknown params) — it only
+	// inherits the flag from the template. Verify the inheritance so a
+	// privileged template fails the provision instead of shipping a
+	// sandbox the threat model does not cover.
+	unpriv, err := p.pve.ContainerUnprivileged(ctx, vmid)
+	if err != nil {
+		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		return fmt.Errorf("read container config: %w", err)
+	}
+	if !unpriv {
+		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+		return fmt.Errorf("template %q produced a privileged container; rebuild it with --unprivileged 1 (see docs/threat-model.md)", t.Spec.Image)
+	}
 	// Apply resource limits post-clone (clone inherits template resources).
 	if err := p.applyResources(ctx, vmid, t); err != nil {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)

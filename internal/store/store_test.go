@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -29,6 +30,42 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
+}
+
+// The database holds Model API keys in plaintext, so Open must tighten it
+// (and its WAL/SHM siblings) to 0600 no matter the umask that created it —
+// including a database restored from a permissive backup.
+func TestOpenEnforcesDatabaseMode(t *testing.T) {
+	path := t.TempDir() + "/px.db"
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	for _, f := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(f, 0o644); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	st, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	for _, f := range []string{path, path + "-wal", path + "-shm"} {
+		fi, err := os.Stat(f)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s mode = %o, want 600", f, got)
+		}
+	}
 }
 
 func TestTaskLifecycle(t *testing.T) {

@@ -226,6 +226,21 @@ func (c *Client) ContainerHostname(ctx context.Context, vmid int) (string, error
 	return cfg.Hostname, nil
 }
 
+// ContainerUnprivileged reports whether the container runs with an
+// unprivileged uid mapping. The clone endpoint cannot set this (the property
+// is absent from clone_vm's parameter schema, so PVE rejects it with 400) —
+// it can only be inherited from the source container, so the provisioner
+// verifies the inheritance after cloning instead of requesting it.
+func (c *Client) ContainerUnprivileged(ctx context.Context, vmid int) (bool, error) {
+	var cfg struct {
+		Unprivileged int `json:"unprivileged"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), nil, &cfg); err != nil {
+		return false, err
+	}
+	return cfg.Unprivileged == 1, nil
+}
+
 // ContainerNet0 returns the container's net0 config value
 // ("name=eth0,bridge=vmbr0,hwaddr=...,ip=dhcp,type=veth") — read before
 // rewriting it, so enabling the firewall keeps the clone's hwaddr and type.
