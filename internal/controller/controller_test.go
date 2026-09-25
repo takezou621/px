@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,9 +15,10 @@ import (
 
 type fakeProv struct {
 	mu          sync.Mutex
-	allocateErr error
+	allocateErr error        // returned by Allocate as a provision failure
 	createErr   error        // returned by Create as a provision failure
 	exitErr     error        // returned by Exit as a probe failure
+	bootedErr   error        // returned by Booted as a probe failure
 	destroyErr  error        // returned by Destroy until cleared
 	exits       map[int]int  // vmid -> exit code; missing = still running
 	dead        map[int]bool // vmids whose container is not running
@@ -24,6 +26,7 @@ type fakeProv struct {
 	created     []int
 	mounts      []ResolvedWorkspace // mounts passed to the last Create
 	destroyed   []int
+	hostnames   map[int]string // vmid -> hostname; empty or missing = owned
 }
 
 func (f *fakeProv) Allocate(_ context.Context) (int, error) {
@@ -47,6 +50,9 @@ func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts 
 func (f *fakeProv) Booted(_ context.Context, vmid int) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.bootedErr != nil {
+		return false, f.bootedErr
+	}
 	return f.booted[vmid], nil
 }
 
@@ -79,6 +85,25 @@ func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
 	}
 	f.destroyed = append(f.destroyed, vmid)
 	return nil
+}
+
+func (f *fakeProv) DestroyOwned(ctx context.Context, taskName string, vmid int) error {
+	f.mu.Lock()
+	host := f.hostnames[vmid]
+	f.mu.Unlock()
+	if host != "" && host != "px-"+taskName {
+		return fmt.Errorf("%w: ct %d hostname %q is not %q", ErrNotOwned, vmid, host, "px-"+taskName)
+	}
+	return f.Destroy(ctx, vmid)
+}
+
+// Owned mirrors DestroyOwned's hostname check without destroying: empty or
+// missing means owned, since plain tests never set a hostname.
+func (f *fakeProv) Owned(_ context.Context, taskName string, vmid int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	host := f.hostnames[vmid]
+	return host == "" || host == "px-"+taskName, nil
 }
 
 type memStore struct {
@@ -325,6 +350,90 @@ func TestDeleteRunningTask(t *testing.T) {
 	}
 }
 
+// A VMID that an external party reused (hostname no longer px-<task>) is not
+// px's to destroy: the record is dropped instead of retrying forever.
+func TestDeleteRefusesForeignContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, hostnames: map[int]string{100: "someone-elses-ct"}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("record should be dropped: there is nothing left to retry against a foreign container")
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("foreign container must not be destroyed, got %v", prov.destroyed)
+	}
+}
+
+func TestTTLSkipsForeignContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, hostnames: map[int]string{100: "someone-elses-ct"}}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl)
+
+	base := time.Now()
+	ctl.now = func() time.Time { return base.Add(2 * time.Hour) }
+	runOnce(ctl)
+
+	task := get(t, st, "t1")
+	if task.Status.Container != 0 {
+		t.Fatalf("want container cleared, got %d", task.Status.Container)
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("foreign container must not be destroyed, got %v", prov.destroyed)
+	}
+	if !strings.Contains(task.Status.Reason, "not owned") {
+		t.Fatalf("reason should note the ownership skip, got %q", task.Status.Reason)
+	}
+}
+
+// An interrupted provision whose recorded VMID now names a foreign container
+// fails the task without touching the foreign container.
+func TestInterruptedProvisioningForeignContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:     map[int]int{},
+		booted:    map[int]bool{100: false},
+		hostnames: map[int]string{100: "someone-elses-ct"},
+	}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("foreign container must not be destroyed, got %v", prov.destroyed)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container cleared, got %d", task.Status.Container)
+	}
+	if !strings.Contains(task.Status.Reason, "not owned") {
+		t.Fatalf("reason should note the ownership skip, got %q", task.Status.Reason)
+	}
+	if len(prov.created) != 0 {
+		t.Fatalf("must not re-provision, created %v", prov.created)
+	}
+}
+
 // Deletion requests are persisted on the record, so a brand-new controller
 // over the same store (i.e. after a px-server restart) resumes the delete.
 func TestDeleteSurvivesRestart(t *testing.T) {
@@ -545,6 +654,63 @@ func TestAdoptBootedProvisioning(t *testing.T) {
 	}
 	if len(prov.destroyed) != 0 {
 		t.Fatalf("live runner must not be destroyed, got %v", prov.destroyed)
+	}
+}
+
+// A boot probe that fails transiently (pct exec died while the container is
+// running) must neither adopt nor destroy: the task stays in Provisioning
+// and the next tick retries.
+func TestBootProbeErrorRetries(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:     map[int]int{},
+		bootedErr: errors.New("pct exec: connection reset by peer"),
+	}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisioning {
+		t.Fatalf("probe error must leave the task in Provisioning, got %s", task.Status.Phase)
+	}
+	if len(prov.destroyed) != 0 || len(prov.created) != 0 {
+		t.Fatalf("probe error must neither destroy nor re-provision, destroyed %v created %v", prov.destroyed, prov.created)
+	}
+}
+
+// A booted container that is not the task's (hostname mismatch) must not be
+// adopted: adoption would run someone else's runner as this task. The
+// foreign container is left alone and the task fails.
+func TestAdoptRefusesForeignContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:     map[int]int{},
+		booted:    map[int]bool{100: true},
+		hostnames: map[int]string{100: "someone-elses-ct"},
+	}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("foreign container must not be destroyed, got %v", prov.destroyed)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container cleared, got %d", task.Status.Container)
+	}
+	if !strings.Contains(task.Status.Reason, "not owned") {
+		t.Fatalf("reason should note the ownership skip, got %q", task.Status.Reason)
 	}
 }
 

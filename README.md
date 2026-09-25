@@ -108,7 +108,9 @@ Known limitations on the current milestone:
   `-token-file <file>` (then every request needs `Authorization: Bearer`, and
   clients pass the value via `-token` / `PX_TOKEN`). Either way the server
   binds to `127.0.0.1` by default — don't expose the port without TLS.
-- SSH host keys are not pinned yet (M3).
+- SSH host keys are accepted unverified unless `px-server` runs with
+  `-ssh-host-key <file>` (pinned public host keys, one per line — generate a
+  pin file with `ssh-keyscan -t ed25519 <host>`).
 - `px delete` is asynchronous: the record and container are gone by the next
   reconcile tick (~2s), after the container has been destroyed. A failed
   destroy is retried until it succeeds, so records never orphan a container.

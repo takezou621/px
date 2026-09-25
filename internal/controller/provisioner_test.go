@@ -134,3 +134,24 @@ func TestBootCommandUser(t *testing.T) {
 		t.Fatalf("no --user expected for empty runner.user: %s", cmd)
 	}
 }
+
+// probeVerdict reads the PX_PROBE:<n> trailer a successful boot-probe exec
+// prints; anything else is a retryable error, not a verdict — a garbage
+// output must never be read as "unbooted" (that destroys live runners).
+func TestProbeVerdict(t *testing.T) {
+	if v, err := probeVerdict("PX_PROBE:0\n"); err != nil || !v {
+		t.Fatalf("PX_PROBE:0 = (%v, %v), want (true, nil)", v, err)
+	}
+	if v, err := probeVerdict("PX_PROBE:1\n"); err != nil || v {
+		t.Fatalf("PX_PROBE:1 = (%v, %v), want (false, nil)", v, err)
+	}
+	// Boot noise can precede the marker, so the trailer is what counts.
+	if v, err := probeVerdict("some pct noise\nPX_PROBE:0\n"); err != nil || !v {
+		t.Fatalf("trailer after noise = (%v, %v)", v, err)
+	}
+	for _, bad := range []string{"", "\n", "garbage"} {
+		if _, err := probeVerdict(bad); err == nil {
+			t.Errorf("output %q must be an error, not a verdict", bad)
+		}
+	}
+}

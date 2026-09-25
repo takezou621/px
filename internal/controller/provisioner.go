@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -11,6 +12,13 @@ import (
 	"github.com/kawai/px/internal/proxmox"
 	"github.com/kawai/px/internal/sshexec"
 )
+
+// ErrNotOwned reports that a VMID names a container that is not the task's
+// sandbox — most plausibly because PVE's unreserved nextid let an external
+// party reuse the VMID after px lost track of it. The controller stops
+// retrying the destroy and gives up on the container rather than touching a
+// foreign one.
+var ErrNotOwned = errors.New("container is not owned by the task")
 
 // Provisioner drives one Task's sandbox through its lifecycle.
 type Provisioner interface {
@@ -40,6 +48,16 @@ type Provisioner interface {
 	Logs(ctx context.Context, vmid int) (string, error)
 	// Destroy stops and deletes the container.
 	Destroy(ctx context.Context, vmid int) error
+	// DestroyOwned stops and deletes the task container, but only after
+	// verifying by hostname that the VMID really names this task's sandbox —
+	// PVE's nextid is a suggestion, not a reservation, so a VMID px lost
+	// track of (crash between persist and Create) may have been reused by
+	// someone else. A mismatch returns an error wrapping ErrNotOwned.
+	DestroyOwned(ctx context.Context, taskName string, vmid int) error
+	// Owned reports whether the VMID names the task's own sandbox, by
+	// hostname — same check as DestroyOwned, without destroying. A container
+	// that does not exist is reported as not owned (false, nil).
+	Owned(ctx context.Context, taskName string, vmid int) (bool, error)
 }
 
 type provisioner struct {
@@ -240,13 +258,47 @@ func (p *provisioner) Running(ctx context.Context, vmid int) (bool, error) {
 // Booted checks for the marker the boot script touches right after it spawns
 // the runner (see runnerScript).
 func (p *provisioner) Booted(ctx context.Context, vmid int) (bool, error) {
-	_, code, err := p.ssh.Run(
-		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("test -f /run/px/booted")),
+	// The probe prints test's exit status, so a successful exec is
+	// distinguishable from pct exec itself failing — a live container whose
+	// clone step died prints "no" and is cleaned up, while a transient pct
+	// failure on a live container must not be read as "unbooted" (that would
+	// destroy a runner that may be mid-boot).
+	out, code, err := p.ssh.Run(
+		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("test -f /run/px/booted; echo PX_PROBE:$?")),
 		30*time.Second)
 	if err != nil {
 		return false, err
 	}
-	return code == 0, nil
+	if code == 0 {
+		return probeVerdict(out)
+	}
+	// pct exec itself failed: either the container is stopped (a runner
+	// cannot exist there — genuinely unbooted) or the exec died transiently
+	// on a live container (retry next tick rather than destroy). A container
+	// that is gone entirely counts as unbooted too, so recovery of a record
+	// whose clone was already destroyed does not wedge.
+	running, rerr := p.pve.ContainerRunning(ctx, vmid)
+	if rerr != nil {
+		if proxmox.IsNotFound(rerr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("boot probe: pct exec failed (%d) and status check: %w", code, rerr)
+	}
+	if running {
+		return false, fmt.Errorf("boot probe: pct exec failed (%d) while container is running", code)
+	}
+	return false, nil
+}
+
+// probeVerdict interprets a boot-probe exec that itself succeeded: the probe
+// script prints test's exit status as PX_PROBE:<n>. Anything else is a
+// retryable error, not a verdict.
+func probeVerdict(out string) (bool, error) {
+	i := strings.LastIndex(out, "PX_PROBE:")
+	if i < 0 {
+		return false, fmt.Errorf("boot probe: unexpected pct exec output %q", strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out[i+len("PX_PROBE:"):]) == "0", nil
 }
 
 func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {
@@ -259,6 +311,37 @@ func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {
 func (p *provisioner) Destroy(ctx context.Context, vmid int) error {
 	_ = p.pve.StopContainer(ctx, vmid)
 	return p.pve.DestroyContainer(ctx, vmid)
+}
+
+// DestroyOwned verifies the container's hostname before destroying — see the
+// interface comment for why. A container that does not exist counts as
+// already destroyed, so deletes stay idempotent.
+func (p *provisioner) DestroyOwned(ctx context.Context, taskName string, vmid int) error {
+	host, err := p.pve.ContainerHostname(ctx, vmid)
+	if err != nil {
+		if proxmox.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("check ownership of ct %d: %w", vmid, err)
+	}
+	if host != "px-"+taskName {
+		return fmt.Errorf("%w: ct %d hostname %q is not %q", ErrNotOwned, vmid, host, "px-"+taskName)
+	}
+	return p.Destroy(ctx, vmid)
+}
+
+// Owned reports whether the VMID names the task's own sandbox, by hostname —
+// the adoption check for interrupted provisioning, which must not adopt a
+// reused VMID just because it happens to carry a boot marker.
+func (p *provisioner) Owned(ctx context.Context, taskName string, vmid int) (bool, error) {
+	host, err := p.pve.ContainerHostname(ctx, vmid)
+	if err != nil {
+		if proxmox.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("check ownership of ct %d: %w", vmid, err)
+	}
+	return host == "px-"+taskName, nil
 }
 
 func shellQuote(s string) string {

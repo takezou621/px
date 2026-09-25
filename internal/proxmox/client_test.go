@@ -141,6 +141,43 @@ func TestDestroyMissing(t *testing.T) {
 	}
 }
 
+// PVE answers probes of a missing container with 500 on both endpoints px
+// checks; IsNotFound must read that as "absent" while never mistaking a
+// transport failure for it — treating a network blip as "already destroyed"
+// would orphan the real container.
+func TestIsNotFound(t *testing.T) {
+	if IsNotFound(nil) {
+		t.Fatal("nil must not read as not-found")
+	}
+
+	c, m := newMockPVE(t)
+	notFound := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"message":"Configuration file 'nodes/n1/lxc/999.conf' does not exist\n","data":null}`))
+	}
+	m.mux.HandleFunc("/api2/json/nodes/n1/lxc/999/config", notFound)
+	m.mux.HandleFunc("/api2/json/nodes/n1/lxc/999/status/current", notFound)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.ContainerHostname(ctx, 999); !IsNotFound(err) {
+		t.Fatalf("hostname probe of a missing container must read as not-found, got %v", err)
+	}
+	if _, err := c.ContainerRunning(ctx, 999); !IsNotFound(err) {
+		t.Fatalf("status probe of a missing container must read as not-found, got %v", err)
+	}
+
+	// A transport failure (server gone) must not read as "absent".
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	url := dead.URL
+	dead.Close()
+	down := New(url, "n1", "root@pam!px=fake", false)
+	_, err := down.ContainerRunning(context.Background(), 142)
+	if err == nil || IsNotFound(err) {
+		t.Fatalf("a transport failure must not read as not-found, got %v", err)
+	}
+}
+
 // PVE's parameter-verification errors report reasons as plain strings,
 // not arrays — the reason must survive into the error message.
 func TestParamVerifyErrorReason(t *testing.T) {

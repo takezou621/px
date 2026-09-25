@@ -32,6 +32,7 @@ func main() {
 		tlsInsecure = flag.Bool("tls-insecure", os.Getenv("PX_PVE_TLS_INSECURE") == "1", "skip TLS verification of the PVE endpoint (for PVE's default self-signed node cert)")
 		sshUser     = flag.String("ssh-user", "root", "SSH user on the PVE node")
 		sshKey      = flag.String("ssh-key", "", "SSH private key path (defaults to ssh-agent)")
+		sshHostKey  = flag.String("ssh-host-key", os.Getenv("PX_SSH_HOST_KEY"), "file of pinned SSH host public keys, one per line (authorized_keys or ssh-keyscan format; get one with `ssh-keyscan -t ed25519 HOST`). Without it any host key is accepted")
 		interval    = flag.Duration("reconcile-interval", 2*time.Second, "controller reconcile interval")
 	)
 	flag.Parse()
@@ -50,7 +51,7 @@ func main() {
 	defer st.Close()
 
 	pve := proxmox.New(*pveEndpoint, *pveNode, *pveToken, *tlsInsecure)
-	ssh, err := sshexec.Dial(10*time.Second, sshexec.Config{Host: hostOf(*pveEndpoint), User: *sshUser, KeyPath: *sshKey})
+	ssh, err := sshexec.Dial(10*time.Second, sshexec.Config{Host: hostOf(*pveEndpoint), User: *sshUser, KeyPath: *sshKey, HostKeyPath: *sshHostKey})
 	if err != nil {
 		// Fail fast: without node SSH access the provisioner cannot boot
 		// runners and would panic on the first Create.
@@ -58,6 +59,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer ssh.Close()
+	if *sshHostKey != "" {
+		log.Info("ssh host key pinning enabled", "host", hostOf(*pveEndpoint), "host-key-file", *sshHostKey)
+	} else {
+		log.Warn("ssh host key is not pinned: any host key is accepted (set -ssh-host-key)", "host", hostOf(*pveEndpoint))
+	}
 
 	prov := controller.NewProvisioner(pve, ssh)
 	ctl := controller.New(st, prov, log)

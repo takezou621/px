@@ -71,9 +71,76 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 
 ## M3 — Sandbox hardening
 
-- [ ] SSH host key pinning (today the first-seen key is accepted unverified)
-- [ ] Destroy guards by container name: PVE nextid is a suggestion, not a reservation. Residual M1 window: a crash between VMID persist and Create can leave a VMID that destroy later targets after an external party reuses it; and a failed Create that clears its VMID can orphan a clone that succeeded late (PVE tasks outlive their waiter) — verify `px-<task>` name ownership before destroy
-- [ ] Distinguish pct exec transient failures from "no marker" in Booted(): today any non-zero pct exec is treated as unbooted, so a transient pct failure could destroy a live runner of an already-interrupted task; re-evaluate against real pct behavior in the PVE E2E (container restarts wiping the /run tmpfs are out of scope — external intervention)
+- [x] SSH host key pinning (today the first-seen key is accepted unverified)
+  - Design: opt-in pinning, same shape as the M2 token auth. `-ssh-host-key F`
+    (env `PX_SSH_HOST_KEY`) names a file of public host keys, one per line in
+    authorized_keys format (`ssh-ed25519 AAAA... comment`) — several lines are
+    allowed so a key rotation window keeps working. sshexec parses the file at
+    Dial and installs a HostKeyCallback that accepts only those keys
+    (comparing `ssh.PublicKey.Marshal` bytes); a mismatch fails the dial with
+    the offending key's fingerprint in the error. Without the flag behavior is
+    unchanged (first key accepted) and px-server logs a warning naming the
+    flag — TOFU state tracking is deliberately not built; an explicit pin file
+    is simpler and fits the single-binary axis. Getting the key:
+    `ssh-keyscan -t ed25519 HOST` on the px-server host, or read
+    `/etc/ssh/ssh_host_*_key.pub` on the PVE node. Found in the E2E: PVE
+    offers ECDSA/RSA/ED25519 host keys and the handshake negotiates whatever
+    the server prefers (ECDSA here), so pinning ED25519 alone never matches —
+    the dial therefore also restricts `HostKeyAlgorithms` to the pinned key
+    types, making the negotiated key one the pin can actually accept. A
+    pinned RSA key additionally advertises as rsa-sha2-256/512 (modern sshd
+    no longer negotiates bare ssh-rsa; rsa-sha2 host keys decode to the same
+    public key blob the pin holds). `@cert-authority`/`@revoked` marker lines
+    are rejected at parse time: they pin CA trust, not a host key, so
+    accepting them as plain pins would silently never match.
+- [x] Destroy guards by container name: PVE nextid is a suggestion, not a reservation. Residual M1 window: a crash between VMID persist and Create can leave a VMID that destroy later targets after an external party reuses it; and a failed Create that clears its VMID can orphan a clone that succeeded late (PVE tasks outlive their waiter) — verify `px-<task>` name ownership before destroy
+  - Design: the PVE client grows `ContainerHostname(vmid)` (GET
+    `/nodes/{node}/lxc/{vmid}/config`), and the Provisioner grows
+    `DestroyOwned(taskName, vmid)` which stops + destroys only when the
+    container's hostname is exactly `px-<taskName>`; a mismatch returns the
+    sentinel `ErrNotOwned`. "Container does not exist" from the hostname read
+    counts as already-destroyed (nil) — deletes stay idempotent. Not-found is
+    detected structurally (`IsNotFound`: PVE's 500 whose body says the config
+    file is gone), never by substring accidents — a DNS failure's "no such
+    host" must not read as "absent", or a destroy would silently skip and
+    orphan the real container. The Provisioner also grows `Owned(taskName,
+    vmid)` — the same hostname check without destroying — so the adoption
+    path can refuse a reused VMID before running its foreign runner as the
+    task. The three
+    controller destroy paths (deletion, TTL cleanup, interrupted-provision
+    cleanup) move to `DestroyOwned`; Create's own partial cleanup keeps the
+    bare `Destroy` since it runs seconds after this controller cloned that
+    exact VMID. On `ErrNotOwned` the controller clears `Status.Container`,
+    logs loudly, and lets the record proceed (deletion drops it, TTL/interrupt
+    fail the task): a VMID that now belongs to someone else is not px's to
+    destroy, and retrying forever would wedge the record.
+- [x] Distinguish pct exec transient failures from "no marker" in Booted(): today any non-zero pct exec is treated as unbooted, so a transient pct failure could destroy a live runner of an already-interrupted task; re-evaluate against real pct behavior in the PVE E2E (container restarts wiping the /run tmpfs are out of scope — external intervention)
+- [x] E2E against the real PVE node (pinning on): a wrong pin fails the dial with
+    the real key's fingerprint; the negotiation surprise above surfaced and was
+    fixed (`pinnedAlgos`); with the correct pin a task ran `Pending ->
+    Provisioning -> Succeeded` (`M3_PIN_OK` in logs, ~9s). Destroy guard
+    verified live by renaming a px-created container (`pct set <vmid>
+    --hostname not-px`): `px delete task` dropped the record in ~4s, left the
+    container running, and logged `destroy skipped: container is not owned by
+    the task` with the offending hostname. Test container destroyed afterwards;
+    no containers left on the node.
+  - Design: `Booted()` uses a two-step probe —
+    `test -f /run/px/booted; echo PX_PROBE:$?` — so a successful exec is
+    distinguishable from pct exec itself failing. `pct exec` runs as an
+    independent process: it can die transiently while the container (pid 1)
+    stays running, so treating any non-zero exec as "no marker" would destroy
+    a runner that is mid-boot, and treating "running" as "transient" would
+    permanently wedge on a partial clone (the container survives its dead
+    boot script). The probe splits the two: a printed `PX_PROBE:0` means
+    booted (adopt), `PX_PROBE:1` means no marker (destroy the partial
+    clone), and no trailer is a retryable error. When pct exec itself fails
+    (non-zero with no verdict), the container status decides: gone counts as
+    unbooted (a record whose clone was already destroyed recovers instead of
+    wedging), stopped counts as unbooted (a runner cannot exist there), and
+    running is an error (retry next tick). The same probe-shaped fix covers
+    the adoption path: before adopting, the controller verifies ownership
+    with `Owned()` so a reused VMID carrying a foreign boot marker fails the
+    task instead of running someone else's runner.
 - [ ] Gateway kind: egress allowlist via LXC firewall
 - [ ] Model kind: LLM credentials injected as per-task env/secrets
 - [ ] unprivileged CT default; docs on threat model

@@ -202,6 +202,30 @@ func (c *Client) ContainerRunning(ctx context.Context, vmid int) (bool, error) {
 	return st.Status == "running", nil
 }
 
+// IsNotFound reports whether err is PVE's response for a container that does
+// not exist: an HTTP 500 whose body says the config file is gone. A network
+// error never matches (a DNS failure's "no such host" must not read as
+// "absent"), so callers can treat not-found as "already destroyed" safely.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, ": 500: ") && strings.Contains(s, "does not exist")
+}
+
+// ContainerHostname returns the container's hostname — the name the clone
+// set, which ownership checks before a destroy compare against.
+func (c *Client) ContainerHostname(ctx context.Context, vmid int) (string, error) {
+	var cfg struct {
+		Hostname string `json:"hostname"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), nil, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.Hostname, nil
+}
+
 // maxTaskWait bounds WaitForTask so a stuck PVE task cannot wedge the
 // serial reconcile loop forever.
 const maxTaskWait = 15 * time.Minute

@@ -319,7 +319,9 @@ func doJSON(method, path string, body []byte, out any) error {
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		var e struct{ Error string `json:"error"` }
+		var e struct {
+			Error string `json:"error"`
+		}
 		_ = json.Unmarshal(data, &e)
 		if e.Error != "" {
 			return fmt.Errorf("%d: %s", resp.StatusCode, e.Error)

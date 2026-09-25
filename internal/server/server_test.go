@@ -16,13 +16,17 @@ import (
 
 type nopProv struct{}
 
-func (nopProv) Allocate(_ context.Context) (int, error)                                     { return 0, nil }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace) error { return nil }
-func (nopProv) Booted(_ context.Context, _ int) (bool, error)                               { return false, nil }
-func (nopProv) Exit(_ context.Context, _ int) (*int, error)                                 { return nil, nil }
-func (nopProv) Running(_ context.Context, _ int) (bool, error)                              { return true, nil }
-func (nopProv) Logs(_ context.Context, _ int) (string, error)                               { return "", nil }
-func (nopProv) Destroy(_ context.Context, _ int) error                                      { return nil }
+func (nopProv) Allocate(_ context.Context) (int, error) { return 0, nil }
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace) error {
+	return nil
+}
+func (nopProv) Booted(_ context.Context, _ int) (bool, error)          { return false, nil }
+func (nopProv) Exit(_ context.Context, _ int) (*int, error)            { return nil, nil }
+func (nopProv) Running(_ context.Context, _ int) (bool, error)         { return true, nil }
+func (nopProv) Logs(_ context.Context, _ int) (string, error)          { return "", nil }
+func (nopProv) Destroy(_ context.Context, _ int) error                 { return nil }
+func (nopProv) DestroyOwned(_ context.Context, _ string, _ int) error  { return nil }
+func (nopProv) Owned(_ context.Context, _ string, _ int) (bool, error) { return true, nil }
 
 const manifest = `
 apiVersion: px.io/v1alpha1

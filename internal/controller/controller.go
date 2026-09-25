@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -130,6 +131,23 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			return
 		}
 		if booted {
+			// A reused VMID can carry a foreign boot marker; adoption must not
+			// run someone else's runner as this task. A container that is not
+			// ours (by hostname) is left alone and the task fails.
+			owned, oerr := c.prov.Owned(ctx, t.Metadata.Name, t.Status.Container)
+			if oerr != nil {
+				c.log.Error("check ownership before adoption", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", oerr)
+				return
+			}
+			if !owned {
+				c.log.Warn("adoption skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container)
+				t.Status.Container = 0
+				t.Status.Phase = v1alpha1.TaskProvisionFail
+				t.Status.Reason = "provisioning interrupted by restart: container is not owned by the task, left alone"
+				t.Status.EndedAt = nowPtr(c.now)
+				c.persist(t)
+				return
+			}
 			t.Status.Phase = v1alpha1.TaskRunning
 			now := c.now()
 			t.Status.StartedAt = &now
@@ -138,8 +156,19 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			c.persist(t)
 			return
 		}
-		if err := c.prov.Destroy(ctx, t.Status.Container); err != nil {
-			c.log.Error("cleanup interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		if err := c.prov.DestroyOwned(ctx, t.Metadata.Name, t.Status.Container); err != nil {
+			if !errors.Is(err, ErrNotOwned) {
+				c.log.Error("cleanup interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+				return
+			}
+			// The VMID no longer names our clone; leave the foreign container
+			// alone and fail the task.
+			c.log.Warn("cleanup skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			t.Status.Container = 0
+			t.Status.Phase = v1alpha1.TaskProvisionFail
+			t.Status.Reason = "provisioning interrupted by restart: container is not owned by the task, left alone"
+			t.Status.EndedAt = nowPtr(c.now)
+			c.persist(t)
 			return
 		}
 		t.Status.Container = 0
@@ -160,14 +189,24 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 // mid-destroy retries on the next tick.
 func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 	if vmid := t.Status.Container; vmid != 0 {
-		if err := c.prov.Destroy(ctx, vmid); err != nil {
+		err := c.prov.DestroyOwned(ctx, t.Metadata.Name, vmid)
+		switch {
+		case errors.Is(err, ErrNotOwned):
+			// The VMID names a container that is not ours (PVE nextid is
+			// unreserved); it is not px's to destroy, so drop the record
+			// rather than retry forever.
+			c.log.Warn("destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+			t.Status.Container = 0
+			c.persist(t)
+		case err != nil:
 			// Keep the record and retry next tick; deleting it now
 			// would orphan the container with nothing left to retry.
 			c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
 			return
+		default:
+			t.Status.Container = 0
+			c.persist(t)
 		}
-		t.Status.Container = 0
-		c.persist(t)
 	} else if t.Status.Phase == v1alpha1.TaskProvisioning {
 		c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
 	}
@@ -300,7 +339,15 @@ func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	vmid := t.Status.Container
-	if err := c.prov.Destroy(ctx, vmid); err != nil {
+	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, vmid)
+	switch {
+	case errors.Is(err, ErrNotOwned):
+		c.log.Warn("ttl destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+		t.Status.Container = 0
+		t.Status.Reason += " (container not owned, left alone after TTL)"
+		c.persist(t)
+		return
+	case err != nil:
 		c.log.Error("ttl destroy", "task", t.Metadata.Name, "vmid", vmid, "err", err)
 		return
 	}
