@@ -14,7 +14,10 @@ import (
 	"github.com/kawai/px/internal/apis/v1alpha1"
 )
 
-var serverURL = "http://127.0.0.1:7420"
+var (
+	serverURL = "http://127.0.0.1:7420"
+	apiToken  string
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -25,6 +28,7 @@ func main() {
 
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	fs.StringVar(&serverURL, "server", envOr("PX_SERVER", "http://127.0.0.1:7420"), "px-server URL")
+	fs.StringVar(&apiToken, "token", envOr("PX_TOKEN", ""), "API bearer token (env PX_TOKEN; px-server enables auth with -token-file)")
 	var err error
 	switch cmd {
 	case "apply":
@@ -35,6 +39,8 @@ func main() {
 		err = cmdDescribe(fs, args)
 	case "logs":
 		err = cmdLogs(fs, args)
+	case "watch":
+		err = cmdWatch(fs, args)
 	case "delete":
 		err = cmdDelete(fs, args)
 	case "version":
@@ -223,6 +229,78 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
+func cmdWatch(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(serverURL, "/")+"/v1/watch", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+
+	// Print phase transitions only, and exit once every task is terminal or
+	// marked for deletion — so `px watch` doubles as the scripted wait for a
+	// task to finish. Frames are decoded straight off the stream: a snapshot
+	// of many tasks can exceed any fixed line size, and a stream end other
+	// than a clean EOF surfaces as an error, so a dead server never looks
+	// like "all tasks done".
+	dec := json.NewDecoder(resp.Body)
+	phases := map[string]string{}
+	for {
+		var snap struct {
+			Tasks []*v1alpha1.Task `json:"tasks"`
+		}
+		if err := dec.Decode(&snap); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		now := map[string]string{}
+		// An empty snapshot (nothing applied yet) is not "everything done" —
+		// stay connected so a watch started before `px apply` still waits.
+		done := len(snap.Tasks) > 0
+		for _, t := range snap.Tasks {
+			ph := string(t.Status.Phase)
+			now[t.Metadata.Name] = ph
+			if old, ok := phases[t.Metadata.Name]; !ok {
+				fmt.Printf("%s %s\n", t.Metadata.Name, ph)
+			} else if old != ph {
+				fmt.Printf("%s %s -> %s\n", t.Metadata.Name, old, ph)
+			}
+			if t.Status.DeletionTimestamp == nil && !isTerminal(t.Status.Phase) {
+				done = false
+			}
+		}
+		for name, old := range phases {
+			if _, ok := now[name]; !ok {
+				fmt.Printf("%s %s -> Deleted\n", name, old)
+			}
+		}
+		phases = now
+		if done {
+			return nil
+		}
+	}
+}
+
+func isTerminal(ph v1alpha1.TaskPhase) bool {
+	switch ph {
+	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
+		return true
+	}
+	return false
+}
+
 func doJSON(method, path string, body []byte, out any) error {
 	req, err := http.NewRequest(method, strings.TrimRight(serverURL, "/")+path, bodyReader(body))
 	if err != nil {
@@ -231,9 +309,9 @@ func doJSON(method, path string, body []byte, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/yaml")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := do(req)
 	if err != nil {
-		return fmt.Errorf("connect to %s: %w (is px-server running?)", serverURL, err)
+		return err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -254,10 +332,31 @@ func doJSON(method, path string, body []byte, out any) error {
 	return nil
 }
 
-func stream(method, path string, w io.Writer) error {
-	resp, err := http.Get(strings.TrimRight(serverURL, "/") + path)
+// do sends req with the API token attached and turns 401 into a hint about
+// PX_TOKEN, so a server started with -token-file is easy to diagnose.
+func do(req *http.Request) (*http.Response, error) {
+	if apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+apiToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("connect to %s: %w", serverURL, err)
+		return nil, fmt.Errorf("connect to %s: %w (is px-server running?)", serverURL, err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		return nil, fmt.Errorf("401: unauthorized (set PX_TOKEN or -token to the value of px-server's -token-file)")
+	}
+	return resp, nil
+}
+
+func stream(method, path string, w io.Writer) error {
+	req, err := http.NewRequest(method, strings.TrimRight(serverURL, "/")+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := do(req)
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
@@ -303,10 +402,12 @@ Usage:
   px describe task NAME           Show one task as JSON
   px describe workspace NAME      Show one workspace as JSON
   px logs NAME [-f]               Stream runner logs
+  px watch                        Stream task phase transitions
   px delete task NAME             Delete a task and its container
   px version                      Show version
 
 Flags:
   -server URL    px-server URL (env PX_SERVER, default http://127.0.0.1:7420)
+  -token TOK     API bearer token (env PX_TOKEN; required when px-server runs with -token-file)
 `)
 }

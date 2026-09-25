@@ -79,6 +79,10 @@ $ px get tasks
 NAME          PHASE    CONTAINER   AGE
 fix-bug-123   Running  142         5s
 
+$ px watch
+fix-bug-123 Provisioning -> Running
+fix-bug-123 Running -> Succeeded
+
 $ px logs -f fix-bug-123
 ```
 
@@ -100,9 +104,10 @@ Pre-alpha. The API (`px.io/v1alpha1`) will change. See
 
 Known limitations on the current milestone:
 
-- The HTTP API is **unauthenticated**; `px-server` therefore binds to
-  `127.0.0.1` by default. Token auth lands in M2 — don't expose the port.
-- Workspace objects are stored only; git clone into containers ships with M2.
+- The HTTP API is unauthenticated unless `px-server` runs with
+  `-token-file <file>` (then every request needs `Authorization: Bearer`, and
+  clients pass the value via `-token` / `PX_TOKEN`). Either way the server
+  binds to `127.0.0.1` by default — don't expose the port without TLS.
 - SSH host keys are not pinned yet (M3).
 - `px delete` is asynchronous: the record and container are gone by the next
   reconcile tick (~2s), after the container has been destroyed. A failed

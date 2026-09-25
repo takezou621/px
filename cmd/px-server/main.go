@@ -23,8 +23,9 @@ import (
 
 func main() {
 	var (
-		listen      = flag.String("listen", "127.0.0.1:7420", "HTTP listen address (loopback by default; the API is unauthenticated)")
+		listen      = flag.String("listen", "127.0.0.1:7420", "HTTP listen address (loopback by default; without -token-file the API is unauthenticated)")
 		dbPath      = flag.String("db", "px.db", "SQLite database path")
+		tokenFile   = flag.String("token-file", os.Getenv("PX_TOKEN_FILE"), "require API bearer token read from this file (clients pass it via -token/env PX_TOKEN; /healthz stays open)")
 		pveEndpoint = flag.String("pve-endpoint", os.Getenv("PX_PVE_ENDPOINT"), "Proxmox VE API endpoint (https://host:8006)")
 		pveNode     = flag.String("pve-node", os.Getenv("PX_PVE_NODE"), "Proxmox VE node name")
 		pveToken    = flag.String("pve-token", os.Getenv("PX_PVE_TOKEN"), "PVE API token: user@realm!tokenid=secret")
@@ -66,9 +67,20 @@ func main() {
 	defer stop()
 	go ctl.Run(ctx)
 
+	handler := server.New(st, ctl, prov, log).Handler()
+	if *tokenFile != "" {
+		token, err := loadToken(*tokenFile)
+		if err != nil {
+			log.Error("load api token", "err", err)
+			os.Exit(1)
+		}
+		handler = server.RequireBearer(token, handler)
+		log.Info("api token auth enabled", "token-file", *tokenFile)
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           server.New(st, ctl, prov, log).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -98,4 +110,18 @@ func hostOf(endpoint string) string {
 		return host
 	}
 	return s
+}
+
+// loadToken reads a single-line token, trimming surrounding whitespace so
+// editors that add a trailing newline don't corrupt it.
+func loadToken(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("%s: empty token", path)
+	}
+	return token, nil
 }

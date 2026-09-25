@@ -44,7 +44,21 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     Server: GET /v1/workspaces and /v1/workspaces/{name}; CLI:
     `px get workspaces`, `px describe workspace NAME`.
 - [ ] API token auth (px-server is unauthenticated today; loopback-only by default)
+  - Design: opt-in static bearer token — `px-server -token-file F` requires
+    `Authorization: Bearer <t>` on every route except `/healthz` (constant-time
+    compare, 401 with `WWW-Authenticate`). Without the flag the loopback-only
+    default stays, so M1/M2 workflows keep working. The CLI sends the token
+    from `-token` / env `PX_TOKEN`; a 401 prints a hint about PX_TOKEN. The
+    token file lives outside the repo (0600), never logged.
 - [ ] `px watch` (phase transition streaming)
+  - Design: `GET /v1/watch` streams NDJSON snapshots
+    (`{"tasks": [...], "workspaces": [...]}`) — first one immediately on
+    connect, then one per second until the client disconnects (plain
+    chunked net/http, no SSE/WebSocket dependency). `px watch` prints only
+    phase transitions (`ws-order Pending -> Running`), treats a task
+    disappearing from a snapshot as `Deleted`, and exits when every task is
+    terminal (Succeeded/Failed/ProvisionFailed) or marked for deletion —
+    so scripts and the E2E can just `px watch` to completion.
 
 ## M3 — Sandbox hardening
 
