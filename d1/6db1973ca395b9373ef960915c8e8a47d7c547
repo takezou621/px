@@ -1,0 +1,22 @@
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_5dcc0b6efb971d 444
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_5c2af86a10973a 537-540,552-554
+  s_c2f954a86dc8c5::t_bdb4e05b71bf59 555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d16db1973ca395b9373ef960915c8e8a47d7c547",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
