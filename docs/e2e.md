@@ -117,6 +117,15 @@ has — the top-level `firewall` option is QEMU-only), and
 `px: dns` / `px: dhcp` rules and the gateway's own rule. Cleanup
 removes all tasks and gateways.
 
+The empty-egress section is also a regression tripwire for a subtle
+timing property: pve-firewall programs the dataplane a few seconds
+*after* the container starts, so a runner that boots immediately gets a
+short unrestricted window (measured ~3s with a per-second egress
+probe). The provisioner closes it by gating the boot on the container's
+`veth<CTID>i0-OUT` chain appearing in the node's iptables — in both the
+v4 and v6 rulesets, which pve-firewall loads in separate passes — which
+is why the DNS-only verdicts are deterministic.
+
 The deny check targets `https://1.1.1.1/`, so the control task in
 section 4 needs outbound internet from the sandbox; on a fully
 air-gapped lab every "blocked" would pass vacuously — the control task

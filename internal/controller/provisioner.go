@@ -66,10 +66,16 @@ type Provisioner interface {
 type provisioner struct {
 	pve *proxmox.Client
 	ssh *sshexec.Executor
+	// egressGate runs between start and boot for gateway tasks; nil falls
+	// back to waitForEgressEnforcement. Tests stub it to keep the flow
+	// deterministic without a live node.
+	egressGate func(ctx context.Context, vmid int) error
 }
 
 func NewProvisioner(pve *proxmox.Client, ssh *sshexec.Executor) Provisioner {
-	return &provisioner{pve: pve, ssh: ssh}
+	p := &provisioner{pve: pve, ssh: ssh}
+	p.egressGate = p.waitForEgressEnforcement
+	return p
 }
 
 // ResolvedWorkspace is a task workspace reference resolved against the
@@ -257,6 +263,20 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return fmt.Errorf("start: %w", err)
 	}
+	// The .fw config is in pmxcfs before start, but pve-firewall programs
+	// the dataplane only a few seconds after the veth appears — measured ~3s
+	// of unrestricted egress right after boot. Hold the runner until the
+	// container's OUT chain is live; failing loud beats silently open.
+	if gw != nil {
+		gate := p.egressGate
+		if gate == nil {
+			gate = p.waitForEgressEnforcement
+		}
+		if err := gate(ctx, vmid); err != nil {
+			_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+			return fmt.Errorf("wait for egress enforcement: %w", err)
+		}
+	}
 	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
 	// top of the plain boot, so give each workspace its own 30s budget.
 	bootTimeout := 60*time.Second + time.Duration(len(mounts))*30*time.Second
@@ -320,6 +340,36 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 		}
 	}
 	return nil
+}
+
+// waitForEgressEnforcement polls the node's iptables until pve-firewall has
+// installed the container's OUT chain (veth<vmid>i0-OUT), the moment its
+// egress policy actually starts dropping packets. grep exit 1 (chain not yet
+// there) is the ordinary retry case, not a failure. Both address families
+// are required: pve-firewall compiles the v4 and v6 rulesets independently
+// and loads them in separate iptables-restore passes, so a runner released
+// on the v4 chain alone could still talk over IPv6 in the gap. The v6 chain
+// is generated unconditionally (v6 routing is not needed for it to exist),
+// so this never wedges on a v4-only node.
+func (p *provisioner) waitForEgressEnforcement(ctx context.Context, vmid int) error {
+	chain := fmt.Sprintf(":veth%di0-OUT", vmid)
+	probe := fmt.Sprintf("iptables-save | grep -qF %s && ip6tables-save | grep -qF %s",
+		shellQuote(chain), shellQuote(chain))
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, code, err := p.ssh.Run(probe, 10*time.Second)
+		if err == nil && code == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("egress chain for CT %d not installed within 30s", vmid)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // net0WithFirewall rewrites an LXC net0 config string with firewall=1:

@@ -246,7 +246,16 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), ssh: &sshexec.Executor{}}
+	// The real gate polls the node's iptables; a stub keeps the test
+	// deterministic while still pinning WHEN enforcement is awaited.
+	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), ssh: &sshexec.Executor{},
+		egressGate: func(_ context.Context, vmid int) error {
+			if vmid != 142 {
+				t.Errorf("egress gate called with vmid %d, want 142", vmid)
+			}
+			record("egress-gate")
+			return nil
+		}}
 
 	err := p.Create(context.Background(), testProvTask(), 142, nil, nil,
 		&ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443"}}})
@@ -272,6 +281,10 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 		{"net0-firewall", "fw-options"},
 		{"fw-options", "rule"},
 		{"rule", "start"},
+		// The runner must not boot until the egress gate has passed — that
+		// gap is the window in which a restricted sandbox is still open.
+		{"start", "egress-gate"},
+		{"egress-gate", "destroy"},
 		{"start", "destroy"},
 	} {
 		if first(pair[0]) >= first(pair[1]) {

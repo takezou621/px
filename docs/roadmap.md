@@ -153,7 +153,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     the placeholder — it now encodes with
     `SetEscapeHTML(false)` like the server, so describe output re-applied
     as YAML still trips the placeholder guard.
-- [ ] Gateway kind: egress allowlist via LXC firewall
+- [x] Gateway kind: egress allowlist via LXC firewall
   - Design: `spec.egress` is a list of destination rules — each has `cidr`
     (required, IP or CIDR) plus optional `ports` (`"443"`, `"80,443"`,
     `"8000:9000"`) and `proto` (`tcp` default, or `udp`; a rule with neither
@@ -181,6 +181,15 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     exec-only per the architecture note. Server: GET /v1/gateways,
     /v1/gateways/{name}, DELETE /v1/gateways/{name}; CLI: `px get
     gateways`, `px describe gateway NAME`, `px delete gateway NAME`.
+    Landed 2026-09-25, E2E-verified live (`scripts/e2e-gateway.sh`, see
+    docs/e2e.md §3c). Two live findings fixed along the way: the runner's
+    model.env source used `2>/dev/null` to ignore a missing file, but dash
+    exits on a failed dot-builtin — model-less tasks froze in Running; and
+    pve-firewall programs the dataplane ~3s after start (measured with a
+    per-second egress probe), so the provisioner now gates the boot on the
+    container's `veth<vmid>i0-OUT` chain appearing in both the node's
+    iptables and ip6tables rulesets (pve-firewall loads the two families in
+    separate passes) — the runner never boots ahead of enforcement.
 - [x] Model kind: LLM credentials injected as per-task env/secrets
   - Design: `spec.provider` is a closed set (`anthropic`, `openai`) that maps
     to the well-known env names (`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
@@ -213,6 +222,14 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     and apply rejects the literal `<redacted>` placeholder, so re-applying
     a fetched Model fails loudly instead of silently replacing the real key.
 - [ ] unprivileged CT default; docs on threat model
+  - Content the doc must cover: DNS-tunnel exfil through the implicit DNS
+    allow (accepted trade-off); image-init traffic runs ahead of the egress
+    gate (the gate holds only the px runner — during the dataplane-loading
+    window the container's init can transmit, which is safe solely because
+    `spec.image` is the trusted px-built template; a user-supplied image
+    would need the gate before start, which PVE cannot do since the
+    dataplane only exists once the veth does); px.db is operator territory
+    (0600) — Model APIKeys sit in SQLite by the single-binary axis.
 
 ## M4 — Beyond one node
 
