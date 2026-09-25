@@ -26,10 +26,16 @@ IMAGE="$(pveam available --section system | awk '/debian-12-standard/ {print $2;
 [[ -n "$IMAGE" ]] || { echo "no debian-12 image found" >&2; exit 1; }
 # Template files need a vztmpl-capable storage (dir/NFS); lvmthin pools like
 # local-lvm reject them, so images land on TPL_STORAGE (default: local).
-pveam download "$TPL_STORAGE" "$IMAGE"
+# pct create must then reference the volume from that same storage — using
+# STORAGE here makes PVE parse the filename as an lvm volume name.
+if ! pvesm list "$TPL_STORAGE" --content vztmpl 2>/dev/null | grep -q "$IMAGE"; then
+  pveam download "$TPL_STORAGE" "$IMAGE"
+else
+  echo "==> $IMAGE already on $TPL_STORAGE, skipping download"
+fi
 
 echo "==> creating container $CTID ($NAME)"
-pct create "$CTID" "${STORAGE}:vztmpl/${IMAGE}" \
+pct create "$CTID" "${TPL_STORAGE}:vztmpl/${IMAGE}" \
   --hostname "$NAME" \
   --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
   --cores 2 --memory 2048 --swap 0 \
