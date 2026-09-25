@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func newMockPVE(t *testing.T) (*Client, *mockPVE) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatal(err)
 		}
-		if r.Form.Get("newid") != "142" || r.Form.Get("name") != "px-t1" {
+		if r.Form.Get("newid") != "142" || r.Form.Get("hostname") != "px-t1" {
 			t.Errorf("clone form: %v", r.Form)
 		}
 		m.cloneCount++
@@ -137,6 +138,28 @@ func TestDestroyMissing(t *testing.T) {
 	})
 	if err := c.DestroyContainer(context.Background(), 999); err != nil {
 		t.Fatalf("destroy missing should be tolerated: %v", err)
+	}
+}
+
+// PVE's parameter-verification errors report reasons as plain strings,
+// not arrays — the reason must survive into the error message.
+func TestParamVerifyErrorReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/clone") {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"data":null,"errors":{"name":"property is not defined in schema"},"message":"Parameter verification failed."}`))
+			return
+		}
+		w.Write([]byte(`{"data": "UPID:n1:0001:0002:updateresourcemanager:clone"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "n1", "root@pam!px=fake", false)
+	err := c.CloneContainer(context.Background(), 9000, 142, "px-t1")
+	if err == nil {
+		t.Fatal("want error for 400 clone")
+	}
+	if !strings.Contains(err.Error(), "property is not defined in schema") {
+		t.Fatalf("error lost the reason: %v", err)
 	}
 }
 

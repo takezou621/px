@@ -39,9 +39,33 @@ func New(endpoint, node, token string, skipTLSVerify bool) *Client {
 	}
 }
 
-// apiError is a PVE API error response.
+// apiError is a PVE API error response. PVE is inconsistent about the
+// error values: parameter verification reports strings ("name": "..."),
+// task failures report arrays ("vmid": ["does not exist"]).
 type apiError struct {
 	Errors map[string][]string `json:"errors,omitempty"`
+}
+
+func (ae *apiError) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Errors map[string]json.RawMessage `json:"errors,omitempty"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	ae.Errors = make(map[string][]string, len(raw.Errors))
+	for k, v := range raw.Errors {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			ae.Errors[k] = []string{s}
+			continue
+		}
+		var arr []string
+		if err := json.Unmarshal(v, &arr); err == nil {
+			ae.Errors[k] = arr
+		}
+	}
+	return nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, form url.Values, out any) error {
@@ -116,7 +140,9 @@ type TaskStatus struct {
 func (c *Client) CloneContainer(ctx context.Context, templateVMID, newVMID int, name string) error {
 	form := url.Values{}
 	form.Set("newid", strconv.Itoa(newVMID))
-	form.Set("name", name)
+	// The LXC clone endpoint takes the container hostname (QEMU's clone
+	// calls it "name"; LXC rejects that parameter outright).
+	form.Set("hostname", name)
 	var upid string
 	// POST to the template's clone endpoint.
 	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/lxc/%d/clone", c.node, templateVMID), form, &upid); err != nil {
