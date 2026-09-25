@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +116,82 @@ func TestNextID(t *testing.T) {
 	id, err := c.NextID(context.Background())
 	if err != nil || id != 142 {
 		t.Fatalf("id=%d err=%v", id, err)
+	}
+}
+
+// The firewall writes go to different endpoints and must not leak into each
+// other: policy_out is a guest firewall option, and PVE rejects it if it
+// reaches the LXC config endpoint.
+func TestFirewallWrites(t *testing.T) {
+	var cfgForm, optsForm url.Values
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/config", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		cfgForm = r.Form
+		w.Write([]byte(`{"data": null}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		optsForm = r.Form
+		w.Write([]byte(`{"data": null}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := New(srv.URL, "n1", "root@pam!px=fake", false)
+
+	if err := c.EnableFirewall(ctx, 142, "name=eth0,bridge=vmbr0,ip=dhcp,type=veth,firewall=1"); err != nil {
+		t.Fatalf("EnableFirewall: %v", err)
+	}
+	if got := cfgForm.Get("net0"); got == "" {
+		t.Error("config write must carry net0")
+	}
+	if got := cfgForm.Get("firewall"); got != "1" {
+		t.Errorf("config write firewall flag = %q, want 1", got)
+	}
+	for _, must := range []string{"policy_out", "enable"} {
+		if _, ok := cfgForm[must]; ok {
+			t.Errorf("config write must not carry %q (guest firewall option, not an LXC property)", must)
+		}
+	}
+
+	if err := c.SetEgressDropPolicy(ctx, 142); err != nil {
+		t.Fatalf("SetEgressDropPolicy: %v", err)
+	}
+	if optsForm.Get("policy_out") != "DROP" || optsForm.Get("enable") != "1" {
+		t.Errorf("guest firewall options form = %v, want enable=1 policy_out=DROP", optsForm)
+	}
+	if _, ok := optsForm["net0"]; ok {
+		t.Error("firewall options write must not carry net0")
+	}
+}
+
+func TestClusterFirewallEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"data": {"enable": 1}}`, true},
+		{`{"data": {"enable": 0}}`, false},
+		{`{"data": {}}`, false},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte(tc.body))
+		}))
+		c := New(srv.URL, "n1", "root@pam!px=fake", false)
+		got, err := c.ClusterFirewallEnabled(context.Background())
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.body, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.body, got, tc.want)
+		}
 	}
 }
 
