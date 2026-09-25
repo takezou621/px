@@ -1,0 +1,34 @@
+docs/threat-model.md
+  s_c2f954a86dc8c5::t_e72355d0f7070d 111-121
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_e078eacb38954f 271-278,285-300
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_0f8dceb6f8a945 540-544
+internal/server/server.go
+  s_c2f954a86dc8c5::t_b195f20e91fc6b 273-278,289-293,306-332
+  s_c2f954a86dc8c5::t_cca6bc97fc4f4e 12
+  s_c2f954a86dc8c5::t_6653214677c625 234-240,242-243,252
+internal/sshexec/exec.go
+  s_c2f954a86dc8c5::t_d437af050202bd 201-203,206,208-209,211,214-220
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_ec3927160e21e3 402-404,417-418
+  s_c2f954a86dc8c5::t_3d6461082ef91d 419,561,566,585-628
+  s_c2f954a86dc8c5::t_b49f6d14d5baa0 420
+  s_c2f954a86dc8c5::t_23d67924a46344 629
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0dc29b9897f935ea62bb906247aa30c73d08a00c",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
