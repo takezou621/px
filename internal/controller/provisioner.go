@@ -31,9 +31,11 @@ type Provisioner interface {
 	// Create clones the template into vmid, starts the container and boots
 	// the runner. mounts are workspace repos cloned into the container before
 	// the runner starts; model, when non-nil, carries provider credentials
-	// the runner gets as environment variables. On failure it destroys any
-	// partial work, so the vmid no longer names a container of ours.
-	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error
+	// the runner gets as environment variables; gw, when non-nil, puts the
+	// container behind an egress allowlist (LXC firewall, default-deny out).
+	// On failure it destroys any partial work, so the vmid no longer names a
+	// container of ours.
+	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error
 	// Booted reports whether the container's boot script reached the runner
 	// spawn step and touched its marker (/run/px/booted) — see runnerScript
 	// for why the marker sits after the spawn. A provision interrupted by a
@@ -87,6 +89,14 @@ type ResolvedModel struct {
 	Provider v1alpha1.ModelProvider
 	APIKey   string
 	BaseURL  string
+}
+
+// ResolvedGateway is a task gateway reference resolved against the store:
+// the egress allowlist the container runs behind — default-deny outbound
+// with one ACCEPT rule per entry, via the LXC firewall.
+type ResolvedGateway struct {
+	Name   string
+	Egress []v1alpha1.EgressRule
 }
 
 // envPrefix maps a provider to its credential env names. Apply-time
@@ -218,7 +228,7 @@ func (p *provisioner) Allocate(ctx context.Context) (int, error) {
 	return p.pve.NextID(ctx)
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error {
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
 	templateVMID, err := p.pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
 		return fmt.Errorf("find template: %w", err)
@@ -230,6 +240,14 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 	if err := p.applyResources(ctx, vmid, t); err != nil {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return err
+	}
+	// The egress policy must be in place before the container starts — a
+	// sandbox that boots wide open even for a second is not deny-by-default.
+	if gw != nil {
+		if err := p.applyEgressPolicy(ctx, vmid, gw); err != nil {
+			_ = p.Destroy(context.WithoutCancel(ctx), vmid)
+			return fmt.Errorf("apply egress policy %q: %w", gw.Name, err)
+		}
 	}
 	if err := p.pve.StartContainer(ctx, vmid); err != nil {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
@@ -244,6 +262,70 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
 	}
 	return nil
+}
+
+// applyEgressPolicy installs the gateway's allowlist on the not-yet-started
+// clone: enable the CT firewall on net0 + CT option with default-deny
+// egress, then the implicit DNS/DHCP allows and one ACCEPT rule per spec
+// rule. The container is still stopped, so no hot-apply ordering concerns.
+func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *ResolvedGateway) error {
+	net0, err := p.pve.ContainerNet0(ctx, vmid)
+	if err != nil {
+		return fmt.Errorf("read net0: %w", err)
+	}
+	net0, err = net0WithFirewall(net0)
+	if err != nil {
+		return err
+	}
+	if err := p.pve.EnableFirewall(ctx, vmid, net0); err != nil {
+		return fmt.Errorf("enable firewall: %w", err)
+	}
+	// Name resolution and the DHCP lease must survive the firewall: nearly
+	// every real egress is name-based, and the template boots with ip=dhcp.
+	implicit := []proxmox.FirewallRule{
+		{Proto: "udp", Dport: "53", Comment: "px: dns"},
+		{Proto: "tcp", Dport: "53", Comment: "px: dns"},
+		{Proto: "udp", Dport: "67", Comment: "px: dhcp"},
+	}
+	for _, r := range implicit {
+		if err := p.pve.AddFirewallRule(ctx, vmid, r); err != nil {
+			return fmt.Errorf("add %s/%s rule: %w", r.Proto, r.Dport, err)
+		}
+	}
+	for _, r := range gw.Egress {
+		fr := proxmox.FirewallRule{
+			Proto:   r.Proto,
+			Dest:    r.CIDR,
+			Dport:   r.Ports,
+			Comment: "px: gateway " + gw.Name,
+		}
+		if err := p.pve.AddFirewallRule(ctx, vmid, fr); err != nil {
+			return fmt.Errorf("add egress rule for %s: %w", r.CIDR, err)
+		}
+	}
+	return nil
+}
+
+// net0WithFirewall rewrites an LXC net0 config string with firewall=1:
+// a firewall key already present (from the template) is flipped in place,
+// otherwise the flag is appended. The rest of the value (hwaddr, type, ...)
+// must survive untouched or the clone loses its NIC identity.
+func net0WithFirewall(net0 string) (string, error) {
+	if net0 == "" {
+		return "", fmt.Errorf("container has no net0")
+	}
+	parts := strings.Split(net0, ",")
+	found := false
+	for i, kv := range parts {
+		if strings.HasPrefix(kv, "firewall=") {
+			parts[i] = "firewall=1"
+			found = true
+		}
+	}
+	if !found {
+		parts = append(parts, "firewall=1")
+	}
+	return strings.Join(parts, ","), nil
 }
 
 func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.Task) error {

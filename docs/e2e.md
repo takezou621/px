@@ -91,6 +91,35 @@ What you should see while it runs (from another terminal):
 ./px logs -f e2e-ok            # tail runner output
 ```
 
+## 3c. Gateway-kind test
+
+With the same server running:
+
+```sh
+./scripts/e2e-gateway.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks); ALLOW_DEST (default
+#      192.168.2.100 — an IP reachable from the sandbox on tcp/8006,
+#      used as the allow rule's cidr)
+```
+
+It exercises: gateway CRUD is upsert-only, a task behind the allowlist
+reaches `ALLOW_DEST:8006` but not the wider internet (DNS stays
+allowed, `policy_out=DROP` denies the rest), a task **without** a
+gateway reaches both (control — if this one fails too, the sandbox
+just has no network and the deny verdicts mean nothing), an empty
+`egress: []` leaves the container DNS-only, a task referencing a
+missing gateway lands in `ProvisionFailed` before any container is
+created, and while the locked task runs the node shows `net0`
+`firewall=1`, the CT `firewall: 1` option, and `/etc/pve/lxc/<CTID>.fw`
+with `policy_out: DROP` plus the implicit `px: dns` / `px: dhcp` rules
+and the gateway's own rule. Cleanup removes all tasks and gateways.
+
+The deny check targets `https://1.1.1.1/`, so the control task in
+section 4 needs outbound internet from the sandbox; on a fully
+air-gapped lab every "blocked" would pass vacuously — the control task
+exists to catch exactly that.
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it

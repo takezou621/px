@@ -40,6 +40,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.handleListModels)
 	mux.HandleFunc("GET /v1/models/{name}", s.handleGetModel)
 	mux.HandleFunc("DELETE /v1/models/{name}", s.handleDeleteModel)
+	mux.HandleFunc("GET /v1/gateways", s.handleListGateways)
+	mux.HandleFunc("GET /v1/gateways/{name}", s.handleGetGateway)
+	mux.HandleFunc("DELETE /v1/gateways/{name}", s.handleDeleteGateway)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -117,6 +120,17 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 				return nil, fmt.Errorf("upsert model %s: %w", m.Metadata.Name, err)
 			}
 			results = append(results, fmt.Sprintf("model.px.io/%s configured", m.Metadata.Name))
+		case v1alpha1.KindGateway:
+			gw := &v1alpha1.Gateway{
+				APIVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindGateway,
+				Metadata:   m.Metadata,
+				Spec:       *m.Gateway,
+			}
+			if err := st.UpsertGateway(gw); err != nil {
+				return nil, fmt.Errorf("upsert gateway %s: %w", m.Metadata.Name, err)
+			}
+			results = append(results, fmt.Sprintf("gateway.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
 			t := &v1alpha1.Task{
 				APIVersion: v1alpha1.APIVersion,
@@ -254,6 +268,44 @@ func (s *Server) handleDeleteModel(w http.ResponseWriter, r *http.Request) {
 	err := s.store.DeleteModel(r.PathValue("name"))
 	if errors.Is(err, store.ErrNotFound) {
 		httpError(w, http.StatusNotFound, "model not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleListGateways(w http.ResponseWriter, _ *http.Request) {
+	gws, err := s.store.ListGateways()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if gws == nil {
+		gws = []*v1alpha1.Gateway{}
+	}
+	writeJSON(w, http.StatusOK, gws)
+}
+
+func (s *Server) handleGetGateway(w http.ResponseWriter, r *http.Request) {
+	g, err := s.store.GetGateway(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "gateway not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, g)
+}
+
+func (s *Server) handleDeleteGateway(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteGateway(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "gateway not found")
 		return
 	}
 	if err != nil {

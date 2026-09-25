@@ -29,6 +29,12 @@ type ModelReader interface {
 	GetModel(name string) (*v1alpha1.Model, error)
 }
 
+// GatewayReader resolves task gateway references against stored Gateway
+// resources.
+type GatewayReader interface {
+	GetGateway(name string) (*v1alpha1.Gateway, error)
+}
+
 // TaskWriter lets the controller persist status changes. UpsertTask
 // implementations must preserve an already-persisted DeletionTimestamp: the
 // controller works on stale snapshots, and a status write must never erase a
@@ -44,6 +50,7 @@ type Controller struct {
 		TaskReader
 		WorkspaceReader
 		ModelReader
+		GatewayReader
 		TaskWriter
 	}
 	prov Provisioner
@@ -56,6 +63,7 @@ func New(store interface {
 	TaskReader
 	WorkspaceReader
 	ModelReader
+	GatewayReader
 	TaskWriter
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
@@ -236,6 +244,11 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		c.failProvision(t, err)
 		return
 	}
+	gw, err := c.resolveGateway(t)
+	if err != nil {
+		c.failProvision(t, err)
+		return
+	}
 	t.Status.Phase = v1alpha1.TaskProvisioning
 	t.Status.Reason = "cloning template and starting container"
 	c.persist(t)
@@ -260,7 +273,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
-	if err := c.prov.Create(ctx, t, vmid, mounts, model); err != nil {
+	if err := c.prov.Create(ctx, t, vmid, mounts, model, gw); err != nil {
 		// Create cleans up its own partial work, so the VMID no longer names
 		// a container of ours. Clear it: a later destroy must never target an
 		// id that Create may have lost to another owner (PVE's nextid is a
@@ -308,6 +321,22 @@ func (c *Controller) resolveModel(t *v1alpha1.Task) (*ResolvedModel, error) {
 		return nil, fmt.Errorf("resolve model %q: %w", t.Spec.Model, err)
 	}
 	return &ResolvedModel{Provider: m.Spec.Provider, APIKey: m.Spec.APIKey, BaseURL: m.Spec.BaseURL}, nil
+}
+
+// resolveGateway resolves the task's gateway reference (at most one) like
+// resolveModel — before any container work, so an unknown Gateway is a
+// provision failure, not a container that boots fully open. A deleted Gateway
+// affects tasks applied after the deletion; running containers keep the
+// firewall rules set at their provision time.
+func (c *Controller) resolveGateway(t *v1alpha1.Task) (*ResolvedGateway, error) {
+	if t.Spec.Gateway == "" {
+		return nil, nil
+	}
+	g, err := c.store.GetGateway(t.Spec.Gateway)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gateway %q: %w", t.Spec.Gateway, err)
+	}
+	return &ResolvedGateway{Name: g.Metadata.Name, Egress: g.Spec.Egress}, nil
 }
 
 func (c *Controller) failProvision(t *v1alpha1.Task, err error) {

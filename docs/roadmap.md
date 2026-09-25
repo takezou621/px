@@ -154,6 +154,33 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     `SetEscapeHTML(false)` like the server, so describe output re-applied
     as YAML still trips the placeholder guard.
 - [ ] Gateway kind: egress allowlist via LXC firewall
+  - Design: `spec.egress` is a list of destination rules — each has `cidr`
+    (required, IP or CIDR) plus optional `ports` (`"443"`, `"80,443"`,
+    `"8000:9000"`) and `proto` (`tcp` default, or `udp`; a rule with neither
+    ports nor proto allows everything to that cidr). A Task references at
+    most one Gateway (`task.spec.gateway`, by name), resolved at provision
+    time exactly like Workspaces/Models — an unknown name is a
+    ProvisionFailed reason, so deleting a Gateway only affects tasks applied
+    later. At provision, after clone and before start, the controller
+    enables the LXC firewall on the clone — net0 gains `firewall=1` (read
+    the cloned net0 first: the template's carries hwaddr/type the clone
+    must keep), CT option `firewall=1`, `policy_out=DROP` — and inserts one
+    ACCEPT rule per spec rule: default-deny egress, replies ride
+    conntrack's ESTABLISHED,RELATED and policy_in stays at its default.
+    DNS (udp+tcp 53, any dest) and DHCP (udp 67) are always allowed: nearly
+    every real egress is name-based, and the lease must survive the
+    firewall — the DNS-tunnel exfil caveat goes to the threat-model doc.
+    An empty egress list is valid: a DNS-only sandbox. CIDR-only by design —
+    hostname rules would need apply-time DNS resolution that goes stale
+    (TOCTOU); pin a proxy's IP or point `model.baseUrl` at one instead.
+    Caps: MaxEgressRules 32, per-field byte caps, ports regex-validated,
+    cidr must parse as IP or CIDR. Declarative config like
+    Workspace/Model: apply upserts, no status. Applied via the PVE REST API
+    (GET config → PUT net0/firewall/policy_out → POST firewall/rules), not
+    SSH — config endpoints are JSON with no quoting pitfalls; SSH+pct stays
+    exec-only per the architecture note. Server: GET /v1/gateways,
+    /v1/gateways/{name}, DELETE /v1/gateways/{name}; CLI: `px get
+    gateways`, `px describe gateway NAME`, `px delete gateway NAME`.
 - [x] Model kind: LLM credentials injected as per-task env/secrets
   - Design: `spec.provider` is a closed set (`anthropic`, `openai`) that maps
     to the well-known env names (`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,

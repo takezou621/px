@@ -1,11 +1,16 @@
 package controller
 
 import (
+	"context"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/proxmox"
 )
 
 func testProvTask() *v1alpha1.Task {
@@ -18,6 +23,99 @@ func testProvTask() *v1alpha1.Task {
 			Workspaces: []v1alpha1.TaskWorkspace{{Name: "ws1", Goal: "Fix bug #123"}},
 			Runner:     v1alpha1.RunnerSpec{Command: []string{"claude", "-p", "it's fine"}},
 		},
+	}
+}
+
+// The net0 rewrite must keep every property the clone produced (bridge,
+// hwaddr, ip mode) and only add or force the firewall flag: rewriting the
+// hwaddr would change the container's MAC, and dropping ip=dhcp would break
+// the lease.
+func TestNet0WithFirewall(t *testing.T) {
+	in := "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:BE:95:31,ip=dhcp,type=veth"
+	out, err := net0WithFirewall(in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := in + ",firewall=1"
+	if out != want {
+		t.Fatalf("got %q, want %q", out, want)
+	}
+	// An existing firewall=0 is forced to 1 rather than appended twice.
+	out, err = net0WithFirewall("name=eth0,bridge=vmbr0,firewall=0,ip=dhcp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "name=eth0,bridge=vmbr0,firewall=1,ip=dhcp" {
+		t.Fatalf("existing flag not forced, got %q", out)
+	}
+	if _, err := net0WithFirewall(""); err == nil {
+		t.Fatal("empty net0 must be rejected")
+	}
+}
+
+// applyEgressPolicy always writes the implicit rules after policy_out=DROP:
+// without DNS the runner cannot resolve anything, and without DHCP the
+// ip=dhcp template loses its lease mid-run.
+func TestApplyEgressPolicyRules(t *testing.T) {
+	var mu sync.Mutex
+	var rules []proxmox.FirewallRule
+	var net0Set string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/123/config", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Write([]byte(`{"data": {"net0": "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:BE:95:31,ip=dhcp,type=veth"}}`))
+		case http.MethodPut:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			net0Set = r.Form.Get("net0")
+			mu.Unlock()
+			w.Write([]byte(`{"data": null}`))
+		}
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/123/firewall/rules", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		rules = append(rules, proxmox.FirewallRule{
+			Proto:   r.Form.Get("proto"),
+			Dest:    r.Form.Get("dest"),
+			Dport:   r.Form.Get("dport"),
+			Comment: r.Form.Get("comment"),
+		})
+		mu.Unlock()
+		w.Write([]byte(`{"data": null}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)}
+
+	gw := &ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{
+		{CIDR: "10.0.0.0/8", Ports: "443", Proto: "tcp"},
+	}}
+	if err := p.applyEgressPolicy(context.Background(), 123, gw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []proxmox.FirewallRule{
+		{Proto: "udp", Dport: "53", Comment: "px: dns"},
+		{Proto: "tcp", Dport: "53", Comment: "px: dns"},
+		{Proto: "udp", Dport: "67", Comment: "px: dhcp"},
+		{Proto: "tcp", Dest: "10.0.0.0/8", Dport: "443", Comment: "px: gateway locked"},
+	}
+	if len(rules) != len(want) {
+		t.Fatalf("got %d rules, want %d: %+v", len(rules), len(want), rules)
+	}
+	for i, r := range want {
+		if rules[i] != r {
+			t.Errorf("rule %d = %+v, want %+v", i, rules[i], r)
+		}
+	}
+	// net0 passed to the config write must carry firewall=1 and keep the hwaddr.
+	if !strings.Contains(net0Set, "firewall=1") || !strings.Contains(net0Set, "hwaddr=BC:24:11:BE:95:31") {
+		t.Fatalf("net0 sent to PVE = %q", net0Set)
 	}
 }
 

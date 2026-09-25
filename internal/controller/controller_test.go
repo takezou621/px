@@ -26,6 +26,7 @@ type fakeProv struct {
 	created     []int
 	mounts      []ResolvedWorkspace // mounts passed to the last Create
 	model       *ResolvedModel      // model passed to the last Create
+	gw          *ResolvedGateway    // gateway passed to the last Create
 	destroyed   []int
 	hostnames   map[int]string // vmid -> hostname; empty or missing = owned
 }
@@ -37,7 +38,7 @@ func (f *fakeProv) Allocate(_ context.Context) (int, error) {
 	return 100 + len(f.created), nil
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error {
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -45,6 +46,7 @@ func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts 
 	f.created = append(f.created, vmid)
 	f.mounts = mounts
 	f.model = model
+	f.gw = gw
 	f.mu.Unlock()
 	return nil
 }
@@ -114,6 +116,7 @@ type memStore struct {
 	tasks       map[string]*v1alpha1.Task
 	workspaces  map[string]*v1alpha1.Workspace
 	models      map[string]*v1alpha1.Model
+	gateways    map[string]*v1alpha1.Gateway
 }
 
 func newMemStore() *memStore {
@@ -121,7 +124,18 @@ func newMemStore() *memStore {
 		tasks:      map[string]*v1alpha1.Task{},
 		workspaces: map[string]*v1alpha1.Workspace{},
 		models:     map[string]*v1alpha1.Model{},
+		gateways:   map[string]*v1alpha1.Gateway{},
 	}
+}
+
+func (m *memStore) GetGateway(name string) (*v1alpha1.Gateway, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.gateways[name]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return g, nil
 }
 
 func (m *memStore) GetModel(name string) (*v1alpha1.Model, error) {
@@ -619,6 +633,78 @@ func TestUnknownModelFailsProvision(t *testing.T) {
 	}
 	if !strings.Contains(task.Status.Reason, "missing") {
 		t.Fatalf("Reason should name the missing model, got %q", task.Status.Reason)
+	}
+}
+
+// A task gateway reference resolves against the stored Gateway and rides into
+// Create as the egress allowlist.
+func TestGatewayResolvedIntoCreate(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	st.gateways["locked"] = &v1alpha1.Gateway{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindGateway,
+		Metadata:   v1alpha1.ObjectMeta{Name: "locked"},
+		Spec:       v1alpha1.GatewaySpec{Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443", Proto: "tcp"}}},
+	}
+	task := testTask(0)
+	task.Spec.Gateway = "locked"
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	gw := prov.gw
+	prov.mu.Unlock()
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s", task.Status.Phase)
+	}
+	if gw == nil || gw.Name != "locked" || len(gw.Egress) != 1 || gw.Egress[0].CIDR != "10.0.0.0/8" {
+		t.Fatalf("Create got wrong gateway: %+v", gw)
+	}
+}
+
+// A task without a gateway reference passes nil, so no firewall is enabled
+// and no rules are written for the container.
+func TestNoGatewayPassesNil(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	gw := prov.gw
+	prov.mu.Unlock()
+	if gw != nil {
+		t.Fatalf("gateway-less task must pass nil, got %+v", gw)
+	}
+}
+
+// A reference to a Gateway that was never applied fails the provision before
+// any container work starts — never a container that boots fully open.
+func TestUnknownGatewayFailsProvision(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Spec.Gateway = "missing"
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run for an unresolved gateway, created %v", prov.created)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container 0, got %d", task.Status.Container)
+	}
+	if !strings.Contains(task.Status.Reason, "missing") {
+		t.Fatalf("Reason should name the missing gateway, got %q", task.Status.Reason)
 	}
 }
 

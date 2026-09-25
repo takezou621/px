@@ -18,6 +18,7 @@ type Manifest struct {
 	Task      *TaskSpec      // non-nil when Kind == Task
 	Workspace *WorkspaceSpec // non-nil when Kind == Workspace
 	Model     *ModelSpec     // non-nil when Kind == Model
+	Gateway   *GatewaySpec   // non-nil when Kind == Gateway
 }
 
 // ParseManifests parses a multi-document YAML manifest stream.
@@ -124,6 +125,11 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 				return nil, fmt.Errorf("task %q: spec.model: %w", m.Metadata.Name, err)
 			}
 		}
+		if s.Gateway != "" {
+			if err := ValidateName(s.Gateway); err != nil {
+				return nil, fmt.Errorf("task %q: spec.gateway: %w", m.Metadata.Name, err)
+			}
+		}
 		m.Task = s
 	case KindWorkspace:
 		s := &WorkspaceSpec{}
@@ -167,6 +173,20 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			return nil, fmt.Errorf("model %q: %w", m.Metadata.Name, err)
 		}
 		m.Model = s
+	case KindGateway:
+		s := &GatewaySpec{}
+		if err := strictDecode(spec, s); err != nil {
+			return nil, fmt.Errorf("gateway %q: %w", m.Metadata.Name, err)
+		}
+		if len(s.Egress) > MaxEgressRules {
+			return nil, fmt.Errorf("gateway %q: spec.egress exceeds %d rules", m.Metadata.Name, MaxEgressRules)
+		}
+		for i := range s.Egress {
+			if err := ValidateEgress(&s.Egress[i]); err != nil {
+				return nil, fmt.Errorf("gateway %q: egress[%d]: %w", m.Metadata.Name, i, err)
+			}
+		}
+		m.Gateway = s
 	default:
 		return nil, fmt.Errorf("unknown kind %q", m.Kind)
 	}

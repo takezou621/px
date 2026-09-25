@@ -354,3 +354,124 @@ func TestParseTaskModelRefName(t *testing.T) {
 		t.Fatal("want error for invalid model reference name")
 	}
 }
+
+func gatewayManifest(spec string) string {
+	return "apiVersion: px.io/v1alpha1\nkind: Gateway\nmetadata:\n  name: g\nspec:\n" + spec
+}
+
+func TestParseGateway(t *testing.T) {
+	in := gatewayManifest(`  egress:
+    - cidr: 10.0.0.0/8
+      ports: "443"
+    - cidr: 192.168.2.100
+      ports: "8000:9000"
+      proto: udp
+    - cidr: 172.16.0.1
+`)
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g := objs[0].Gateway
+	if g == nil {
+		t.Fatal("Gateway spec not parsed")
+	}
+	if len(g.Egress) != 3 {
+		t.Fatalf("want 3 rules, got %d", len(g.Egress))
+	}
+	// Ports without an explicit proto defaults to tcp, the overwhelmingly
+	// common case for API egress.
+	if g.Egress[0].Proto != "tcp" {
+		t.Errorf("rule 0 proto = %q, want tcp", g.Egress[0].Proto)
+	}
+	if g.Egress[1].Proto != "udp" || g.Egress[1].Ports != "8000:9000" {
+		t.Errorf("rule 1 = %+v", g.Egress[1])
+	}
+	// No ports + no proto means "any protocol, any port".
+	if g.Egress[2].Ports != "" || g.Egress[2].Proto != "" {
+		t.Errorf("rule 2 = %+v", g.Egress[2])
+	}
+}
+
+func TestParseGatewayEmptyEgress(t *testing.T) {
+	in := gatewayManifest("  egress: []\n")
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Gateway == nil || len(objs[0].Gateway.Egress) != 0 {
+		t.Fatalf("empty egress must parse, got %+v", objs[0].Gateway)
+	}
+}
+
+func TestParseRejectsBadEgress(t *testing.T) {
+	for _, spec := range []string{
+		"  egress:\n    - ports: \"443\"\n",                       // cidr required
+		"  egress:\n    - cidr: not-an-ip\n",                      // invalid ip/cidr
+		"  egress:\n    - cidr: 10.0.0.1/99\n",                    // invalid prefix
+		"  egress:\n    - cidr: 10.0.0.0/8\n      ports: \"0\"\n", // port < 1
+		"  egress:\n    - cidr: 10.0.0.0/8\n      ports: \"65536\"\n",
+		"  egress:\n    - cidr: 10.0.0.0/8\n      ports: \"9000:1000\"\n", // range start > end
+		"  egress:\n    - cidr: 10.0.0.0/8\n      proto: icmp\n",
+		"  egress:\n    - cidr: 10.0.0.0/8\n      ports: \"443\"\n      proto: sctp\n",
+	} {
+		if _, err := ParseManifests(strings.NewReader(gatewayManifest(spec))); err == nil {
+			t.Errorf("spec %q must be rejected", spec)
+		}
+	}
+}
+
+func TestParseRejectsTooManyEgressRules(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("  egress:\n")
+	for i := 0; i <= MaxEgressRules; i++ {
+		fmt.Fprintf(&b, "    - cidr: 10.%d.0.0/16\n", i)
+	}
+	if _, err := ParseManifests(strings.NewReader(gatewayManifest(b.String()))); err == nil {
+		t.Fatal("want error for exceeding MaxEgressRules")
+	}
+}
+
+// The gateway reference resolves into firewall rules, but the name rides a Go
+// map key, so a task must not sneak in a name the Gateway kind would have
+// rejected.
+func TestParseTaskGatewayRefName(t *testing.T) {
+	ok := taskManifest("  image: t\n  gateway: locked-down\n  runner:\n    command: [\"true\"]\n")
+	objs, err := ParseManifests(strings.NewReader(ok))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Task.Gateway != "locked-down" {
+		t.Errorf("gateway = %q", objs[0].Task.Gateway)
+	}
+	bad := taskManifest("  image: t\n  gateway: \"../etc\"\n  runner:\n    command: [\"true\"]\n")
+	if _, err := ParseManifests(strings.NewReader(bad)); err == nil {
+		t.Fatal("want error for invalid gateway reference name")
+	}
+}
+
+func TestValidateEgress(t *testing.T) {
+	// A bare IP (no prefix) is accepted and left as-is: PVE's firewall
+	// accepts both forms.
+	r := &EgressRule{CIDR: "192.168.2.100"}
+	if err := ValidateEgress(r); err != nil {
+		t.Fatalf("bare IP rejected: %v", err)
+	}
+	// An oversized cidr is rejected before parsing, so a huge string cannot
+	// reach netlink or the API layer.
+	if err := ValidateEgress(&EgressRule{CIDR: strings.Repeat("a", MaxCIDRBytes+1)}); err == nil {
+		t.Fatal("oversized cidr must be rejected")
+	}
+	// Port edges: 1 and 65535 are valid, 0 and 65536 are not; an empty range
+	// endpoint fails as a non-port.
+	for _, ports := range []string{"1", "65535", "1,65535", "1000:2000", "443,80,8000:9000"} {
+		if err := ValidateEgress(&EgressRule{CIDR: "10.0.0.0/8", Ports: ports}); err != nil {
+			t.Errorf("ports %q rejected: %v", ports, err)
+		}
+	}
+	for _, ports := range []string{"0", "65536", "1000:0", ":443", "443:", "443,,80"} {
+		if err := ValidateEgress(&EgressRule{CIDR: "10.0.0.0/8", Ports: ports}); err == nil {
+			t.Errorf("ports %q must be rejected", ports)
+		}
+	}
+}

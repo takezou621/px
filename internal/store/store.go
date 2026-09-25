@@ -54,6 +54,11 @@ func Open(path string) (*Store, error) {
 			spec TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS gateways (
+			name TEXT PRIMARY KEY,
+			spec TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
@@ -252,6 +257,49 @@ func (s *Store) DeleteModel(name string) error {
 	return nil
 }
 
+func (s *Store) UpsertGateway(g *v1alpha1.Gateway) error {
+	spec, err := json.Marshal(g.Spec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO gateways (name, spec) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec`, g.Metadata.Name, string(spec))
+	return err
+}
+
+func (s *Store) GetGateway(name string) (*v1alpha1.Gateway, error) {
+	row := s.db.QueryRow(`SELECT name, spec FROM gateways WHERE name = ?`, name)
+	return scanGateway(row)
+}
+
+func (s *Store) ListGateways() ([]*v1alpha1.Gateway, error) {
+	rows, err := s.db.Query(`SELECT name, spec FROM gateways ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var gws []*v1alpha1.Gateway
+	for rows.Next() {
+		g, err := scanGateway(rows)
+		if err != nil {
+			return nil, err
+		}
+		gws = append(gws, g)
+	}
+	return gws, rows.Err()
+}
+
+func (s *Store) DeleteGateway(name string) error {
+	res, err := s.db.Exec(`DELETE FROM gateways WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanWorkspace(row rowScanner) (*v1alpha1.Workspace, error) {
@@ -300,4 +348,19 @@ func scanModel(row rowScanner) (*v1alpha1.Model, error) {
 		return nil, fmt.Errorf("model %s spec: %w", m.Metadata.Name, err)
 	}
 	return m, nil
+}
+
+func scanGateway(row rowScanner) (*v1alpha1.Gateway, error) {
+	g := &v1alpha1.Gateway{APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindGateway}
+	var spec string
+	if err := row.Scan(&g.Metadata.Name, &spec); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(spec), &g.Spec); err != nil {
+		return nil, fmt.Errorf("gateway %s spec: %w", g.Metadata.Name, err)
+	}
+	return g, nil
 }

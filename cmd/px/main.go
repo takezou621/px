@@ -93,7 +93,7 @@ func cmdApply(fs *flag.FlagSet, args []string) error {
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: px get tasks|workspaces|models")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways")
 	}
 	switch args[0] {
 	case "tasks":
@@ -140,8 +140,32 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 			fmt.Printf("%-24s %-12s %s\n", m.Metadata.Name, m.Spec.Provider, m.Spec.BaseURL)
 		}
 		return nil
+	case "gateways":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		var gws []*v1alpha1.Gateway
+		if err := doJSON(http.MethodGet, "/v1/gateways", nil, &gws); err != nil {
+			return err
+		}
+		fmt.Printf("%-24s %s\n", "NAME", "EGRESS")
+		for _, g := range gws {
+			rules := make([]string, 0, len(g.Spec.Egress))
+			for _, r := range g.Spec.Egress {
+				rule := r.CIDR
+				if r.Ports != "" {
+					rule += ":" + r.Ports
+				}
+				if r.Proto != "" {
+					rule += "/" + r.Proto
+				}
+				rules = append(rules, rule)
+			}
+			fmt.Printf("%-24s %s\n", g.Metadata.Name, strings.Join(rules, ","))
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: px get tasks|workspaces|models")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways")
 	}
 }
 
@@ -159,13 +183,13 @@ func popName(args []string) (string, []string, error) {
 
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	kind := "task" // bare NAME is treated as a task
-	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME")
+		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -189,6 +213,12 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		printJSONIndent(m)
+	case "gateway":
+		var g *v1alpha1.Gateway
+		if err := doJSON(http.MethodGet, "/v1/gateways/"+name, nil, &g); err != nil {
+			return err
+		}
+		printJSONIndent(g)
 	}
 	return nil
 }
@@ -240,13 +270,13 @@ func cmdLogs(fs *flag.FlagSet, args []string) error {
 
 func cmdDelete(fs *flag.FlagSet, args []string) error {
 	kind := "task"
-	if len(args) > 0 && (args[0] == "task" || args[0] == "model") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px delete task NAME | delete model NAME")
+		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -264,6 +294,12 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		fmt.Printf("model.px.io/%s deleted\n", name)
+	case "gateway":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/gateways/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("gateway.px.io/%s deleted\n", name)
 	}
 	return nil
 }
@@ -441,13 +477,16 @@ Usage:
   px get tasks                    List tasks
   px get workspaces               List workspaces
   px get models                   List models (API keys redacted)
+  px get gateways                 List gateways with their egress rules
   px describe task NAME           Show one task as JSON
   px describe workspace NAME      Show one workspace as JSON
   px describe model NAME          Show one model as JSON (API key redacted)
+  px describe gateway NAME        Show one gateway as JSON
   px logs NAME [-f]               Stream runner logs
   px watch                        Stream task phase transitions
   px delete task NAME             Delete a task and its container
   px delete model NAME            Delete a model
+  px delete gateway NAME          Delete a gateway
   px version                      Show version
 
 Flags:

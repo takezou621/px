@@ -226,6 +226,62 @@ func (c *Client) ContainerHostname(ctx context.Context, vmid int) (string, error
 	return cfg.Hostname, nil
 }
 
+// ContainerNet0 returns the container's net0 config value
+// ("name=eth0,bridge=vmbr0,hwaddr=...,ip=dhcp,type=veth") — read before
+// rewriting it, so enabling the firewall keeps the clone's hwaddr and type.
+func (c *Client) ContainerNet0(ctx context.Context, vmid int) (string, error) {
+	var cfg struct {
+		Net0 string `json:"net0"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), nil, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.Net0, nil
+}
+
+// EnableFirewall turns on the CT-level LXC firewall with default-deny
+// egress (policy_out=DROP; policy_in stays at its default, so replies ride
+// the same open inbound path as before). net0 must be the container's
+// current value with firewall=1 appended.
+func (c *Client) EnableFirewall(ctx context.Context, vmid int, net0 string) error {
+	form := url.Values{}
+	form.Set("net0", net0)
+	form.Set("firewall", "1")
+	form.Set("policy_out", "DROP")
+	return c.do(ctx, http.MethodPut, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), form, nil)
+}
+
+// FirewallRule is one CT firewall rule to append.
+type FirewallRule struct {
+	Proto   string // "tcp", "udp" or "" for any protocol
+	Dest    string // destination IP/CIDR, "" for any
+	Dport   string // destination port(s), "" for any
+	Comment string
+}
+
+// AddFirewallRule appends one outbound ACCEPT rule: a conntrack-matched
+// reply comes back through policy_in, so allowing the outbound initiation
+// is all an egress allow needs.
+func (c *Client) AddFirewallRule(ctx context.Context, vmid int, r FirewallRule) error {
+	form := url.Values{}
+	form.Set("enable", "1")
+	form.Set("type", "out")
+	form.Set("action", "ACCEPT")
+	if r.Proto != "" {
+		form.Set("proto", r.Proto)
+	}
+	if r.Dest != "" {
+		form.Set("dest", r.Dest)
+	}
+	if r.Dport != "" {
+		form.Set("dport", r.Dport)
+	}
+	if r.Comment != "" {
+		form.Set("comment", r.Comment)
+	}
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/lxc/%d/firewall/rules", c.node, vmid), form, nil)
+}
+
 // maxTaskWait bounds WaitForTask so a stuck PVE task cannot wedge the
 // serial reconcile loop forever.
 const maxTaskWait = 15 * time.Minute

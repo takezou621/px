@@ -3,7 +3,10 @@ package v1alpha1
 
 import (
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,6 +16,7 @@ const (
 	KindTask      = "Task"
 	KindWorkspace = "Workspace"
 	KindModel     = "Model"
+	KindGateway   = "Gateway"
 )
 
 // ObjectMeta identifies a manifest object.
@@ -35,6 +39,9 @@ type TaskSpec struct {
 	// Model optionally references a Model resource by name; the runner then
 	// gets the provider's credentials as environment variables.
 	Model string `json:"model,omitempty" yaml:"model,omitempty"`
+	// Gateway optionally references a Gateway resource by name; the
+	// container then runs behind its egress allowlist (default-deny out).
+	Gateway string `json:"gateway,omitempty" yaml:"gateway,omitempty"`
 }
 
 type TaskWorkspace struct {
@@ -100,6 +107,34 @@ type Model struct {
 	Spec       ModelSpec  `json:"spec"`
 }
 
+// EgressRule allows outbound traffic to one destination. A rule with ports
+// but no proto is normalized to tcp at parse time; a rule with neither
+// allows every protocol to the cidr.
+type EgressRule struct {
+	// CIDR is the destination address or range ("192.168.2.1",
+	// "10.0.0.0/8", v6 allowed).
+	CIDR string `json:"cidr" yaml:"cidr"`
+	// Ports is the destination port list: "443", "80,443", "8000:9000".
+	Ports string `json:"ports,omitempty" yaml:"ports,omitempty"`
+	// Proto is "tcp" or "udp" (default tcp when ports is set).
+	Proto string `json:"proto,omitempty" yaml:"proto,omitempty"`
+}
+
+// GatewaySpec declares an egress allowlist task containers run behind.
+// DNS (53) and DHCP (67) are always allowed on top of the rules — name-based
+// egress is unusable without DNS and the lease must survive the firewall.
+type GatewaySpec struct {
+	Egress []EgressRule `json:"egress" yaml:"egress"`
+}
+
+// Gateway is the API representation of a Gateway object.
+type Gateway struct {
+	APIVersion string      `json:"apiVersion"`
+	Kind       string      `json:"kind"`
+	Metadata   ObjectMeta  `json:"metadata"`
+	Spec       GatewaySpec `json:"spec"`
+}
+
 // TaskPhase is the lifecycle phase of a Task.
 type TaskPhase string
 
@@ -160,6 +195,9 @@ const (
 	MaxWorkspaces   = 8        // per task spec.workspaces
 	MaxAPIKeyBytes  = 4 << 10  // per model spec.apiKey
 	MaxBaseURLBytes = 512      // per model spec.baseUrl
+	MaxEgressRules  = 32       // per gateway spec.egress
+	MaxCIDRBytes    = 64       // per egress rule cidr
+	MaxPortsBytes   = 64       // per egress rule ports
 )
 
 // ValidateProvider checks spec.provider is a known provider.
@@ -183,6 +221,59 @@ func ValidateName(name string) error {
 func ValidateUser(user string) error {
 	if !userRe.MatchString(user) {
 		return fmt.Errorf("invalid runner.user %q: must be a container user name or numeric uid", user)
+	}
+	return nil
+}
+
+// ValidateEgress checks an egress rule survives the round-trip into PVE
+// firewall rules: cidr must parse as an IP or CIDR (a hostname is rejected
+// — resolving it at apply time would go stale, see the roadmap), ports must
+// be a comma-separated list of ports or low:high ranges in 1..65535, and
+// proto, when present, must be tcp or udp. It normalizes the proto default
+// so the stored spec is always what the firewall sees.
+func ValidateEgress(r *EgressRule) error {
+	if r.CIDR == "" {
+		return fmt.Errorf("cidr is required")
+	}
+	if len(r.CIDR) > MaxCIDRBytes {
+		return fmt.Errorf("cidr exceeds %d bytes", MaxCIDRBytes)
+	}
+	if net.ParseIP(r.CIDR) == nil {
+		if _, _, err := net.ParseCIDR(r.CIDR); err != nil {
+			return fmt.Errorf("cidr %q: must be an IP or CIDR", r.CIDR)
+		}
+	}
+	if len(r.Ports) > MaxPortsBytes {
+		return fmt.Errorf("ports exceeds %d bytes", MaxPortsBytes)
+	}
+	if r.Ports != "" {
+		for _, part := range strings.Split(r.Ports, ",") {
+			lo, hi, ranged := strings.Cut(part, ":")
+			ports := []string{lo}
+			if ranged {
+				ports = append(ports, hi)
+			}
+			nums := make([]int, 0, 2)
+			for _, p := range ports {
+				n, err := strconv.Atoi(p)
+				if err != nil || n < 1 || n > 65535 {
+					return fmt.Errorf("ports %q: %q is not a port (1-65535)", r.Ports, part)
+				}
+				nums = append(nums, n)
+			}
+			if ranged && nums[0] > nums[1] {
+				return fmt.Errorf("ports %q: range start above end", r.Ports)
+			}
+		}
+	}
+	switch r.Proto {
+	case "":
+		if r.Ports != "" {
+			r.Proto = "tcp"
+		}
+	case "tcp", "udp":
+	default:
+		return fmt.Errorf("invalid proto %q: must be tcp or udp", r.Proto)
 	}
 	return nil
 }

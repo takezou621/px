@@ -17,7 +17,7 @@ import (
 type nopProv struct{}
 
 func (nopProv) Allocate(_ context.Context) (int, error) { return 0, nil }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel) error {
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway) error {
 	return nil
 }
 func (nopProv) Booted(_ context.Context, _ int) (bool, error)          { return false, nil }
