@@ -112,10 +112,15 @@ var nameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 var userRe = regexp.MustCompile(`^([a-z_][a-z0-9_-]{0,31}|[0-9]{1,5})$`)
 
 // Size caps for values embedded base64 into the boot command line; the real
-// constraint is the kernel's MAX_ARG_STRLEN (128 KiB per argument).
+// constraint is the kernel's MAX_ARG_STRLEN (128 KiB per argument) — the
+// whole boot script rides on that single SSH argv element. At the caps below
+// a task's boot command stays well under the limit.
 const (
 	MaxGoalBytes    = 32 << 10 // combined across workspaces
 	MaxCommandBytes = 16 << 10 // total of spec.runner.command argv
+	MaxRepoBytes    = 2 << 10  // per workspace spec.git.repo
+	MaxBranchBytes  = 256      // per workspace spec.git.branch
+	MaxWorkspaces   = 8        // per task spec.workspaces
 )
 
 // ValidateName checks DNS-1123-style naming.

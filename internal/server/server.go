@@ -60,6 +60,35 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var results []string
+	err = s.store.InTx(func(tx *store.Store) error {
+		var aerr error
+		results, aerr = applyObjects(tx, manifests)
+		return aerr
+	})
+	if err != nil {
+		var conflict *applyConflictError
+		if errors.As(err, &conflict) {
+			httpError(w, http.StatusConflict, "%s", conflict.msg)
+			return
+		}
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"results": results})
+}
+
+// applyConflictError is a 409 apply (task name already taken). It aborts the
+// apply transaction, so a partially applied batch never persists — a Task in
+// a failing batch cannot outlive the Workspaces it references.
+type applyConflictError struct{ msg string }
+
+func (e *applyConflictError) Error() string { return e.msg }
+
+// applyObjects persists every manifest in document order. It runs inside the
+// caller's transaction, so the reconcile loop cannot observe the batch
+// half-applied (e.g. a Task whose Workspace is not yet stored).
+func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, error) {
+	var results []string
 	for _, m := range manifests {
 		switch m.Kind {
 		case v1alpha1.KindWorkspace:
@@ -69,9 +98,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 				Metadata:   m.Metadata,
 				Spec:       *m.Workspace,
 			}
-			if err := s.store.UpsertWorkspace(ws); err != nil {
-				httpError(w, http.StatusInternalServerError, "upsert workspace %s: %v", m.Metadata.Name, err)
-				return
+			if err := st.UpsertWorkspace(ws); err != nil {
+				return nil, fmt.Errorf("upsert workspace %s: %w", m.Metadata.Name, err)
 			}
 			results = append(results, fmt.Sprintf("workspace.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
@@ -83,18 +111,16 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			}
 			t.Status.Phase = v1alpha1.TaskPending
 			t.Status.Reason = "queued"
-			if err := s.store.CreateTask(t); err != nil {
+			if err := st.CreateTask(t); err != nil {
 				if errors.Is(err, store.ErrExists) {
-					httpError(w, http.StatusConflict, "task %q already exists; delete it first", m.Metadata.Name)
-					return
+					return nil, &applyConflictError{msg: fmt.Sprintf("task %q already exists; delete it first", m.Metadata.Name)}
 				}
-				httpError(w, http.StatusInternalServerError, "create task %s: %v", m.Metadata.Name, err)
-				return
+				return nil, fmt.Errorf("create task %s: %w", m.Metadata.Name, err)
 			}
 			results = append(results, fmt.Sprintf("task.px.io/%s created", m.Metadata.Name))
 		}
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"results": results})
+	return results, nil
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, _ *http.Request) {

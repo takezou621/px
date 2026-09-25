@@ -19,8 +19,16 @@ var (
 	ErrExists   = errors.New("already exists")
 )
 
+// executor is the subset of *sql.DB and *sql.Tx the store needs, so InTx can
+// bind every store method to a transaction.
+type executor interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 type Store struct {
-	db *sql.DB
+	db executor
 }
 
 func Open(path string) (*Store, error) {
@@ -49,7 +57,23 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error { return s.db.(*sql.DB).Close() }
+
+// InTx runs fn with every store method bound to one SQLite transaction: fn
+// either commits all its writes or none of them. handleApply uses this so a
+// reconcile tick can never observe a Task whose referenced Workspaces are
+// still on their way into the store.
+func (s *Store) InTx(fn func(*Store) error) error {
+	tx, err := s.db.(*sql.DB).Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op once Commit succeeded
+	if err := fn(&Store{db: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 // UpsertTask stores the task spec and merges the given status. An already
 // persisted deletionTimestamp survives: the controller works on snapshots,

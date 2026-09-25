@@ -205,3 +205,41 @@ func TestParseRejectsOversizedCommand(t *testing.T) {
 		t.Fatal("want error for command over MaxCommandBytes")
 	}
 }
+
+// The workspace reference name becomes a path segment in the boot script, so
+// a task must not sneak in a name the Workspace kind would have rejected.
+func TestParseRejectsBadWorkspaceRefName(t *testing.T) {
+	in := taskManifest("  image: t\n  workspaces:\n    - name: \"../etc\"\n      goal: x\n  runner:\n    command: [\"true\"]\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for invalid workspace reference name")
+	}
+}
+
+func TestParseRejectsTooManyWorkspaces(t *testing.T) {
+	wss := ""
+	for i := 0; i <= MaxWorkspaces; i++ {
+		wss += fmt.Sprintf("    - name: ws%d\n      goal: g\n", i)
+	}
+	in := taskManifest("  image: t\n  workspaces:\n" + wss + "  runner:\n    command: [\"true\"]\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for more than MaxWorkspaces entries")
+	}
+}
+
+func workspaceManifestWith(spec string) string {
+	return "apiVersion: px.io/v1alpha1\nkind: Workspace\nmetadata:\n  name: w\nspec:\n  git:\n" + spec
+}
+
+func TestParseRejectsOversizedRepo(t *testing.T) {
+	in := workspaceManifestWith(fmt.Sprintf("    repo: %q\n", strings.Repeat("a", MaxRepoBytes+1)))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for repo over MaxRepoBytes")
+	}
+}
+
+func TestParseRejectsOversizedBranch(t *testing.T) {
+	in := workspaceManifestWith(fmt.Sprintf("    repo: https://example.com/a.git\n    branch: %q\n", strings.Repeat("b", MaxBranchBytes+1)))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for branch over MaxBranchBytes")
+	}
+}

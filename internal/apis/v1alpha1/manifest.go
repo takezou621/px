@@ -86,10 +86,20 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			}
 		}
 		var goalBytes int
+		if len(s.Workspaces) > MaxWorkspaces {
+			return nil, fmt.Errorf("task %q: spec.workspaces exceeds %d entries", m.Metadata.Name, MaxWorkspaces)
+		}
 		seenWS := map[string]bool{}
 		for i, ws := range s.Workspaces {
 			if ws.Name == "" {
 				return nil, fmt.Errorf("task %q: workspaces[%d].name is required", m.Metadata.Name, i)
+			}
+			// The reference name becomes a path segment (/workspace/<name>) in
+			// the boot script; validating here keeps that safety property
+			// local to the parser instead of relying on the Workspace kind
+			// having been validated too.
+			if err := ValidateName(ws.Name); err != nil {
+				return nil, fmt.Errorf("task %q: workspaces[%d].name: %w", m.Metadata.Name, i, err)
 			}
 			if seenWS[ws.Name] {
 				return nil, fmt.Errorf("task %q: workspaces[%d].name %q is duplicated", m.Metadata.Name, i, ws.Name)
@@ -115,6 +125,12 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 		}
 		if s.Git.Repo == "" {
 			return nil, fmt.Errorf("workspace %q: spec.git.repo is required", m.Metadata.Name)
+		}
+		if len(s.Git.Repo) > MaxRepoBytes {
+			return nil, fmt.Errorf("workspace %q: spec.git.repo exceeds %d bytes", m.Metadata.Name, MaxRepoBytes)
+		}
+		if len(s.Git.Branch) > MaxBranchBytes {
+			return nil, fmt.Errorf("workspace %q: spec.git.branch exceeds %d bytes", m.Metadata.Name, MaxBranchBytes)
 		}
 		m.Workspace = s
 	default:

@@ -33,8 +33,15 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     clone failure dies before the `booted` marker and rides the existing
     provision-failure path (partial clone destroyed, no orphans). A
     Workspace is declarative config, not a reconciled object: apply upserts
-    it, there is no status. Public repos only in M2 — credentials belong to
-    Model (M3). Server: GET /v1/workspaces and /v1/workspaces/{name}; CLI:
+    it, there is no status; one apply batch commits in a single SQLite
+    transaction, so the reconcile tick never sees a Task whose Workspace is
+    still missing. Public repos only in M2 — credentials belong to
+    Model (M3). The runner starts in the container's root directory —
+    commands that work inside a repo must `cd /workspace/<name>` explicitly
+    (no implicit cd: surprise-free is better than convenient). Manifest
+    caps cover workspace values too (MaxWorkspaces/MaxRepoBytes/
+    MaxBranchBytes), keeping the boot command within SSH's MAX_ARG_STRLEN.
+    Server: GET /v1/workspaces and /v1/workspaces/{name}; CLI:
     `px get workspaces`, `px describe workspace NAME`.
 - [ ] API token auth (px-server is unauthenticated today; loopback-only by default)
 - [ ] `px watch` (phase transition streaming)

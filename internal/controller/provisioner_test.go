@@ -71,16 +71,17 @@ func TestRunnerScriptClonesWorkspaces(t *testing.T) {
 			t.Errorf("workspace input leaked raw into boot script: %q", secret)
 		}
 	}
-	if !strings.Contains(script, `clone_ws0() { git clone --depth 1 --branch "$(cat /run/px/ws0.branch)" "$(cat /run/px/ws0.repo)" /workspace/repo-a; }`) {
+	if !strings.Contains(script, `clone_ws0() { git clone --depth 1 --branch "$(cat /run/px/ws0.branch)" "$(cat /run/px/ws0.repo)" -- /workspace/repo-a; }`) {
 		t.Errorf("missing branch clone for repo-a:\n%s", script)
 	}
-	if !strings.Contains(script, `clone_ws1() { git clone --depth 1 "$(cat /run/px/ws1.repo)" /workspace/repo-b; }`) {
+	if !strings.Contains(script, `clone_ws1() { git clone --depth 1 "$(cat /run/px/ws1.repo)" -- /workspace/repo-b; }`) {
 		t.Errorf("missing default clone for repo-b:\n%s", script)
 	}
-	// Each clone retries once before the boot fails.
+	// Each clone retries once before the boot fails, clearing any partial
+	// clone the first attempt left behind.
 	for _, retry := range []string{
-		`clone_ws0 || { sleep 2; clone_ws0; } || { echo 'px: git clone repo-a failed' >&2; exit 1; }`,
-		`clone_ws1 || { sleep 2; clone_ws1; } || { echo 'px: git clone repo-b failed' >&2; exit 1; }`,
+		`clone_ws0 || { rm -rf /workspace/repo-a; sleep 2; clone_ws0; } || { echo 'px: git clone repo-a failed' >&2; exit 1; }`,
+		`clone_ws1 || { rm -rf /workspace/repo-b; sleep 2; clone_ws1; } || { echo 'px: git clone repo-b failed' >&2; exit 1; }`,
 	} {
 		if !strings.Contains(script, retry) {
 			t.Errorf("missing clone retry line %q:\n%s", retry, script)

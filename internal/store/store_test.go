@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -149,5 +150,69 @@ func TestReopenPersistsTasksAndMark(t *testing.T) {
 	}
 	if got.Status.DeletionTimestamp == nil {
 		t.Fatal("deletion mark lost across reopen")
+	}
+}
+
+func testWorkspace(name string) *v1alpha1.Workspace {
+	return &v1alpha1.Workspace{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindWorkspace,
+		Metadata:   v1alpha1.ObjectMeta{Name: name},
+		Spec:       v1alpha1.WorkspaceSpec{Git: v1alpha1.GitSpec{Repo: "https://example.com/a.git"}},
+	}
+}
+
+// InTx must commit everything fn wrote when it returns nil — and nothing at
+// all when fn errors. handleApply relies on the "nothing" half: a Task in a
+// failing batch must not outlive the Workspaces it references.
+func TestInTxCommitAndRollback(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.InTx(func(tx *Store) error {
+		if err := tx.CreateTask(testTask("t1")); err != nil {
+			return err
+		}
+		if err := tx.UpsertWorkspace(testWorkspace("ws1")); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetTask("t1"); err != nil {
+		t.Fatalf("committed task missing: %v", err)
+	}
+	if _, err := st.GetWorkspace("ws1"); err != nil {
+		t.Fatalf("committed workspace missing: %v", err)
+	}
+
+	err := st.InTx(func(tx *Store) error {
+		if err := tx.CreateTask(testTask("t2")); err != nil {
+			return err
+		}
+		return errors.New("boom")
+	})
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("want fn error propagated, got %v", err)
+	}
+	if _, err := st.GetTask("t2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rolled-back task must not persist, got %v", err)
+	}
+}
+
+// Store methods must keep working outside a transaction after InTx changes.
+func TestNonTxPathStillWorks(t *testing.T) {
+	st := openTestStore(t)
+	if err := st.CreateTask(testTask("t1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertWorkspace(testWorkspace("ws1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListTasks(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListWorkspaces(); err != nil {
+		t.Fatal(err)
 	}
 }

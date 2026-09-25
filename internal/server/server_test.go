@@ -186,6 +186,56 @@ func TestWorkspaces(t *testing.T) {
 	}
 }
 
+// The whole apply is one store transaction, so document order cannot matter:
+// the reconcile loop never observes a Task whose referenced Workspace is
+// still on its way into the store (a Task-first batch used to race the 2s
+// tick into a permanent ProvisionFailed).
+func TestApplyTaskBeforeWorkspace(t *testing.T) {
+	srv, ctl := newTestServer(t)
+	in := `
+apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: t-ws
+spec:
+  image: tmpl
+  workspaces:
+    - name: demo
+      goal: go
+  runner:
+    command: ["true"]
+---
+apiVersion: px.io/v1alpha1
+kind: Workspace
+metadata:
+  name: demo
+spec:
+  git:
+    repo: https://example.com/demo.git
+`
+	resp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("want 201, got %d: %s", resp.StatusCode, body)
+	}
+
+	// One reconcile tick must resolve the workspace reference and provision.
+	ctl.ReconcileOnce(context.Background())
+	getResp, err := http.Get(srv.URL + "/v1/tasks/t-ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if !strings.Contains(string(data), `"phase": "Running"`) {
+		t.Fatalf("task must provision past workspace resolution, got: %s", data)
+	}
+}
+
 func TestDelete(t *testing.T) {
 	srv, ctl := newTestServer(t)
 	if _, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(manifest)); err != nil {

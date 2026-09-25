@@ -106,14 +106,17 @@ done
 			branchFlag = fmt.Sprintf("--branch \"$(cat /run/px/ws%d.branch)\" ", i)
 		}
 		// ws.Name is DNS-1123-validated, safe as a path segment and inside a
-		// single-quoted echo. The boot runs right after container start, when
-		// DHCP may not have handed out a lease yet, so wait for the default
-		// route (max 20s) and retry the clone once before failing. A failed
-		// clone exits before the runner spawns, so PX_BOOT_OK is never
-		// printed and Create cleans up the container.
-		fmt.Fprintf(&s, `clone_ws%d() { git clone --depth 1 %s"$(cat /run/px/ws%d.repo)" /workspace/%s; }
-clone_ws%d || { sleep 2; clone_ws%d; } || { echo 'px: git clone %s failed' >&2; exit 1; }
-`, i, branchFlag, i, ws.Name, i, i, ws.Name)
+		// single-quoted echo. The `--` keeps a repo string starting with '-'
+		// from being parsed as a git option. The boot runs right after
+		// container start, when DHCP may not have handed out a lease yet, so
+		// wait for the default route (max 20s) and retry the clone once before
+		// failing — the retry clears any partial clone a first attempt may
+		// have left behind, since git refuses to clone into a non-empty dir.
+		// A failed clone exits before the runner spawns, so PX_BOOT_OK is
+		// never printed and Create cleans up the container.
+		fmt.Fprintf(&s, `clone_ws%d() { git clone --depth 1 %s"$(cat /run/px/ws%d.repo)" -- /workspace/%s; }
+clone_ws%d || { rm -rf /workspace/%s; sleep 2; clone_ws%d; } || { echo 'px: git clone %s failed' >&2; exit 1; }
+`, i, branchFlag, i, ws.Name, i, ws.Name, i, ws.Name)
 	}
 	s.WriteString(`nohup sh -c 'sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
 # marker for Booted(), touched only after the runner is spawned so that a
@@ -174,12 +177,9 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return fmt.Errorf("start: %w", err)
 	}
-	bootTimeout := 60 * time.Second
-	if len(mounts) > 0 {
-		// The DHCP wait (max 20s) and one retried clone per workspace ride on
-		// top of the plain boot.
-		bootTimeout = 180 * time.Second
-	}
+	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
+	// top of the plain boot, so give each workspace its own 30s budget.
+	bootTimeout := 60*time.Second + time.Duration(len(mounts))*30*time.Second
 	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts)), bootTimeout)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
