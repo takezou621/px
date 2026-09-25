@@ -1,0 +1,83 @@
+internal/apis/v1alpha1/types.go
+  s_c2f954a86dc8c5::t_0d896aaa823753 104-113,121-125
+  s_c2f954a86dc8c5::t_a545670eca0e8e 126-128
+internal/apis/v1alpha1/manifest.go
+  s_c2f954a86dc8c5::t_f8f0c6b79ed4a0 83-88,93-103
+internal/sshexec/exec.go
+  s_c2f954a86dc8c5::t_6b51eeb58b3e3f 10,26-28,30,32-33,37,45-54,58-59,65,67,71-72,80-81,83-97,119-132
+  s_c2f954a86dc8c5::t_eb5817d6d2a1c7 31,44,62
+  s_c2f954a86dc8c5::t_a4a8ed512d1402 133
+internal/apis/v1alpha1/manifest_test.go
+  s_c2f954a86dc8c5::t_a6881832f8392e 4
+  s_c2f954a86dc8c5::t_a40b295d34e9a8 113-166
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_b0f558766bff11 108,241,251-304,306-344
+  s_c2f954a86dc8c5::t_22805ee4dd2840 80,88,92-107
+  s_c2f954a86dc8c5::t_73a8647ae74ac6 40-42,50-55,60-63
+  s_c2f954a86dc8c5::t_1091df33759890 305
+  s_c2f954a86dc8c5::t_c01114eda572e6 5-6,16-23
+  s_c2f954a86dc8c5::t_c9a1aeb71a2da1 109
+internal/server/server.go
+  s_c2f954a86dc8c5::t_8474cef0f23bdd 125-129,133
+  s_c2f954a86dc8c5::t_20e94425392001 5,18
+  s_c2f954a86dc8c5::t_009abeb2e2ac3e 46,51-55
+  s_c2f954a86dc8c5::t_340fa457a911d1 84-89
+  s_c2f954a86dc8c5::t_9f24946ee52c36 19
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_8d7b7b6cdd2f7b 21
+  s_c2f954a86dc8c5::t_07905fd5a095f0 135
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_e588f1744fcd13 1-82
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_fd231cc640f389 172-176,180,187-189,192-193
+  s_c2f954a86dc8c5::t_953b0fed03aabd 194
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_e052eb95779c02 36,49
+  s_c2f954a86dc8c5::t_950bc5d0508786 172-182
+  s_c2f954a86dc8c5::t_72707b1dd8860d 70-74,77
+  s_c2f954a86dc8c5::t_21de7379a6e19c 94,100,102-103,105-108,120-133
+internal/store/store.go
+  s_c2f954a86dc8c5::t_bd76ad45398cd8 69-87
+  s_c2f954a86dc8c5::t_529755d7ebefc7 9,16-19
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_e86a385287ba9b 63-76,161
+  s_c2f954a86dc8c5::t_793833f514383f 130-137,151
+  s_c2f954a86dc8c5::t_d9f592f228f4c1 163-165
+  s_c2f954a86dc8c5::t_11fa61be6a887e 141,147-150
+  s_c2f954a86dc8c5::t_8457770e02f10e 20,22-23
+  s_c2f954a86dc8c5::t_b61dad642517ef 156-157,160
+  s_c2f954a86dc8c5::t_6928177b035854 111
+  s_c2f954a86dc8c5::t_256b8cd6744020 162
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_9c01e617415cd5 58,62
+  s_c2f954a86dc8c5::t_ec5a78ed92aad5 18,23
+  s_c2f954a86dc8c5::t_0a7404378de6fc 122-131
+cmd/px-server/main.go
+  s_c2f954a86dc8c5::t_37198b21919159 90-91,93,96-97
+  s_c2f954a86dc8c5::t_48206bc1b61c32 26
+  s_c2f954a86dc8c5::t_8e28456a909182 9,13
+  s_c2f954a86dc8c5::t_000e7668d45997 53-56,58
+README.md
+  s_c2f954a86dc8c5::t_87cc278f0a2087 63-66
+  s_c2f954a86dc8c5::t_33831516156a99 89,101-109
+  s_c2f954a86dc8c5::t_32a7c92206d18f 110
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_f2f82ee2efc3ba 125,143,146,151,162-167,179,182
+  s_c2f954a86dc8c5::t_10bbf7761a6ffb 107-118,123-124,127,141-142,145,168,177-178,180-181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9a69491bfcf07c6858bf12837369a768109a468e",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
