@@ -1,0 +1,88 @@
+internal/store/store.go
+  s_c2f954a86dc8c5::t_bb1d95a7b8d826 210-254
+  s_c2f954a86dc8c5::t_999416befe5b34 52-56
+  s_c2f954a86dc8c5::t_d508f298e314ba 289-303
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_f2670baf45822f 20
+  s_c2f954a86dc8c5::t_9aac567079ac90 326-342
+  s_c2f954a86dc8c5::t_15d18331f85dcc 266-291,296-325,343-367
+  s_c2f954a86dc8c5::t_7b55b264664761 292-295
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_f27b2a187a803d 116,123,127-134
+  s_c2f954a86dc8c5::t_4d89ea1d2e0732 28,40,47
+  s_c2f954a86dc8c5::t_b0b0f32363151e 135,553-624
+  s_c2f954a86dc8c5::t_527281c3ce7fd7 136
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_b574b7979db76a 145
+  s_c2f954a86dc8c5::t_eab41cd5e68ac6 168-175
+  s_c2f954a86dc8c5::t_1a6a2c1b97b4b2 146-167
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_3be07e75b95636 241-243,246,248
+  s_c2f954a86dc8c5::t_31972304e94584 164-240,244-245,247,249-254
+  s_c2f954a86dc8c5::t_28e763effc13e4 25
+  s_c2f954a86dc8c5::t_158c9d0096bac4 66
+  s_c2f954a86dc8c5::t_40a1ff2b428172 39-43
+  s_c2f954a86dc8c5::t_7b46e168cfd0fa 116,119-120
+internal/server/server.go
+  s_c2f954a86dc8c5::t_b0e653229d8c22 109-119
+  s_c2f954a86dc8c5::t_42e7f8706a17e1 227-271,273-275
+  s_c2f954a86dc8c5::t_b8f3afa31b0edb 281
+  s_c2f954a86dc8c5::t_8e1960e04df537 40-42
+  s_c2f954a86dc8c5::t_637c7c2fd47920 272
+internal/apis/v1alpha1/types.go
+  s_c2f954a86dc8c5::t_20b060790ec8f9 161-162,165-172
+  s_c2f954a86dc8c5::t_a2094f8df3682a 35-37
+  s_c2f954a86dc8c5::t_3f306b6a106cd7 90-94
+  s_c2f954a86dc8c5::t_857facc9b43194 70-89,95-102
+  s_c2f954a86dc8c5::t_bf4954da8a3bed 15
+  s_c2f954a86dc8c5::t_bdec5ca218bf53 173
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_9cc21a0701ecb8 96
+  s_c2f954a86dc8c5::t_7fcdf30a42e837 234-236,241,246-258
+  s_c2f954a86dc8c5::t_d306003a64862b 435,438,442
+  s_c2f954a86dc8c5::t_803a90596dc4de 130-142,144
+  s_c2f954a86dc8c5::t_02f9a898fdbbab 162,168,188-193
+  s_c2f954a86dc8c5::t_b959d2cd342c87 194
+internal/apis/v1alpha1/manifest_test.go
+  s_c2f954a86dc8c5::t_48e16676293877 246-304,340-356
+  s_c2f954a86dc8c5::t_c4f995adea595e 305-339
+internal/apis/v1alpha1/manifest.go
+  s_c2f954a86dc8c5::t_e7e4415a343d85 122-126
+  s_c2f954a86dc8c5::t_3db1e2c06d95de 20
+  s_c2f954a86dc8c5::t_2520cc91e79e0f 143-153,160-164,168-169
+  s_c2f954a86dc8c5::t_7f2d42c2e6d059 154-159,165-167
+  s_c2f954a86dc8c5::t_398131570ebf30 7
+  s_c2f954a86dc8c5::t_7efc322b05de1a 176-192
+internal/store/store_test.go
+  s_c2f954a86dc8c5::t_6f309fb8f5f2c7 219-273
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_42a2a383d3e30b 33-36
+  s_c2f954a86dc8c5::t_1c0ee3366471d2 105,129-142
+  s_c2f954a86dc8c5::t_2725cd712a39bd 177
+  s_c2f954a86dc8c5::t_45fe3d13a5ff37 115-119
+  s_c2f954a86dc8c5::t_ec17f346d59e8d 191-193,201
+  s_c2f954a86dc8c5::t_d063ffcce907f1 221,241
+  s_c2f954a86dc8c5::t_b5f10baa06e6a9 82-100
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_d79028acb36e9f 46,58
+  s_c2f954a86dc8c5::t_b601f07322eb48 234-238
+  s_c2f954a86dc8c5::t_9d5385c9007ad1 263
+  s_c2f954a86dc8c5::t_af1ceeac3966b4 299-312
+  s_c2f954a86dc8c5::t_d5c4fef0f07aed 27-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bcfe5d9dcad474329c49eb52faf3162ab7c507fd",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
