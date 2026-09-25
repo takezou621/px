@@ -188,6 +188,10 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	if err := c.store.UpsertTask(t); err != nil {
 		// The persisted VMID is the crash-safety anchor for everything
 		// node-side; if it cannot be recorded, do not create the container.
+		// Clear it before failing: the retry write inside failProvision may
+		// succeed, and must not then persist a VMID for a container that was
+		// never created.
+		t.Status.Container = 0
 		c.failProvision(t, fmt.Errorf("persist vmid: %w", err))
 		return
 	}

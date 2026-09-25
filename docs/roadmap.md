@@ -31,7 +31,8 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 ## M3 — Sandbox hardening
 
 - [ ] SSH host key pinning (today the first-seen key is accepted unverified)
-- [ ] Destroy guards by container name: PVE nextid is a suggestion, not a reservation, so a VMID recorded after a crash mid-provision could in theory collide with an externally created container — verify `px-<task>` name ownership before destroy
+- [ ] Destroy guards by container name: PVE nextid is a suggestion, not a reservation. Residual M1 window: a crash between VMID persist and Create can leave a VMID that destroy later targets after an external party reuses it; and a failed Create that clears its VMID can orphan a clone that succeeded late (PVE tasks outlive their waiter) — verify `px-<task>` name ownership before destroy
+- [ ] Distinguish pct exec transient failures from "no marker" in Booted(): today any non-zero pct exec is treated as unbooted, so a transient pct failure could destroy a live runner of an already-interrupted task; re-evaluate against real pct behavior in the PVE E2E (container restarts wiping the /run tmpfs are out of scope — external intervention)
 - [ ] Gateway kind: egress allowlist via LXC firewall
 - [ ] Model kind: LLM credentials injected as per-task env/secrets
 - [ ] unprivileged CT default; docs on threat model

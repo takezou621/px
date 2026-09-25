@@ -80,9 +80,9 @@ func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
 }
 
 type memStore struct {
-	mu        sync.Mutex
-	upsertErr error
-	tasks     map[string]*v1alpha1.Task
+	mu          sync.Mutex
+	failUpserts int // fail the next N UpsertTask calls, then succeed
+	tasks       map[string]*v1alpha1.Task
 }
 
 func newMemStore() *memStore { return &memStore{tasks: map[string]*v1alpha1.Task{}} }
@@ -112,8 +112,9 @@ func (m *memStore) GetTask(name string) (*v1alpha1.Task, error) {
 func (m *memStore) UpsertTask(t *v1alpha1.Task) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.upsertErr != nil {
-		return m.upsertErr
+	if m.failUpserts > 0 {
+		m.failUpserts--
+		return errors.New("db broken")
 	}
 	cp := copyTask(t)
 	if cur, ok := m.tasks[t.Metadata.Name]; ok &&
@@ -382,8 +383,9 @@ func TestAllocateError(t *testing.T) {
 	}
 }
 
-// If the VMID cannot be persisted, node-side work must not start: the record
-// is the crash-safety anchor for the container.
+// If the VMID cannot be persisted, node-side work must not start, and a
+// later successful write must not record a VMID for a container that was
+// never created — delete/TTL would then target an id we do not own.
 func TestPersistVmidFailureAbortsCreate(t *testing.T) {
 	st := newMemStore()
 	prov := &fakeProv{exits: map[int]int{}}
@@ -391,12 +393,19 @@ func TestPersistVmidFailureAbortsCreate(t *testing.T) {
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
 
 	st.mu.Lock()
-	st.upsertErr = errors.New("db broken")
+	st.failUpserts = 2 // 1st: Provisioning persist, 2nd: VMID persist; failProvision's retry succeeds
 	st.mu.Unlock()
 
 	runOnce(ctl)
 	if len(prov.created) != 0 {
 		t.Fatalf("Create must not run when the VMID cannot be persisted, created %v", prov.created)
+	}
+	task := get(t, st, "t1")
+	if task.Status.Container != 0 {
+		t.Fatalf("an uncreated VMID must not be recorded, got %d", task.Status.Container)
+	}
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
 	}
 }
 

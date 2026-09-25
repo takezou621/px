@@ -40,6 +40,13 @@ func TestRunnerScriptLayout(t *testing.T) {
 	if strings.Contains(script, "Fix bug #123") {
 		t.Error("goal leaked raw into boot script")
 	}
+	// The booted marker must be touched only after the runner is spawned, so
+	// that a present marker proves the runner process exists.
+	marker := strings.Index(script, "touch /run/px/booted")
+	spawn := strings.Index(script, "nohup sh -c")
+	if marker == -1 || spawn == -1 || marker < spawn {
+		t.Errorf("booted marker must follow the runner spawn:\n%s", script)
+	}
 }
 
 func TestQuoteCommandExportsGoalAndQuotesArgv(t *testing.T) {
