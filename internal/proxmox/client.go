@@ -169,17 +169,28 @@ func (c *Client) ContainerRunning(ctx context.Context, vmid int) (bool, error) {
 	return st.Status == "running", nil
 }
 
-// WaitForTask polls a PVE task until it finishes.
+// maxTaskWait bounds WaitForTask so a stuck PVE task cannot wedge the
+// serial reconcile loop forever.
+const maxTaskWait = 15 * time.Minute
+
+// WaitForTask polls a PVE task until it finishes and verifies it succeeded.
 func (c *Client) WaitForTask(ctx context.Context, upid string) (TaskStatus, error) {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
+	deadline := time.Now().Add(maxTaskWait)
 	for {
 		var st TaskStatus
 		if err := c.do(ctx, http.MethodGet, "/nodes/"+c.node+"/tasks/"+url.PathEscape(upid)+"/status", nil, &st); err != nil {
 			return st, err
 		}
 		if st.Status != "running" {
+			if !strings.HasPrefix(st.ExitStatus, "OK") {
+				return st, fmt.Errorf("pve task failed: %s", st.ExitStatus)
+			}
 			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return st, fmt.Errorf("pve task timed out after %s: %s", maxTaskWait, upid)
 		}
 		select {
 		case <-ctx.Done():

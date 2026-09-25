@@ -17,7 +17,10 @@ type Provisioner interface {
 	// Create clones the template, starts the container and boots the runner.
 	Create(ctx context.Context, t *v1alpha1.Task) (vmid int, err error)
 	// Exit polls the runner's exit code; nil means still running.
+	// A non-nil error means the probe itself failed (e.g. container gone).
 	Exit(ctx context.Context, vmid int) (*int, error)
+	// Running reports whether the task container is still up.
+	Running(ctx context.Context, vmid int) (bool, error)
 	// Logs returns the runner's combined output so far.
 	Logs(ctx context.Context, vmid int) (string, error)
 	// Destroy stops and deletes the container.
@@ -57,6 +60,20 @@ echo PX_BOOT_OK
 		base64.StdEncoding.EncodeToString([]byte(cmd)))
 }
 
+// bootCommand wraps the boot script so it lands inside the container via
+// base64. mkdir runs before the redirect on purpose: /run is tmpfs and the
+// template does not carry /run/px, so the redirect would fail before
+// boot.sh ever executes.
+func bootCommand(vmid int, user, script string) string {
+	userArg := ""
+	if user != "" {
+		userArg = " --user " + shellQuote(user)
+	}
+	b64 := base64.StdEncoding.EncodeToString([]byte(script))
+	return fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg,
+		shellQuote("mkdir -p /run/px && echo "+b64+" | base64 -d > /run/px/boot.sh && sh /run/px/boot.sh"))
+}
+
 func quoteCommand(argv []string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\nexport GOAL=\"$(cat /run/px/goal)\"\n")
@@ -91,10 +108,7 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task) (int, error)
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return 0, fmt.Errorf("start: %w", err)
 	}
-	// Boot the runner inside the container.
-	out, code, err := p.ssh.Run(
-		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("echo "+base64.StdEncoding.EncodeToString([]byte(runnerScript(t)))+" | base64 -d > /run/px/boot.sh && sh /run/px/boot.sh")),
-		60*time.Second)
+	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t)), 60*time.Second)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return 0, fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
@@ -113,26 +127,42 @@ func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.
 	if len(parts) == 0 {
 		return nil
 	}
-	_, _, err := p.ssh.Run(fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
-	return err
+	out, code, err := p.ssh.Run(fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("pct set: exit=%d out=%q", code, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 func (p *provisioner) Exit(ctx context.Context, vmid int) (*int, error) {
-	out, _, err := p.ssh.Run(
+	out, code, err := p.ssh.Run(
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("cat /run/px/exit 2>/dev/null || echo __RUNNING__")),
 		30*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	if code != 0 {
+		// pct exec itself failed; the controller treats this as a dead
+		// container after double-checking with Running.
+		return nil, fmt.Errorf("pct exec: exit=%d out=%q", code, strings.TrimSpace(out))
+	}
 	out = strings.TrimSpace(out)
 	if out == "" || out == "__RUNNING__" {
 		return nil, nil
 	}
-	var code int
-	if _, err := fmt.Sscanf(out, "%d", &code); err != nil {
+	var n int
+	if _, err := fmt.Sscanf(out, "%d", &n); err != nil {
 		return nil, fmt.Errorf("bad exit file %q", out)
 	}
-	return &code, nil
+	return &n, nil
+}
+
+// Running reports whether the task container is still up.
+func (p *provisioner) Running(ctx context.Context, vmid int) (bool, error) {
+	return p.pve.ContainerRunning(ctx, vmid)
 }
 
 func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {

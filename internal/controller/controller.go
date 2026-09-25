@@ -22,12 +22,6 @@ type TaskWriter interface {
 	DeleteTask(name string) error
 }
 
-// Deleter signals that a task was deleted while running and its container
-// should be destroyed (wired by the server on DELETE requests).
-type Deleter interface {
-	DeleteTaskAndDestroy(ctx context.Context, name string) error
-}
-
 type Controller struct {
 	store interface {
 		TaskReader
@@ -39,7 +33,7 @@ type Controller struct {
 	now    func() time.Time
 
 	mu      sync.Mutex
-	destroy map[string]int // task name -> vmid pending destroy
+	destroy map[string]bool // task names with a pending destroy
 }
 
 func New(store interface {
@@ -52,7 +46,7 @@ func New(store interface {
 		log:     log,
 		Tick:    2 * time.Second,
 		now:     time.Now,
-		destroy: map[string]int{},
+		destroy: map[string]bool{},
 	}
 }
 
@@ -73,12 +67,14 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
-// RequestDestroy asks the controller to destroy a task's container on the
-// next reconcile (used by the API server on DELETE).
-func (c *Controller) RequestDestroy(name string, vmid int) {
+// RequestDestroy asks the controller to destroy a task's container and drop
+// its record on the next reconcile (used by the API server on DELETE). The
+// vmid is resolved from the task record at reconcile time, so a delete racing
+// with provision still destroys the freshly created container.
+func (c *Controller) RequestDestroy(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.destroy[name] = vmid
+	c.destroy[name] = true
 }
 
 func (c *Controller) reconcileAll(ctx context.Context) {
@@ -95,15 +91,21 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	// Explicit delete: destroy the container and drop the record.
 	c.mu.Lock()
-	vmid, pending := c.destroy[t.Metadata.Name]
+	_, pending := c.destroy[t.Metadata.Name]
 	if pending {
 		delete(c.destroy, t.Metadata.Name)
 	}
 	c.mu.Unlock()
 	if pending {
-		if vmid != 0 {
+		if vmid := t.Status.Container; vmid != 0 {
 			if err := c.prov.Destroy(ctx, vmid); err != nil {
+				// Keep the record and retry next tick; deleting it now
+				// would orphan the container with nothing left to retry.
 				c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+				c.mu.Lock()
+				c.destroy[t.Metadata.Name] = true
+				c.mu.Unlock()
+				return
 			}
 		}
 		if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
@@ -115,7 +117,20 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	switch t.Status.Phase {
 	case "", v1alpha1.TaskPending:
 		c.provision(ctx, t)
-	case v1alpha1.TaskProvisioning, v1alpha1.TaskRunning:
+	case v1alpha1.TaskProvisioning:
+		if t.Status.Container == 0 {
+			// Reconcile is serial, so an in-flight Create never spans ticks:
+			// reaching here means the process restarted mid-provision and no
+			// VMID was recorded. The clone may linger on the node.
+			t.Status.Phase = v1alpha1.TaskProvisionFail
+			t.Status.Reason = "provisioning interrupted by restart; container may be orphaned on the node"
+			t.Status.EndedAt = nowPtr(c.now)
+			c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name)
+			c.persist(t)
+			return
+		}
+		c.poll(ctx, t)
+	case v1alpha1.TaskRunning:
 		c.poll(ctx, t)
 	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
 		c.cleanupAfterTTL(ctx, t)
@@ -154,6 +169,17 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 	}
 	code, err := c.prov.Exit(ctx, t.Status.Container)
 	if err != nil {
+		// The container may have died without writing an exit file (OOM,
+		// node reboot); distinguish that from a transient probe failure.
+		if running, rerr := c.prov.Running(ctx, t.Status.Container); rerr == nil && !running {
+			end := c.now()
+			t.Status.EndedAt = &end
+			t.Status.Phase = v1alpha1.TaskFailed
+			t.Status.Reason = "container not running and no exit file: " + err.Error()
+			c.log.Warn("container died", "task", t.Metadata.Name, "vmid", t.Status.Container)
+			c.persist(t)
+			return
+		}
 		c.log.Warn("poll exit", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
 		return
 	}

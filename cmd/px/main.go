@@ -104,17 +104,29 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
+// popName finds the first non-flag argument (the object NAME) and returns it
+// with the remaining args, so flags work before or after the name.
+func popName(args []string) (string, []string, error) {
+	for i, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			rest := append(append([]string{}, args[:i]...), args[i+1:]...)
+			return a, rest, nil
+		}
+	}
+	return "", args, fmt.Errorf("missing NAME")
+}
+
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	if len(args) > 0 && args[0] == "task" {
 		args = args[1:]
 	}
-	if len(args) < 1 {
-		return fmt.Errorf("usage: px describe task NAME")
+	name, rest, err := popName(args)
+	if err != nil {
+		return fmt.Errorf("usage: px describe task NAME [-server URL]")
 	}
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	name := args[0]
 	var t *v1alpha1.Task
 	if err := doJSON(http.MethodGet, "/v1/tasks/"+name, nil, &t); err != nil {
 		return err
@@ -126,18 +138,17 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 
 func cmdLogs(fs *flag.FlagSet, args []string) error {
 	follow := fs.Bool("f", false, "follow")
-	if len(args) > 0 && args[0] == "-f" {
-		*follow = true
-		args = args[1:]
+	name, rest, err := popName(args)
+	if err != nil {
+		return fmt.Errorf("usage: px logs NAME [-f] [-server URL]")
 	}
-	if len(args) < 1 {
-		return fmt.Errorf("usage: px logs NAME [-f]")
+	if err := fs.Parse(rest); err != nil {
+		return err
 	}
-	name := args[0]
 	if !*follow {
 		return stream(http.MethodGet, "/v1/tasks/"+name+"/logs", os.Stdout)
 	}
-	// Follow: poll and print the tail.
+	// Follow: poll and print the tail, stop once the task is terminal.
 	var last string
 	for {
 		var buf strings.Builder
@@ -148,6 +159,13 @@ func cmdLogs(fs *flag.FlagSet, args []string) error {
 			fmt.Print(strings.TrimPrefix(out, last))
 			last = out
 		}
+		var t *v1alpha1.Task
+		if err := doJSON(http.MethodGet, "/v1/tasks/"+name, nil, &t); err == nil {
+			switch t.Status.Phase {
+			case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
+				return nil
+			}
+		}
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -156,10 +174,13 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 	if len(args) > 0 && args[0] == "task" {
 		args = args[1:]
 	}
-	if len(args) < 1 {
-		return fmt.Errorf("usage: px delete task NAME")
+	name, rest, err := popName(args)
+	if err != nil {
+		return fmt.Errorf("usage: px delete task NAME [-server URL]")
 	}
-	name := args[0]
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
 	var out map[string]string
 	if err := doJSON(http.MethodDelete, "/v1/tasks/"+name, nil, &out); err != nil {
 		return err

@@ -60,7 +60,10 @@ spec:
     - name: myapp
       goal: "Fix bug #123 and make the tests pass"
   runner:
-    command: ["claude", "-p", "$GOAL", "--dangerously-skip-permissions"]
+    # $GOAL is an env var set from the workspaces' goals. Because commands run
+    # in exec form (each argv element is passed literally), wrap in a shell to
+    # expand variables.
+    command: ["bash", "-lc", "claude -p \"$GOAL\" --dangerously-skip-permissions"]
   resources:
     cores: 4
     memoryMB: 8192
@@ -83,7 +86,7 @@ $ px logs -f fix-bug-123
 
 ```console
 $ go install ./cmd/px ./cmd/px-server
-$ px-server --listen :7420 \
+$ px-server \
     --pve-endpoint https://pve.example.com:8006 \
     --pve-token PVE@px=<token> \
     --pve-node pve1
@@ -94,6 +97,16 @@ $ px apply -f examples/hello-task.yaml
 
 Pre-alpha. The API (`px.io/v1alpha1`) will change. See
 [docs/roadmap.md](docs/roadmap.md) for what exists and what's next.
+
+Known limitations on the current milestone:
+
+- The HTTP API is **unauthenticated**; `px-server` therefore binds to
+  `127.0.0.1` by default. Token auth lands in M2 — don't expose the port.
+- Workspace objects are stored only; git clone into containers ships with M2.
+- SSH host keys are not pinned yet (M3).
+- `px delete` is asynchronous: the record and container are gone by the next
+  reconcile tick (~2s), after the container has been destroyed. A failed
+  destroy is retried until it succeeds, so records never orphan a container.
 
 ## License
 

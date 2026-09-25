@@ -80,10 +80,27 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 		if len(s.Runner.Command) == 0 {
 			return nil, fmt.Errorf("task %q: spec.runner.command is required", m.Metadata.Name)
 		}
+		if s.Runner.User != "" {
+			if err := ValidateUser(s.Runner.User); err != nil {
+				return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
+			}
+		}
+		var goalBytes int
 		for i, ws := range s.Workspaces {
 			if ws.Name == "" {
 				return nil, fmt.Errorf("task %q: workspaces[%d].name is required", m.Metadata.Name, i)
 			}
+			goalBytes += len(ws.Goal)
+		}
+		if goalBytes > MaxGoalBytes {
+			return nil, fmt.Errorf("task %q: combined workspaces goal exceeds %d bytes", m.Metadata.Name, MaxGoalBytes)
+		}
+		var cmdBytes int
+		for _, a := range s.Runner.Command {
+			cmdBytes += len(a) + 1
+		}
+		if cmdBytes > MaxCommandBytes {
+			return nil, fmt.Errorf("task %q: spec.runner.command exceeds %d bytes", m.Metadata.Name, MaxCommandBytes)
 		}
 		m.Task = s
 	case KindWorkspace:

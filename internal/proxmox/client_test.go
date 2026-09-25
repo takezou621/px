@@ -15,11 +15,12 @@ type mockPVE struct {
 	cloneCount int
 	nextID     int
 	taskDone   bool
+	taskExit   string // exitstatus reported once the task is done
 }
 
 func newMockPVE(t *testing.T) (*Client, *mockPVE) {
 	t.Helper()
-	m := &mockPVE{t: t, mux: http.NewServeMux(), nextID: 142, taskDone: true}
+	m := &mockPVE{t: t, mux: http.NewServeMux(), nextID: 142, taskDone: true, taskExit: "OK"}
 
 	m.mux.HandleFunc("/api2/json/cluster/nextid", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(`{"data": "142"}`))
@@ -54,11 +55,11 @@ func newMockPVE(t *testing.T) (*Client, *mockPVE) {
 		w.Write([]byte(`{"data": "UPID:n1:0001:0002:updateresourcemanager:destroy"}`))
 	})
 	m.mux.HandleFunc("/api2/json/nodes/n1/tasks/", func(w http.ResponseWriter, _ *http.Request) {
-		status := "OK"
+		status := "stopped"
 		if !m.taskDone {
 			status = "running"
 		}
-		w.Write([]byte(`{"data": {"status": "` + status + `"}}`))
+		w.Write([]byte(`{"data": {"status": "` + status + `", "exitstatus": "` + m.taskExit + `"}}`))
 	})
 
 	srv := httptest.NewServer(m.mux)
@@ -115,6 +116,16 @@ func TestDestroyMissing(t *testing.T) {
 	})
 	if err := c.DestroyContainer(context.Background(), 999); err != nil {
 		t.Fatalf("destroy missing should be tolerated: %v", err)
+	}
+}
+
+// A finished PVE task whose exitstatus is not "OK" must surface as an error,
+// not silent success — otherwise failed stops/clones look green.
+func TestTaskFailureDetected(t *testing.T) {
+	c, m := newMockPVE(t)
+	m.taskExit = "TASK ERROR: volume detach failed"
+	if err := c.StopContainer(context.Background(), 142); err == nil {
+		t.Fatal("want error for failed pve task")
 	}
 }
 

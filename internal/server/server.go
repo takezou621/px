@@ -2,18 +2,20 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/controller"
 	"github.com/kawai/px/internal/store"
 )
+
+const maxBodyBytes = 4 << 20
 
 type Server struct {
 	store *store.Store
@@ -41,12 +43,16 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "read body: %v", err)
 		return
 	}
-	manifests, err := v1alpha1.ParseManifests(strings.NewReader(string(body)))
+	if len(body) > maxBodyBytes {
+		httpError(w, http.StatusRequestEntityTooLarge, "manifest exceeds %d bytes", maxBodyBytes)
+		return
+	}
+	manifests, err := v1alpha1.ParseManifests(bytes.NewReader(body))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "%v", err)
 		return
@@ -73,14 +79,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 				Metadata:   m.Metadata,
 				Spec:       *m.Task,
 			}
-			if _, err := s.store.GetTask(m.Metadata.Name); err == nil {
-				httpError(w, http.StatusConflict, "task %q already exists; delete it first", m.Metadata.Name)
-				return
-			}
 			t.Status.Phase = v1alpha1.TaskPending
 			t.Status.Reason = "queued"
-			if err := s.store.UpsertTask(t); err != nil {
-				httpError(w, http.StatusInternalServerError, "upsert task %s: %v", m.Metadata.Name, err)
+			if err := s.store.CreateTask(t); err != nil {
+				if errors.Is(err, store.ErrExists) {
+					httpError(w, http.StatusConflict, "task %q already exists; delete it first", m.Metadata.Name)
+					return
+				}
+				httpError(w, http.StatusInternalServerError, "create task %s: %v", m.Metadata.Name, err)
 				return
 			}
 			results = append(results, fmt.Sprintf("task.px.io/%s created", m.Metadata.Name))
@@ -116,20 +122,15 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	t, err := s.store.GetTask(name)
-	if errors.Is(err, store.ErrNotFound) {
-		httpError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	if err != nil {
+	if _, err := s.store.GetTask(name); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			httpError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if t.Status.Container != 0 {
-		s.ctl.RequestDestroy(name, t.Status.Container)
-	} else {
-		s.ctl.RequestDestroy(name, 0)
-	}
+	s.ctl.RequestDestroy(name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleting"})
 }
 

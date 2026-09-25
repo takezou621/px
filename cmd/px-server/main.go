@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,7 +23,7 @@ import (
 
 func main() {
 	var (
-		listen      = flag.String("listen", ":7420", "HTTP listen address")
+		listen      = flag.String("listen", "127.0.0.1:7420", "HTTP listen address (loopback by default; the API is unauthenticated)")
 		dbPath      = flag.String("db", "px.db", "SQLite database path")
 		pveEndpoint = flag.String("pve-endpoint", os.Getenv("PX_PVE_ENDPOINT"), "Proxmox VE API endpoint (https://host:8006)")
 		pveNode     = flag.String("pve-node", os.Getenv("PX_PVE_NODE"), "Proxmox VE node name")
@@ -48,11 +50,12 @@ func main() {
 	pve := proxmox.New(*pveEndpoint, *pveNode, *pveToken)
 	ssh, err := sshexec.Dial(10*time.Second, sshexec.Config{Host: hostOf(*pveEndpoint), User: *sshUser, KeyPath: *sshKey})
 	if err != nil {
-		log.Warn("ssh dial failed; runner exec unavailable", "err", err)
+		// Fail fast: without node SSH access the provisioner cannot boot
+		// runners and would panic on the first Create.
+		log.Error("ssh dial failed; px-server needs SSH access to the PVE node", "host", hostOf(*pveEndpoint), "err", err)
+		os.Exit(1)
 	}
-	if ssh != nil {
-		defer ssh.Close()
-	}
+	defer ssh.Close()
 
 	prov := controller.NewProvisioner(pve, ssh)
 	ctl := controller.New(st, prov, log)
@@ -83,28 +86,15 @@ func main() {
 }
 
 func hostOf(endpoint string) string {
-	// https://pve.example.com:8006 -> pve.example.com
 	s := endpoint
-	for _, p := range []string{"https://", "http://"} {
-		if len(s) > len(p) && s[:len(p)] == p {
-			s = s[len(p):]
-			break
-		}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
 	}
-	if i := indexByte(s, ':'); i >= 0 {
+	if i := strings.IndexByte(s, '/'); i >= 0 {
 		s = s[:i]
 	}
-	if i := indexByte(s, '/'); i >= 0 {
-		s = s[:i]
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		return host
 	}
 	return s
-}
-
-func indexByte(s string, b byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }

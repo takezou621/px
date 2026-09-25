@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -107,5 +108,59 @@ func TestValidateName(t *testing.T) {
 		if err := ValidateName(bad); err == nil {
 			t.Errorf("%q should be invalid", bad)
 		}
+	}
+}
+
+func TestValidateUser(t *testing.T) {
+	for _, ok := range []string{"agent", "a", "_svc", "dev-2", "1000", "0"} {
+		if err := ValidateUser(ok); err != nil {
+			t.Errorf("%q should be valid: %v", ok, err)
+		}
+	}
+	// Every one of these could break out of the shellQuote'd pct exec argument.
+	for _, bad := range []string{"", "root;reboot", "bad name", "-rf", "u\x27", "100000", "Agent", "a b"} {
+		if err := ValidateUser(bad); err == nil {
+			t.Errorf("%q should be invalid", bad)
+		}
+	}
+}
+
+func taskManifest(spec string) string {
+	return "apiVersion: px.io/v1alpha1\nkind: Task\nmetadata:\n  name: x\nspec:\n" + spec
+}
+
+func TestParseAcceptsRunnerUser(t *testing.T) {
+	in := taskManifest("  image: t\n  runner:\n    command: [\"true\"]\n    user: agent\n")
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Task.Runner.User != "agent" {
+		t.Fatalf("user = %q", objs[0].Task.Runner.User)
+	}
+}
+
+func TestParseRejectsBadRunnerUser(t *testing.T) {
+	in := taskManifest("  image: t\n  runner:\n    command: [\"true\"]\n    user: \"bad;user\"\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for invalid runner.user")
+	}
+}
+
+// Caps keep the base64-embedded goal and command within MAX_ARG_STRLEN
+// (128 KiB per argv element on Linux).
+func TestParseRejectsOversizedGoal(t *testing.T) {
+	in := fmt.Sprintf(taskManifest("  image: t\n  workspaces:\n    - name: w\n      goal: %q\n  runner:\n    command: [\"true\"]\n"),
+		strings.Repeat("a", MaxGoalBytes+1))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for goal over MaxGoalBytes")
+	}
+}
+
+func TestParseRejectsOversizedCommand(t *testing.T) {
+	big := strings.Repeat("a", MaxCommandBytes)
+	in := taskManifest("  image: t\n  runner:\n    command: [\"true\", \"" + big + "\"]\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for command over MaxCommandBytes")
 	}
 }

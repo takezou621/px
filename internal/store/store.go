@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound = errors.New("not found")
+	ErrExists   = errors.New("already exists")
+)
 
 type Store struct {
 	db *sql.DB
@@ -59,6 +63,25 @@ func (s *Store) UpsertTask(t *v1alpha1.Task) error {
 	_, err = s.db.Exec(`INSERT INTO tasks (name, spec, status) VALUES (?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec, status=excluded.status, updated_at=datetime('now')`,
 		t.Metadata.Name, string(spec), string(status))
+	return err
+}
+
+// CreateTask inserts a new task atomically; it fails with ErrExists if the
+// name is taken (unlike UpsertTask, which overwrites).
+func (s *Store) CreateTask(t *v1alpha1.Task) error {
+	spec, err := json.Marshal(t.Spec)
+	if err != nil {
+		return err
+	}
+	status, err := json.Marshal(t.Status)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO tasks (name, spec, status) VALUES (?, ?, ?)`,
+		t.Metadata.Name, string(spec), string(status))
+	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		return ErrExists
+	}
 	return err
 }
 

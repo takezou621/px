@@ -101,10 +101,28 @@ type TaskStatus struct {
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
+// userRe accepts a container user name or a numeric uid (passed to pct exec).
+var userRe = regexp.MustCompile(`^([a-z_][a-z0-9_-]{0,31}|[0-9]{1,5})$`)
+
+// Size caps for values embedded base64 into the boot command line; the real
+// constraint is the kernel's MAX_ARG_STRLEN (128 KiB per argument).
+const (
+	MaxGoalBytes    = 32 << 10 // combined across workspaces
+	MaxCommandBytes = 16 << 10 // total of spec.runner.command argv
+)
+
 // ValidateName checks DNS-1123-style naming.
 func ValidateName(name string) error {
 	if !nameRe.MatchString(name) {
 		return fmt.Errorf("invalid name %q: must be lowercase alphanumeric or '-', max 63 chars", name)
+	}
+	return nil
+}
+
+// ValidateUser checks spec.runner.user is a plausible container user.
+func ValidateUser(user string) error {
+	if !userRe.MatchString(user) {
+		return fmt.Errorf("invalid runner.user %q: must be a container user name or numeric uid", user)
 	}
 	return nil
 }

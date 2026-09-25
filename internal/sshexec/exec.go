@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -22,35 +23,53 @@ type Config struct {
 	KeyPath string // optional private key path; falls back to ssh-agent
 }
 
+// Executor holds one SSH connection to the node and re-dials lazily if the
+// connection drops, so a network blip does not kill the control plane until
+// restart.
 type Executor struct {
-	cfg    Config
+	cfg        Config
+	dialTimeout time.Duration
+
+	mu     sync.Mutex
 	client *ssh.Client
 }
 
-func Dial(ctxDialTimeout time.Duration, cfg Config) (*Executor, error) {
+func Dial(dialTimeout time.Duration, cfg Config) (*Executor, error) {
 	if cfg.User == "" {
 		cfg.User = "root"
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
-	auths, err := authMethods(cfg.KeyPath)
+	e := &Executor{cfg: cfg, dialTimeout: dialTimeout}
+	client, err := e.dial()
 	if err != nil {
 		return nil, err
 	}
-	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), &ssh.ClientConfig{
-		User:            cfg.User,
+	e.client = client
+	return e, nil
+}
+
+func (e *Executor) dial() (*ssh.Client, error) {
+	auths, err := authMethods(e.cfg.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", e.cfg.Host, e.cfg.Port), &ssh.ClientConfig{
+		User:            e.cfg.User,
 		Auth:            auths,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO(M3): known_hosts pinning
-		Timeout:         ctxDialTimeout,
+		Timeout:         e.dialTimeout,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("ssh %s@%s:%d: %w", cfg.User, cfg.Host, cfg.Port, err)
+		return nil, fmt.Errorf("ssh %s@%s:%d: %w", e.cfg.User, e.cfg.Host, e.cfg.Port, err)
 	}
-	return &Executor{cfg: cfg, client: client}, nil
+	return client, nil
 }
 
 func (e *Executor) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.client != nil {
 		return e.client.Close()
 	}
@@ -58,8 +77,24 @@ func (e *Executor) Close() error {
 }
 
 // Run executes a command on the node, returning combined output and exit code.
+// A dead connection is re-dialed once before giving up; a remote command that
+// exits non-zero is not a connection failure and is not retried.
 func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
-	sess, err := e.client.NewSession()
+	out, code, err := e.runOnce(cmd, timeout)
+	if err != nil && e.redial() {
+		out, code, err = e.runOnce(cmd, timeout)
+	}
+	return out, code, err
+}
+
+func (e *Executor) runOnce(cmd string, timeout time.Duration) (string, int, error) {
+	e.mu.Lock()
+	client := e.client
+	e.mu.Unlock()
+	if client == nil {
+		return "", -1, fmt.Errorf("ssh not connected")
+	}
+	sess, err := client.NewSession()
 	if err != nil {
 		return "", -1, err
 	}
@@ -79,6 +114,21 @@ func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
 		}
 	}
 	return string(out), code, nil
+}
+
+func (e *Executor) redial() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.client != nil {
+		_ = e.client.Close()
+	}
+	client, err := e.dial()
+	if err != nil {
+		e.client = nil
+		return false
+	}
+	e.client = client
+	return true
 }
 
 func authMethods(keyPath string) ([]ssh.AuthMethod, error) {
