@@ -256,7 +256,10 @@ func ValidateEgress(r *EgressRule) error {
 			nums := make([]int, 0, 2)
 			for _, p := range ports {
 				n, err := strconv.Atoi(p)
-				if err != nil || n < 1 || n > 65535 {
+				// The Itoa round-trip rejects what Atoi silently accepts
+				// ("+443", "0443") — PVE would refuse those as dport and
+				// fail the whole rule install with an opaque error.
+				if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
 					return fmt.Errorf("ports %q: %q is not a port (1-65535)", r.Ports, part)
 				}
 				nums = append(nums, n)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/proxmox"
+	"github.com/kawai/px/internal/sshexec"
 )
 
 func testProvTask() *v1alpha1.Task {
@@ -178,6 +179,104 @@ func TestApplyEgressPolicyRequiresClusterFirewall(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Errorf("nothing must be written to the container once the check fails, got %d writes", calls)
+	}
+}
+
+// Create must have the deny-by-default policy fully installed before the
+// container ever boots — a sandbox that starts wide open even briefly is
+// not a sandbox. The final SSH boot step needs a real node, so the flow
+// ends in the destroy-on-boot-failure path (a zero-value Executor never
+// connects); the recorded PVE call order is the point.
+func TestCreateOrdersEgressBeforeStart(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(e string) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/nodes/n1/lxc", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": [{"vmid": 9000, "name": "tmpl", "template": 1}]}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/9000/clone", func(w http.ResponseWriter, r *http.Request) {
+		record("clone")
+		w.Write([]byte(`{"data": "UPID:n1:1:1:clone"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/config", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Write([]byte(`{"data": {"net0": "name=eth0,bridge=vmbr0,hwaddr=AA,ip=dhcp,type=veth"}}`))
+		case http.MethodPut:
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(r.Form.Get("net0"), "firewall=1") {
+				record("net0-firewall")
+			} else {
+				record("config-put")
+			}
+		}
+	})
+	mux.HandleFunc("/api2/json/cluster/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		record("cluster-firewall-check")
+		w.Write([]byte(`{"data": {"enable": 1}}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		record("fw-options")
+		w.Write([]byte(`{"data": null}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/firewall/rules", func(w http.ResponseWriter, r *http.Request) {
+		record("rule")
+		w.Write([]byte(`{"data": null}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/status/start", func(w http.ResponseWriter, r *http.Request) {
+		record("start")
+		w.Write([]byte(`{"data": "UPID:n1:2:2:start"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142/status/stop", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": "UPID:n1:3:3:stop"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/142", func(w http.ResponseWriter, r *http.Request) {
+		record("destroy")
+		w.Write([]byte(`{"data": "UPID:n1:4:4:destroy"}`))
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": {"status": "stopped", "exitstatus": "OK"}}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false), ssh: &sshexec.Executor{}}
+
+	err := p.Create(context.Background(), testProvTask(), 142, nil, nil,
+		&ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443"}}})
+	if err == nil || !strings.Contains(err.Error(), "boot runner") {
+		t.Fatalf("Create must fail at the (unreachable) SSH boot step, got: %v", err)
+	}
+	first := func(e string) int {
+		for i, x := range events {
+			if x == e {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, want := range []string{"clone", "net0-firewall", "fw-options", "rule", "start", "destroy"} {
+		if first(want) < 0 {
+			t.Fatalf("event %q never happened; events: %v", want, events)
+		}
+	}
+	for _, pair := range [][2]string{
+		{"clone", "net0-firewall"},
+		{"cluster-firewall-check", "net0-firewall"},
+		{"net0-firewall", "fw-options"},
+		{"fw-options", "rule"},
+		{"rule", "start"},
+		{"start", "destroy"},
+	} {
+		if first(pair[0]) >= first(pair[1]) {
+			t.Errorf("%s must precede %s; events: %v", pair[0], pair[1], events)
+		}
 	}
 }
 

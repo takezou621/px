@@ -75,6 +75,14 @@ wait_gone() { # name
   return 1
 }
 apply() { "$PX" apply -f - >/dev/null; }
+# GET against the raw API must authenticate the same way the CLI does.
+api_get_code() { # path
+  local -a curl_args=(curl -s -o /dev/null -w '%{http_code}')
+  if [[ -n ${PX_TOKEN:-} ]]; then
+    curl_args+=( -H "Authorization: Bearer $PX_TOKEN" )
+  fi
+  "${curl_args[@]}" "$PX_SERVER$1"
+}
 
 gateway_yaml() { # $1 name; $2 = "empty" for the DNS-only variant
   if [[ $2 == empty ]]; then
@@ -131,13 +139,15 @@ EOF
 }
 
 # Verifies the task's single EGRESS_CHECK line against the wanted verdicts.
+# The grep must not abort the script when the line is missing — that case is
+# a counted FAIL, and later sections must still run.
 check_egress() { # task want_pve want_ext want_dns
   local task=$1 logs line
   if ! logs=$("$PX" logs "$task" 2>&1); then
     bad "logs for $task failed: $logs"
     return
   fi
-  line=$(grep -o 'EGRESS_CHECK.*' <<<"$logs" | tail -1)
+  line=$(grep -o 'EGRESS_CHECK.*' <<<"$logs" | tail -1) || true
   if [[ $line == "EGRESS_CHECK pve=$2 ext=$3 dns=$4" ]]; then
     ok "$task egress verdict: $line"
   else
@@ -170,7 +180,7 @@ if apply < <(gateway_yaml "$GW_LOCKED"); then
 else
   bad "gateway apply failed"
 fi
-apply < <(gateway_yaml "$GW_DNS" empty)
+apply < <(gateway_yaml "$GW_DNS" empty) || true
 if list=$("$PX" get gateways 2>&1); then
   if grep -q "^$GW_LOCKED " <<<"$list" && grep -q "^$GW_DNS " <<<"$list"; then
     ok "both gateways listed"
@@ -197,7 +207,7 @@ else
 fi
 
 say "2. locked task: ALLOW_DEST:8006 allowed, internet denied, DNS up"
-apply < <(task_yaml "$TASK_LOCKED" "$GW_LOCKED")
+apply < <(task_yaml "$TASK_LOCKED" "$GW_LOCKED") || true
 if wait_phase "$TASK_LOCKED" Succeeded; then
   check_egress "$TASK_LOCKED" ok blocked ok
 fi
@@ -241,19 +251,19 @@ say "4. control task without a gateway: everything reachable"
 # Distinguishes "the firewall blocks" from "the sandbox has no network":
 # if this one cannot reach the internet either, the deny verdicts above
 # prove nothing about the allowlist.
-apply < <(task_yaml "$TASK_OPEN" "")
+apply < <(task_yaml "$TASK_OPEN" "") || true
 if wait_phase "$TASK_OPEN" Succeeded; then
   check_egress "$TASK_OPEN" ok ok ok
 fi
 
 say "5. empty egress: DNS only"
-apply < <(task_yaml "$TASK_DNS" "$GW_DNS")
+apply < <(task_yaml "$TASK_DNS" "$GW_DNS") || true
 if wait_phase "$TASK_DNS" Succeeded; then
   check_egress "$TASK_DNS" blocked blocked ok
 fi
 
 say "6. a task referencing a missing gateway fails before provisioning"
-apply < <(task_yaml "$TASK_MISSING" "$GW_LOCKED-nonexistent")
+apply < <(task_yaml "$TASK_MISSING" "$GW_LOCKED-nonexistent") || true
 if wait_phase "$TASK_MISSING" ProvisionFailed; then
   if reason=$("$PX" describe task "$TASK_MISSING" | grep '"reason"'); then
     ok "reason: $(tr -d ' ' <<<"$reason")"
@@ -276,7 +286,7 @@ fi
 
 say "7. cleanup: tasks and gateways go away with nothing left on the node"
 for t in "$TASK_LOCKED" "$TASK_OPEN" "$TASK_DNS" "$TASK_MISSING"; do
-  "$PX" delete task "$t" >/dev/null
+  "$PX" delete task "$t" >/dev/null || true
   wait_gone "$t"
 done
 if [[ -n $PVE_SSH ]]; then
@@ -293,8 +303,8 @@ if [[ -n $PVE_SSH ]]; then
   fi
 fi
 for g in "$GW_LOCKED" "$GW_DNS"; do
-  "$PX" delete gateway "$g" >/dev/null
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$PX_SERVER/v1/gateways/$g")
+  "$PX" delete gateway "$g" >/dev/null || true
+  code=$(api_get_code "/v1/gateways/$g")
   if [[ $code == 404 ]]; then
     ok "gateway $g deleted (GET returns 404)"
   else
