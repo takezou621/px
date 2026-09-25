@@ -1,0 +1,83 @@
+cmd/px-server/main.go
+  s_c2f954a86dc8c5::t_56fd0884c8c015 35
+  s_c2f954a86dc8c5::t_f36f3ad3812368 54,62-66
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_b7fc5ad923d29d 322-324
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_8804dd473b8487 137-157
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_1fbb8241df8aa5 316-321,323-330,345-346
+  s_c2f954a86dc8c5::t_79fa55ae89909a 6,16-21
+  s_c2f954a86dc8c5::t_42c3d5e5224489 51-56
+  s_c2f954a86dc8c5::t_e3dea0afcadf51 272,280-281,285-290
+  s_c2f954a86dc8c5::t_a057661a4911dc 57-60
+  s_c2f954a86dc8c5::t_5413745d1baf26 322,331-344
+  s_c2f954a86dc8c5::t_2653ef6b168ce4 261-267,273-279,282-284,291-301
+  s_c2f954a86dc8c5::t_580cb6b31a8868 22
+internal/sshexec/exec_test.go
+  s_c2f954a86dc8c5::t_6fc3eb78ebfb12 1-4,6,8,10,12-89
+  s_c2f954a86dc8c5::t_2a63656cd09321 90-98
+  s_c2f954a86dc8c5::t_e5671364abbea0 5,7,9,11
+  s_c2f954a86dc8c5::t_c158084508af41 99-155
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_27c7f4f7b16688 144-180
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_f6e21cc6e1345f 90-99
+  s_c2f954a86dc8c5::t_c685de74472e63 29
+  s_c2f954a86dc8c5::t_62a2fb82abf261 53-55
+  s_c2f954a86dc8c5::t_2e770040458c77 100-108
+  s_c2f954a86dc8c5::t_d08c3a10199896 660-716
+  s_c2f954a86dc8c5::t_f8913c5deee536 8
+  s_c2f954a86dc8c5::t_055f79e865eb32 353-436
+  s_c2f954a86dc8c5::t_8aa0e21811d918 18,21
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_7679c8658a7338 205-216
+  s_c2f954a86dc8c5::t_fac0f954c31934 217-228
+internal/sshexec/exec.go
+  s_c2f954a86dc8c5::t_561a4403fd30b3 99-103,107-117
+  s_c2f954a86dc8c5::t_8eb1183cb0bef5 138
+  s_c2f954a86dc8c5::t_a247a0d8aeb9f3 142
+  s_c2f954a86dc8c5::t_4ea0e624f98d71 33,35,49-59,73,75-76,78,118-132,139-141,143-167
+  s_c2f954a86dc8c5::t_d16021b3266fc1 133-137
+  s_c2f954a86dc8c5::t_29c3fb29430390 80-82,84
+  s_c2f954a86dc8c5::t_f03abb55942d23 74,77,83,92-98,104-106
+  s_c2f954a86dc8c5::t_b787771376d6aa 7,11,22-26
+  s_c2f954a86dc8c5::t_60fb9a33982d31 168
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_d1842f8477b44a 86-89
+  s_c2f954a86dc8c5::t_268fdb7935c1c2 90-95
+  s_c2f954a86dc8c5::t_749a316b99c221 74
+  s_c2f954a86dc8c5::t_6ec9122f09c55a 75-85,97-101,110-116
+  s_c2f954a86dc8c5::t_141364fd23a4a8 96
+  s_c2f954a86dc8c5::t_9780b9161cf887 117-126
+  s_c2f954a86dc8c5::t_7ef11b449eaf45 127-143
+  s_c2f954a86dc8c5::t_ca2ae1a4a14a1a 102-109
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_cc44ed2e628495 7
+  s_c2f954a86dc8c5::t_bf3b5b942c7a4d 192-201,206-208
+  s_c2f954a86dc8c5::t_11e9b0c01d4982 159-171
+  s_c2f954a86dc8c5::t_aa19ca2d122ef4 342-350
+  s_c2f954a86dc8c5::t_2a7629316e4311 134-150
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_bd6e88e5e7a6b3 23-28
+  s_c2f954a86dc8c5::t_4fa37ebf6f835b 29
+  s_c2f954a86dc8c5::t_b7fc5ad923d29d 19-22
+README.md
+  s_c2f954a86dc8c5::t_5763412c293b78 111-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0540d3753a9dc354661594c595f9aa12fee31786",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
