@@ -16,7 +16,8 @@ import (
 
 type nopProv struct{}
 
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task) (int, error) { return 0, nil }
+func (nopProv) Allocate(_ context.Context) (int, error)                 { return 0, nil }
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int) error { return nil }
 func (nopProv) Exit(_ context.Context, _ int) (*int, error)             { return nil, nil }
 func (nopProv) Running(_ context.Context, _ int) (bool, error)          { return true, nil }
 func (nopProv) Logs(_ context.Context, _ int) (string, error)           { return "", nil }
@@ -131,8 +132,8 @@ func TestDelete(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
-	// Controller reconcile removes the record.
-	ctl.RequestDestroy("t1")
+	// Controller reconcile removes the record (the mark is already persisted
+	// by the API call above).
 	ctl.ReconcileOnce(context.Background())
 	resp2, _ := http.Get(srv.URL + "/v1/tasks/t1")
 	resp2.Body.Close()

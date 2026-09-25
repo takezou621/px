@@ -13,25 +13,32 @@ import (
 )
 
 type fakeProv struct {
-	mu         sync.Mutex
-	createErr  error
-	exitErr    error   // returned by Exit as a probe failure
-	destroyErr error   // returned by Destroy until cleared
-	exits      map[int]int  // vmid -> exit code; missing = still running
-	dead       map[int]bool // vmids whose container is not running
-	created    []int
-	destroyed  []int
+	mu          sync.Mutex
+	allocateErr error
+	createErr   error
+	exitErr     error        // returned by Exit as a probe failure
+	destroyErr  error        // returned by Destroy until cleared
+	exits       map[int]int  // vmid -> exit code; missing = still running
+	dead        map[int]bool // vmids whose container is not running
+	created     []int
+	destroyed   []int
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task) (int, error) {
-	if f.createErr != nil {
-		return 0, f.createErr
+func (f *fakeProv) Allocate(_ context.Context) (int, error) {
+	if f.allocateErr != nil {
+		return 0, f.allocateErr
 	}
-	vmid := 100 + len(f.created)
+	return 100 + len(f.created), nil
+}
+
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
 	f.mu.Lock()
 	f.created = append(f.created, vmid)
 	f.mu.Unlock()
-	return vmid, nil
+	return nil
 }
 
 func (f *fakeProv) Exit(_ context.Context, vmid int) (*int, error) {
@@ -82,10 +89,40 @@ func (m *memStore) ListTasks() ([]*v1alpha1.Task, error) {
 	return out, nil
 }
 
+func (m *memStore) GetTask(name string) (*v1alpha1.Task, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[name]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return copyTask(t), nil
+}
+
+// UpsertTask mirrors the real store's semantics: a write based on a snapshot
+// that predates a deletion request must not erase the request.
 func (m *memStore) UpsertTask(t *v1alpha1.Task) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.tasks[t.Metadata.Name] = copyTask(t)
+	cp := copyTask(t)
+	if cur, ok := m.tasks[t.Metadata.Name]; ok &&
+		cur.Status.DeletionTimestamp != nil && t.Status.DeletionTimestamp == nil {
+		mark := *cur.Status.DeletionTimestamp
+		cp.Status.DeletionTimestamp = &mark
+	}
+	m.tasks[t.Metadata.Name] = cp
+	return nil
+}
+
+func (m *memStore) MarkTaskDeleted(name string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.tasks[name]
+	if !ok {
+		return errors.New("not found")
+	}
+	mark := at
+	cur.Status.DeletionTimestamp = &mark
 	return nil
 }
 
@@ -103,6 +140,10 @@ func copyTask(t *v1alpha1.Task) *v1alpha1.Task {
 	if t.Status.EndedAt != nil {
 		v := *t.Status.EndedAt
 		cp.Status.EndedAt = &v
+	}
+	if t.Status.DeletionTimestamp != nil {
+		v := *t.Status.DeletionTimestamp
+		cp.Status.DeletionTimestamp = &v
 	}
 	return &cp
 }
@@ -238,7 +279,9 @@ func TestDeleteRunningTask(t *testing.T) {
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
 
 	runOnce(ctl)
-	ctl.RequestDestroy("t1")
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
 	runOnce(ctl)
 
 	if _, ok := st.tasks["t1"]; ok {
@@ -246,6 +289,39 @@ func TestDeleteRunningTask(t *testing.T) {
 	}
 	if len(prov.destroyed) != 1 || prov.destroyed[0] != 100 {
 		t.Fatalf("want destroy [100], got %v", prov.destroyed)
+	}
+}
+
+// Deletion requests are persisted on the record, so a brand-new controller
+// over the same store (i.e. after a px-server restart) resumes the delete.
+func TestDeleteSurvivesRestart(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running, vmid 100
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(restarted)
+
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("task record should be deleted after restart")
+	}
+	if len(prov.destroyed) != 1 || prov.destroyed[0] != 100 {
+		t.Fatalf("want destroy [100], got %v", prov.destroyed)
+	}
+}
+
+func TestRequestDestroyUnknownTask(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	if err := ctl.RequestDestroy("nope"); err == nil {
+		t.Fatal("want error for unknown task")
 	}
 }
 
@@ -271,6 +347,112 @@ func TestInterruptedProvisioning(t *testing.T) {
 	}
 }
 
+// Allocate fails before any container exists: the task goes to
+// ProvisionFailed with no VMID recorded.
+func TestAllocateError(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, allocateErr: errors.New("no free id")}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container 0, got %d", task.Status.Container)
+	}
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run after a failed Allocate, created %v", prov.created)
+	}
+}
+
+// A status write from a snapshot that predates a deletion request must not
+// erase the request (the store-level race behind TestDeleteSurvivesRestart).
+func TestUpsertKeepsDeletionMark(t *testing.T) {
+	st := newMemStore()
+	_ = st.UpsertTask(testTask(0))
+	if err := st.MarkTaskDeleted("t1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.UpsertTask(testTask(0)) // stale snapshot, no mark
+	cur := st.tasks["t1"]
+	if cur.Status.DeletionTimestamp == nil {
+		t.Fatal("deletion mark was erased by a stale snapshot write")
+	}
+}
+
+// Delete racing an interrupted provision: the record disappears even though
+// no container was ever recorded, and nothing is destroyed or created.
+func TestDeleteWithoutContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("task record should be deleted")
+	}
+	if len(prov.destroyed) != 0 || len(prov.created) != 0 {
+		t.Fatalf("want no destroy/create, destroyed %v created %v", prov.destroyed, prov.created)
+	}
+}
+
+func TestDoubleDelete(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatalf("second delete must be idempotent, got %v", err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("task record should be deleted")
+	}
+	if len(prov.destroyed) != 1 {
+		t.Fatalf("want exactly one destroy, got %v", prov.destroyed)
+	}
+}
+
+// Deleting a finished task bypasses the TTL and destroys immediately.
+func TestDeleteFinishedTaskIgnoresTTL(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(600))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded, TTL clock starts
+
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("task record should be deleted despite TTL")
+	}
+	if len(prov.destroyed) != 1 || prov.destroyed[0] != 100 {
+		t.Fatalf("want destroy [100], got %v", prov.destroyed)
+	}
+}
+
 func TestDeleteRetriesOnDestroyFailure(t *testing.T) {
 	st := newMemStore()
 	prov := &fakeProv{exits: map[int]int{}, destroyErr: errors.New("pve down")}
@@ -278,7 +460,9 @@ func TestDeleteRetriesOnDestroyFailure(t *testing.T) {
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
 
 	runOnce(ctl) // -> Running, vmid 100
-	ctl.RequestDestroy("t1")
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
 	runOnce(ctl)
 	if _, ok := st.tasks["t1"]; !ok {
 		t.Fatal("record should survive a failed destroy")

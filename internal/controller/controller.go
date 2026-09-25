@@ -4,8 +4,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
@@ -13,12 +13,17 @@ import (
 
 // TaskReader gives the controller read access to persisted tasks.
 type TaskReader interface {
+	GetTask(name string) (*v1alpha1.Task, error)
 	ListTasks() ([]*v1alpha1.Task, error)
 }
 
-// TaskWriter lets the controller persist status changes.
+// TaskWriter lets the controller persist status changes. UpsertTask
+// implementations must preserve an already-persisted DeletionTimestamp: the
+// controller works on stale snapshots, and a status write must never erase a
+// deletion request that arrived while the snapshot was being processed.
 type TaskWriter interface {
 	UpsertTask(*v1alpha1.Task) error
+	MarkTaskDeleted(name string, at time.Time) error
 	DeleteTask(name string) error
 }
 
@@ -27,13 +32,10 @@ type Controller struct {
 		TaskReader
 		TaskWriter
 	}
-	prov   Provisioner
-	log    *slog.Logger
-	Tick   time.Duration // reconcile interval
-	now    func() time.Time
-
-	mu      sync.Mutex
-	destroy map[string]bool // task names with a pending destroy
+	prov Provisioner
+	log  *slog.Logger
+	Tick time.Duration // reconcile interval
+	now  func() time.Time
 }
 
 func New(store interface {
@@ -41,12 +43,11 @@ func New(store interface {
 	TaskWriter
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
-		store:   store,
-		prov:    prov,
-		log:     log,
-		Tick:    2 * time.Second,
-		now:     time.Now,
-		destroy: map[string]bool{},
+		store: store,
+		prov:  prov,
+		log:   log,
+		Tick:  2 * time.Second,
+		now:   time.Now,
 	}
 }
 
@@ -67,14 +68,13 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
-// RequestDestroy asks the controller to destroy a task's container and drop
-// its record on the next reconcile (used by the API server on DELETE). The
-// vmid is resolved from the task record at reconcile time, so a delete racing
-// with provision still destroys the freshly created container.
-func (c *Controller) RequestDestroy(name string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.destroy[name] = true
+// RequestDestroy persists a deletion request on the task record; the next
+// reconcile destroys the container and drops the record. It updates only the
+// deletion timestamp in a single statement — never a full status overwrite —
+// so it cannot clobber a VMID that reconcile persists concurrently. The mark
+// lives in the store, so an in-flight delete survives a px-server restart.
+func (c *Controller) RequestDestroy(name string) error {
+	return c.store.MarkTaskDeleted(name, c.now())
 }
 
 func (c *Controller) reconcileAll(ctx context.Context) {
@@ -89,28 +89,8 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 }
 
 func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
-	// Explicit delete: destroy the container and drop the record.
-	c.mu.Lock()
-	_, pending := c.destroy[t.Metadata.Name]
-	if pending {
-		delete(c.destroy, t.Metadata.Name)
-	}
-	c.mu.Unlock()
-	if pending {
-		if vmid := t.Status.Container; vmid != 0 {
-			if err := c.prov.Destroy(ctx, vmid); err != nil {
-				// Keep the record and retry next tick; deleting it now
-				// would orphan the container with nothing left to retry.
-				c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
-				c.mu.Lock()
-				c.destroy[t.Metadata.Name] = true
-				c.mu.Unlock()
-				return
-			}
-		}
-		if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
-			c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
-		}
+	if t.Status.DeletionTimestamp != nil {
+		c.destroyTask(ctx, t)
 		return
 	}
 
@@ -119,11 +99,11 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 		c.provision(ctx, t)
 	case v1alpha1.TaskProvisioning:
 		if t.Status.Container == 0 {
-			// Reconcile is serial, so an in-flight Create never spans ticks:
-			// reaching here means the process restarted mid-provision and no
-			// VMID was recorded. The clone may linger on the node.
+			// The controller persists the VMID before any node-side work, so
+			// Container==0 in Provisioning means the restart happened before
+			// allocation completed and no container was ever created.
 			t.Status.Phase = v1alpha1.TaskProvisionFail
-			t.Status.Reason = "provisioning interrupted by restart; container may be orphaned on the node"
+			t.Status.Reason = "provisioning interrupted by restart"
 			t.Status.EndedAt = nowPtr(c.now)
 			c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name)
 			c.persist(t)
@@ -137,6 +117,27 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	}
 }
 
+// destroyTask destroys the container and drops the record. Until Destroy
+// succeeds the record keeps its DeletionTimestamp, so a failure or a crash
+// mid-destroy retries on the next tick.
+func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
+	if vmid := t.Status.Container; vmid != 0 {
+		if err := c.prov.Destroy(ctx, vmid); err != nil {
+			// Keep the record and retry next tick; deleting it now
+			// would orphan the container with nothing left to retry.
+			c.log.Error("destroy container", "task", t.Metadata.Name, "vmid", vmid, "err", err)
+			return
+		}
+		t.Status.Container = 0
+		c.persist(t)
+	} else if t.Status.Phase == v1alpha1.TaskProvisioning {
+		c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
+	}
+	if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
+		c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
+	}
+}
+
 func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	if ctx.Err() != nil {
 		return
@@ -145,21 +146,34 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Reason = "cloning template and starting container"
 	c.persist(t)
 
-	vmid, err := c.prov.Create(ctx, t)
+	vmid, err := c.prov.Allocate(ctx)
 	if err != nil {
-		t.Status.Phase = v1alpha1.TaskProvisionFail
-		t.Status.Reason = err.Error()
-		t.Status.EndedAt = nowPtr(c.now)
-		c.log.Error("provision task", "task", t.Metadata.Name, "err", err)
-		c.persist(t)
+		c.failProvision(t, fmt.Errorf("allocate: %w", err))
 		return
 	}
+	// Persist the VMID before any node-side work: if the process dies
+	// mid-Create the record still names the container, so delete and TTL can
+	// destroy it after a restart.
 	t.Status.Container = vmid
+	c.persist(t)
+
+	if err := c.prov.Create(ctx, t, vmid); err != nil {
+		c.failProvision(t, err)
+		return
+	}
 	t.Status.Phase = v1alpha1.TaskRunning
 	now := c.now()
 	t.Status.StartedAt = &now
 	t.Status.Reason = ""
 	c.log.Info("task running", "task", t.Metadata.Name, "vmid", vmid)
+	c.persist(t)
+}
+
+func (c *Controller) failProvision(t *v1alpha1.Task, err error) {
+	t.Status.Phase = v1alpha1.TaskProvisionFail
+	t.Status.Reason = err.Error()
+	t.Status.EndedAt = nowPtr(c.now)
+	c.log.Error("provision task", "task", t.Metadata.Name, "err", err)
 	c.persist(t)
 }
 

@@ -121,16 +121,15 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if _, err := s.store.GetTask(name); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			httpError(w, http.StatusNotFound, "task not found")
-			return
-		}
+	err := s.ctl.RequestDestroy(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if err != nil {
 		httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	s.ctl.RequestDestroy(name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleting"})
 }
 

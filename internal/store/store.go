@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -50,7 +51,10 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertTask stores the task spec and merges the given status.
+// UpsertTask stores the task spec and merges the given status. An already
+// persisted deletionTimestamp survives: the controller works on snapshots,
+// and a status write must never erase a deletion request that arrived while
+// the snapshot was being processed.
 func (s *Store) UpsertTask(t *v1alpha1.Task) error {
 	spec, err := json.Marshal(t.Spec)
 	if err != nil {
@@ -61,9 +65,33 @@ func (s *Store) UpsertTask(t *v1alpha1.Task) error {
 		return err
 	}
 	_, err = s.db.Exec(`INSERT INTO tasks (name, spec, status) VALUES (?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec, status=excluded.status, updated_at=datetime('now')`,
+		ON CONFLICT(name) DO UPDATE SET
+			spec=excluded.spec,
+			status=CASE
+				WHEN json_extract(excluded.status,'$.deletionTimestamp') IS NULL
+					AND json_extract(tasks.status,'$.deletionTimestamp') IS NOT NULL
+				THEN json_set(excluded.status,'$.deletionTimestamp',json_extract(tasks.status,'$.deletionTimestamp'))
+				ELSE excluded.status
+			END,
+			updated_at=datetime('now')`,
 		t.Metadata.Name, string(spec), string(status))
 	return err
+}
+
+// MarkTaskDeleted sets the deletion timestamp in a single statement, without
+// touching any other status field: a delete racing with reconcile cannot
+// clobber a concurrently persisted VMID.
+func (s *Store) MarkTaskDeleted(name string, at time.Time) error {
+	res, err := s.db.Exec(
+		`UPDATE tasks SET status = json_set(status, '$.deletionTimestamp', ?), updated_at=datetime('now') WHERE name = ?`,
+		at.UTC().Format(time.RFC3339Nano), name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // CreateTask inserts a new task atomically; it fails with ErrExists if the

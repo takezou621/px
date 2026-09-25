@@ -14,8 +14,13 @@ import (
 
 // Provisioner drives one Task's sandbox through its lifecycle.
 type Provisioner interface {
-	// Create clones the template, starts the container and boots the runner.
-	Create(ctx context.Context, t *v1alpha1.Task) (vmid int, err error)
+	// Allocate reserves a VMID before any node-side work, so the task record
+	// names the container from the first moment: a crash mid-provision still
+	// leaves a record that delete/TTL can destroy by VMID.
+	Allocate(ctx context.Context) (int, error)
+	// Create clones the template into vmid, starts the container and boots
+	// the runner.
+	Create(ctx context.Context, t *v1alpha1.Task, vmid int) error
 	// Exit polls the runner's exit code; nil means still running.
 	// A non-nil error means the probe itself failed (e.g. container gone).
 	Exit(ctx context.Context, vmid int) (*int, error)
@@ -87,33 +92,33 @@ func quoteCommand(argv []string) string {
 	return b.String()
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task) (int, error) {
+func (p *provisioner) Allocate(ctx context.Context) (int, error) {
+	return p.pve.NextID(ctx)
+}
+
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int) error {
 	templateVMID, err := p.pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
-		return 0, fmt.Errorf("find template: %w", err)
-	}
-	vmid, err := p.pve.NextID(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("next id: %w", err)
+		return fmt.Errorf("find template: %w", err)
 	}
 	if err := p.pve.CloneContainer(ctx, templateVMID, vmid, "px-"+t.Metadata.Name); err != nil {
-		return 0, fmt.Errorf("clone: %w", err)
+		return fmt.Errorf("clone: %w", err)
 	}
 	// Apply resource limits post-clone (clone inherits template resources).
 	if err := p.applyResources(ctx, vmid, t); err != nil {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
-		return 0, err
+		return err
 	}
 	if err := p.pve.StartContainer(ctx, vmid); err != nil {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
-		return 0, fmt.Errorf("start: %w", err)
+		return fmt.Errorf("start: %w", err)
 	}
 	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t)), 60*time.Second)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
-		return 0, fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
+		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
 	}
-	return vmid, nil
+	return nil
 }
 
 func (p *provisioner) applyResources(ctx context.Context, vmid int, t *v1alpha1.Task) error {

@@ -97,6 +97,10 @@ type TaskStatus struct {
 	StartedAt *time.Time `json:"startedAt,omitempty" yaml:"startedAt,omitempty"`
 	EndedAt   *time.Time `json:"endedAt,omitempty" yaml:"endedAt,omitempty"`
 	ExitCode  int        `json:"exitCode,omitempty" yaml:"exitCode,omitempty"`
+	// DeletionTimestamp is set once a delete was requested; the controller
+	// then destroys the container and removes the record. Persisted, so a
+	// px-server restart resumes an in-flight delete.
+	DeletionTimestamp *time.Time `json:"deletionTimestamp,omitempty" yaml:"deletionTimestamp,omitempty"`
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
