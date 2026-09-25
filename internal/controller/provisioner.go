@@ -14,13 +14,21 @@ import (
 
 // Provisioner drives one Task's sandbox through its lifecycle.
 type Provisioner interface {
-	// Allocate reserves a VMID before any node-side work, so the task record
-	// names the container from the first moment: a crash mid-provision still
-	// leaves a record that delete/TTL can destroy by VMID.
+	// Allocate returns a free VMID before any node-side work, so the task
+	// record names the container from the first moment: a crash mid-provision
+	// still leaves a record that delete/TTL can destroy by VMID. PVE's nextid
+	// is a suggestion, not a reservation — see the controller's handling of a
+	// failed Create.
 	Allocate(ctx context.Context) (int, error)
 	// Create clones the template into vmid, starts the container and boots
-	// the runner.
+	// the runner. On failure it destroys any partial work, so the vmid no
+	// longer names a container of ours.
 	Create(ctx context.Context, t *v1alpha1.Task, vmid int) error
+	// Booted reports whether the container reached the runner-launch step of
+	// its boot script (/run/px/booted). A provision interrupted by a restart
+	// leaves either a live runner (marker present — adopt the task) or a
+	// partial clone without a runner (marker absent — clean up).
+	Booted(ctx context.Context, vmid int) (bool, error)
 	// Exit polls the runner's exit code; nil means still running.
 	// A non-nil error means the probe itself failed (e.g. container gone).
 	Exit(ctx context.Context, vmid int) (*int, error)
@@ -58,6 +66,9 @@ func runnerScript(t *v1alpha1.Task) string {
 mkdir -p /run/px
 printf '%%s' '%s' | base64 -d > /run/px/goal
 printf '%%s' '%s' | base64 -d > /run/px/cmd.sh
+# marker for Booted(): a restart mid-boot can then tell a live runner from a
+# partial clone whose boot died with the SSH session.
+touch /run/px/booted
 nohup sh -c 'sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
 echo PX_BOOT_OK
 `,
@@ -168,6 +179,18 @@ func (p *provisioner) Exit(ctx context.Context, vmid int) (*int, error) {
 // Running reports whether the task container is still up.
 func (p *provisioner) Running(ctx context.Context, vmid int) (bool, error) {
 	return p.pve.ContainerRunning(ctx, vmid)
+}
+
+// Booted checks for the marker the boot script touches right before it
+// launches the runner (see runnerScript).
+func (p *provisioner) Booted(ctx context.Context, vmid int) (bool, error) {
+	_, code, err := p.ssh.Run(
+		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("test -f /run/px/booted")),
+		30*time.Second)
+	if err != nil {
+		return false, err
+	}
+	return code == 0, nil
 }
 
 func (p *provisioner) Logs(ctx context.Context, vmid int) (string, error) {

@@ -20,6 +20,7 @@ type fakeProv struct {
 	destroyErr  error        // returned by Destroy until cleared
 	exits       map[int]int  // vmid -> exit code; missing = still running
 	dead        map[int]bool // vmids whose container is not running
+	booted      map[int]bool // vmids whose container reached the runner launch
 	created     []int
 	destroyed   []int
 }
@@ -39,6 +40,12 @@ func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int) error {
 	f.created = append(f.created, vmid)
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeProv) Booted(_ context.Context, vmid int) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.booted[vmid], nil
 }
 
 func (f *fakeProv) Exit(_ context.Context, vmid int) (*int, error) {
@@ -73,8 +80,9 @@ func (f *fakeProv) Destroy(_ context.Context, vmid int) error {
 }
 
 type memStore struct {
-	mu    sync.Mutex
-	tasks map[string]*v1alpha1.Task
+	mu        sync.Mutex
+	upsertErr error
+	tasks     map[string]*v1alpha1.Task
 }
 
 func newMemStore() *memStore { return &memStore{tasks: map[string]*v1alpha1.Task{}} }
@@ -104,6 +112,9 @@ func (m *memStore) GetTask(name string) (*v1alpha1.Task, error) {
 func (m *memStore) UpsertTask(t *v1alpha1.Task) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.upsertErr != nil {
+		return m.upsertErr
+	}
 	cp := copyTask(t)
 	if cur, ok := m.tasks[t.Metadata.Name]; ok &&
 		cur.Status.DeletionTimestamp != nil && t.Status.DeletionTimestamp == nil {
@@ -239,6 +250,9 @@ func TestProvisionError(t *testing.T) {
 	if task.Status.Phase != v1alpha1.TaskProvisionFail {
 		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
 	}
+	if task.Status.Container != 0 {
+		t.Fatalf("a failed Create must clear the VMID, got %d", task.Status.Container)
+	}
 }
 
 func TestTTLCleanup(t *testing.T) {
@@ -365,6 +379,76 @@ func TestAllocateError(t *testing.T) {
 	}
 	if len(prov.created) != 0 {
 		t.Fatalf("Create must not run after a failed Allocate, created %v", prov.created)
+	}
+}
+
+// If the VMID cannot be persisted, node-side work must not start: the record
+// is the crash-safety anchor for the container.
+func TestPersistVmidFailureAbortsCreate(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	st.mu.Lock()
+	st.upsertErr = errors.New("db broken")
+	st.mu.Unlock()
+
+	runOnce(ctl)
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run when the VMID cannot be persisted, created %v", prov.created)
+	}
+}
+
+// Restart mid-Create with a container that never reached the runner-launch
+// step: the partial clone is destroyed and the task fails — it must not spin
+// in a fake Running.
+func TestInterruptedProvisioningUnbooted(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.destroyed) != 1 || prov.destroyed[0] != 100 {
+		t.Fatalf("want destroy [100], got %v", prov.destroyed)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container cleared, got %d", task.Status.Container)
+	}
+	if len(prov.created) != 0 {
+		t.Fatalf("must not re-provision, created %v", prov.created)
+	}
+}
+
+// Restart mid-Create after the runner actually launched (boot marker
+// present): the task is adopted as Running instead of being torn down.
+func TestAdoptBootedProvisioning(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, booted: map[int]bool{100: true}}
+	task := testTask(0)
+	task.Status.Phase = v1alpha1.TaskProvisioning
+	task.Status.Container = 100
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s", task.Status.Phase)
+	}
+	if task.Status.StartedAt == nil {
+		t.Fatal("StartedAt should be set on adoption")
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("live runner must not be destroyed, got %v", prov.destroyed)
 	}
 }
 

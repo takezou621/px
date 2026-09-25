@@ -98,18 +98,48 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	case "", v1alpha1.TaskPending:
 		c.provision(ctx, t)
 	case v1alpha1.TaskProvisioning:
+		// The reconciler is serial, so a Provisioning task in the store is
+		// always a provision interrupted by a px-server restart.
 		if t.Status.Container == 0 {
-			// The controller persists the VMID before any node-side work, so
-			// Container==0 in Provisioning means the restart happened before
-			// allocation completed and no container was ever created.
+			// The restart hit before the VMID was persisted; no container exists.
+			c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name)
 			t.Status.Phase = v1alpha1.TaskProvisionFail
 			t.Status.Reason = "provisioning interrupted by restart"
 			t.Status.EndedAt = nowPtr(c.now)
-			c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name)
 			c.persist(t)
 			return
 		}
-		c.poll(ctx, t)
+		// A container was cloned, but Create never completed: the boot may
+		// have died with the SSH session. Adopt the task only if the runner
+		// actually launched; otherwise the container is a partial clone —
+		// clean it up rather than spin in a fake Running.
+		booted, err := c.prov.Booted(ctx, t.Status.Container)
+		if err != nil {
+			// Transient probe failure; retry on the next tick. A container
+			// that is gone or stopped makes pct exec fail with a non-zero
+			// code, which lands in the unbooted branch below.
+			c.log.Warn("boot probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			return
+		}
+		if booted {
+			t.Status.Phase = v1alpha1.TaskRunning
+			now := c.now()
+			t.Status.StartedAt = &now
+			t.Status.Reason = ""
+			c.log.Info("adopted interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container)
+			c.persist(t)
+			return
+		}
+		if err := c.prov.Destroy(ctx, t.Status.Container); err != nil {
+			c.log.Error("cleanup interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			return
+		}
+		t.Status.Container = 0
+		t.Status.Phase = v1alpha1.TaskProvisionFail
+		t.Status.Reason = "provisioning interrupted by restart: container never booted a runner, cleaned up"
+		t.Status.EndedAt = nowPtr(c.now)
+		c.log.Warn("stale provisioning recovered", "task", t.Metadata.Name, "cleaned", "partial container destroyed")
+		c.persist(t)
 	case v1alpha1.TaskRunning:
 		c.poll(ctx, t)
 	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
@@ -155,9 +185,19 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	// mid-Create the record still names the container, so delete and TTL can
 	// destroy it after a restart.
 	t.Status.Container = vmid
-	c.persist(t)
+	if err := c.store.UpsertTask(t); err != nil {
+		// The persisted VMID is the crash-safety anchor for everything
+		// node-side; if it cannot be recorded, do not create the container.
+		c.failProvision(t, fmt.Errorf("persist vmid: %w", err))
+		return
+	}
 
 	if err := c.prov.Create(ctx, t, vmid); err != nil {
+		// Create cleans up its own partial work, so the VMID no longer names
+		// a container of ours. Clear it: a later destroy must never target an
+		// id that Create may have lost to another owner (PVE's nextid is a
+		// suggestion, not a reservation).
+		t.Status.Container = 0
 		c.failProvision(t, err)
 		return
 	}
@@ -198,10 +238,6 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	if code == nil {
-		if t.Status.Phase != v1alpha1.TaskRunning {
-			t.Status.Phase = v1alpha1.TaskRunning
-			c.persist(t)
-		}
 		return
 	}
 	end := c.now()

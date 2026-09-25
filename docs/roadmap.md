@@ -19,7 +19,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 - [x] px CLI: `apply`, `get tasks`, `describe task`, `logs -f`, `delete task`
 - [x] `template/runner/`: script to build the LXC runner template
 - [x] Deletion: persisted `deletionTimestamp`, destroy-retry, restart-safe
-- [x] Crash recovery: interrupted provisioning → ProvisionFailed; dead container → Failed
+- [x] Crash recovery: interrupted provisioning → adopt (booted) or fail + partial-clone cleanup; dead container → Failed
 - [ ] E2E against a real PVE node (blocks M1 sign-off)
 
 ## M2 — Workspaces & lifecycle polish
@@ -31,6 +31,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 ## M3 — Sandbox hardening
 
 - [ ] SSH host key pinning (today the first-seen key is accepted unverified)
+- [ ] Destroy guards by container name: PVE nextid is a suggestion, not a reservation, so a VMID recorded after a crash mid-provision could in theory collide with an externally created container — verify `px-<task>` name ownership before destroy
 - [ ] Gateway kind: egress allowlist via LXC firewall
 - [ ] Model kind: LLM credentials injected as per-task env/secrets
 - [ ] unprivileged CT default; docs on threat model
