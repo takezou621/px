@@ -22,9 +22,9 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 - [x] Crash recovery: interrupted provisioning → adopt (booted) or fail + partial-clone cleanup; dead container → Failed
 - [x] E2E against a real PVE node (PVE 9.2, node `third`): smoke 14/14 (success/failure/goal delivery/delete-running/duplicate rejection), crash-recovery paths verified live (re-provision after kill, unbooted clone destroyed with no orphans, adopted booted container resumes). Fixes surfaced by the run: LXC clone takes `hostname`, PVE string-form API errors parsed, `-tls-insecure` for PVE's self-signed cert.
 
-## M2 — Workspaces & lifecycle polish
+## M2 — Workspaces & lifecycle polish (done)
 
-- [ ] Workspace kind: git clone into the container before runner exec
+- [x] Workspace kind: git clone into the container before runner exec
   - Design: `task.spec.workspaces[].name` references a Workspace resource
     (`spec.git.repo`, optional `spec.git.branch`). The controller resolves
     the references at provision time — an unknown name is a ProvisionFailed
@@ -43,14 +43,14 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     MaxBranchBytes), keeping the boot command within SSH's MAX_ARG_STRLEN.
     Server: GET /v1/workspaces and /v1/workspaces/{name}; CLI:
     `px get workspaces`, `px describe workspace NAME`.
-- [ ] API token auth (px-server is unauthenticated today; loopback-only by default)
+- [x] API token auth (px-server is unauthenticated today; loopback-only by default)
   - Design: opt-in static bearer token — `px-server -token-file F` requires
     `Authorization: Bearer <t>` on every route except `/healthz` (constant-time
     compare, 401 with `WWW-Authenticate`). Without the flag the loopback-only
     default stays, so M1/M2 workflows keep working. The CLI sends the token
     from `-token` / env `PX_TOKEN`; a 401 prints a hint about PX_TOKEN. The
     token file lives outside the repo (0600), never logged.
-- [ ] `px watch` (phase transition streaming)
+- [x] `px watch` (phase transition streaming)
   - Design: `GET /v1/watch` streams NDJSON snapshots
     (`{"tasks": [...], "workspaces": [...]}`) — first one immediately on
     connect, then one per second until the client disconnects (plain
@@ -59,6 +59,15 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     disappearing from a snapshot as `Deleted`, and exits when every task is
     terminal (Succeeded/Failed/ProvisionFailed) or marked for deletion —
     so scripts and the E2E can just `px watch` to completion.
+- [x] E2E against the real PVE node (token auth on/off): 401 without/with a
+    wrong token and 200 with the right one; Workspace-first apply ran a task
+    to `Succeeded` with `px watch` detecting terminal in ~5s (`WS_ORDER_OK`
+    in logs); delete surfaced as `Succeeded -> Deleted`; no containers left
+    on the node. Dual-agent review fixes: first watch snapshot loads before
+    the 200 commits (store errors are a 500, not an empty stream), CLI
+    treats HTTP errors and mid-stream drops as failures, frames decode with
+    json.Decoder (no 1 MiB line cap), and an empty snapshot keeps waiting
+    so a watch started before `px apply` still works.
 
 ## M3 — Sandbox hardening
 
