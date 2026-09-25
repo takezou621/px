@@ -21,14 +21,16 @@ On your workstation, copy the build script to the node and run it as root:
 ```sh
 scp template/runner/build.sh root@<PVE_HOST>:/root/
 ssh root@<PVE_HOST> /root/build.sh <CTID>          # e.g. 999
-# optional args: /root/build.sh <CTID> <bridge> <storage>
-# defaults:      vmbr0, local-lvm
+# optional args: /root/build.sh <CTID> <bridge> <rootfs-storage> <tpl-storage>
+# defaults:      vmbr0, local-lvm, local
 ```
 
 This downloads the Debian 12 standard image, creates an unprivileged
 container with `nesting=1`, installs the base tools, and converts it to
 the template `px-runner-debian12`. Reference that name as `spec.image`
-in Task manifests.
+in Task manifests. Note: the image file must go on a `vztmpl`-capable
+storage (dir/NFS, default `local`); lvmthin pools like `local-lvm`
+reject template files, so keep them separate.
 
 ## 2. Start px-server
 

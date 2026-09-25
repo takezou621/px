@@ -2,7 +2,7 @@
 # Build the px runner LXC template on a Proxmox VE node.
 #
 # Usage (on the PVE node, or via ssh):
-#   ./build.sh <CTID> [bridge] [storage]
+#   ./build.sh <CTID> [bridge] [storage] [tpl-storage]
 #
 # Result: container <CTID> converted to a template, named px-runner-debian12.
 # The template contains: bash, git, curl, and the px boot shim layout
@@ -12,6 +12,7 @@ set -euo pipefail
 CTID="${1:?usage: build.sh <CTID> [bridge] [storage]}"
 BRIDGE="${2:-vmbr0}"
 STORAGE="${3:-local-lvm}"
+TPL_STORAGE="${4:-local}"
 NAME="px-runner-debian12"
 
 if [[ $EUID -ne 0 ]]; then
@@ -23,7 +24,9 @@ echo "==> downloading Debian 12 image (once)"
 pveam update >/dev/null
 IMAGE="$(pveam available --section system | awk '/debian-12-standard/ {print $2; exit}')"
 [[ -n "$IMAGE" ]] || { echo "no debian-12 image found" >&2; exit 1; }
-pveam download "$STORAGE" "$IMAGE" >/dev/null 2>&1 || true
+# Template files need a vztmpl-capable storage (dir/NFS); lvmthin pools like
+# local-lvm reject them, so images land on TPL_STORAGE (default: local).
+pveam download "$TPL_STORAGE" "$IMAGE"
 
 echo "==> creating container $CTID ($NAME)"
 pct create "$CTID" "${STORAGE}:vztmpl/${IMAGE}" \
