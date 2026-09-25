@@ -1,0 +1,22 @@
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_b0b902f3e81279 25,27
+  s_c2f954a86dc8c5::t_0eba233e086a05 46
+  s_c2f954a86dc8c5::t_b885303a9f87b4 62-70
+  s_c2f954a86dc8c5::t_8c7586dd63fa8f 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9a3dfffdf33c6f93b159b67c8a98be2fa1cbefed",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
