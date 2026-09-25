@@ -1,0 +1,36 @@
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_4671fe19ca06ba 249-258
+  s_c2f954a86dc8c5::t_a3b2a056fbfad1 284-287
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_ada6cafdec5617 69-72
+  s_c2f954a86dc8c5::t_74dacdb98cf264 266-270,276-279
+  s_c2f954a86dc8c5::t_88e42d542520bf 271-272,274-275
+  s_c2f954a86dc8c5::t_901593dbf45555 76-78
+  s_c2f954a86dc8c5::t_d13acdcb4eeccb 273
+  s_c2f954a86dc8c5::t_a2abb0f54362c1 345-347,354-355,358-359,361-374
+  s_c2f954a86dc8c5::t_5518b234188c50 348-353,356-357,360
+docs/e2e.md
+  s_c2f954a86dc8c5::t_e3837fb5c1661d 120-124,128
+  s_c2f954a86dc8c5::t_25ad96ac253af7 125-127
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_925f3bb4380e16 156
+  s_c2f954a86dc8c5::t_7d16e17eac8e56 184-189
+  s_c2f954a86dc8c5::t_dc70c71d634016 190-192
+  s_c2f954a86dc8c5::t_5c83bdd803fcca 225-232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "592c931181446f5d64762c413cf8be577c2de66b",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
