@@ -1,0 +1,20 @@
+template/runner/build.sh
+  s_c2f954a86dc8c5::t_1f00118e80fb99 12
+  s_c2f954a86dc8c5::t_619e109000f9e6 30-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "401bfb21c95fbd34f902b2881d948e080f346a79",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
