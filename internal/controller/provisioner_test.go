@@ -476,8 +476,8 @@ func TestRunnerScriptInjectsModelEnv(t *testing.T) {
 		t.Errorf("missing model.baseurl write:\n%s", script)
 	}
 	spawn := strings.Index(script, "nohup sh -c")
-	if spawn == -1 || !strings.Contains(script[spawn:], ". /run/px/model.env 2>/dev/null;") {
-		t.Errorf("runner spawn must source model.env:\n%s", script)
+	if spawn == -1 || !strings.Contains(script[spawn:], "if [ -f /run/px/model.env ]; then . /run/px/model.env; fi;") {
+		t.Errorf("runner spawn must source model.env behind an existence guard:\n%s", script)
 	}
 }
 
@@ -507,7 +507,7 @@ func TestRunnerScriptWithoutModel(t *testing.T) {
 			t.Errorf("model-less script writes %s:\n%s", absent, script)
 		}
 	}
-	if !strings.Contains(script, ". /run/px/model.env 2>/dev/null;") {
-		t.Errorf("spawn must tolerate a missing model.env:\n%s", script)
+	if !strings.Contains(script, "if [ -f /run/px/model.env ]; then . /run/px/model.env; fi;") {
+		t.Errorf("spawn must tolerate a missing model.env (dash exits on a failed dot-builtin):\n%s", script)
 	}
 }

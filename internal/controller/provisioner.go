@@ -184,7 +184,11 @@ done
 clone_ws%d || { rm -rf /workspace/%s; sleep 2; clone_ws%d; } || { echo 'px: git clone %s failed' >&2; exit 1; }
 `, i, branchFlag, i, ws.Name, i, ws.Name, i, ws.Name)
 	}
-	s.WriteString(`nohup sh -c '. /run/px/model.env 2>/dev/null; sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
+	// The model.env source must be an [ -f ] guard, not ". file 2>/dev/null":
+	// under dash (the template's /bin/sh) a dot-builtin that cannot open its
+	// file is a fatal error for the shell, so the runner would die before
+	// cmd.sh ever starts — a model-less task then hangs in Running forever.
+	s.WriteString(`nohup sh -c 'if [ -f /run/px/model.env ]; then . /run/px/model.env; fi; sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
 # marker for Booted(), touched only after the runner is spawned so that a
 # present marker proves the runner process exists — a restart mid-boot can
 # then tell a live runner from a partial clone whose boot died with the SSH
