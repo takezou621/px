@@ -111,7 +111,7 @@ just has no network and the deny verdicts mean nothing), an empty
 `egress: []` leaves the container DNS-only, a task referencing a
 missing gateway lands in `ProvisionFailed` before any container is
 created, and while the locked task runs the node shows `net0`
-`firewall=1`, the CT `firewall: 1` option, and `/etc/pve/lxc/<CTID>.fw`
+`firewall=1`, the CT `firewall: 1` option, and `/etc/pve/firewall/<CTID>.fw`
 with `policy_out: DROP` plus the implicit `px: dns` / `px: dhcp` rules
 and the gateway's own rule. Cleanup removes all tasks and gateways.
 

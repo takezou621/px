@@ -55,12 +55,21 @@ func TestNet0WithFirewall(t *testing.T) {
 
 // applyEgressPolicy always writes the implicit rules after policy_out=DROP:
 // without DNS the runner cannot resolve anything, and without DHCP the
-// ip=dhcp template loses its lease mid-run.
+// ip=dhcp template loses its lease mid-run. The default-deny lands on the
+// guest firewall options endpoint (policy_out is not an LXC config
+// property — PVE's schema rejects it on the config endpoint), and the
+// datacenter firewall must already be enabled or the whole install is
+// refused: with it off PVE ignores every guest rule and the sandbox would
+// run wide open behind an allowlist that looks enforced.
 func TestApplyEgressPolicyRules(t *testing.T) {
 	var mu sync.Mutex
 	var rules []proxmox.FirewallRule
 	var net0Set string
+	var fwOpts map[string]string
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/cluster/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": {"enable": 1}}`))
+	})
 	mux.HandleFunc("/api2/json/nodes/n1/lxc/123/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -74,6 +83,21 @@ func TestApplyEgressPolicyRules(t *testing.T) {
 			mu.Unlock()
 			w.Write([]byte(`{"data": null}`))
 		}
+	})
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/123/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("guest firewall options write must be a PUT, got %s", r.Method)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		fwOpts = map[string]string{
+			"enable":     r.Form.Get("enable"),
+			"policy_out": r.Form.Get("policy_out"),
+		}
+		mu.Unlock()
+		w.Write([]byte(`{"data": null}`))
 	})
 	mux.HandleFunc("/api2/json/nodes/n1/lxc/123/firewall/rules", func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -113,9 +137,47 @@ func TestApplyEgressPolicyRules(t *testing.T) {
 			t.Errorf("rule %d = %+v, want %+v", i, rules[i], r)
 		}
 	}
+	if fwOpts["enable"] != "1" || fwOpts["policy_out"] != "DROP" {
+		t.Errorf("guest firewall options = %+v, want enable=1 policy_out=DROP", fwOpts)
+	}
 	// net0 passed to the config write must carry firewall=1 and keep the hwaddr.
 	if !strings.Contains(net0Set, "firewall=1") || !strings.Contains(net0Set, "hwaddr=BC:24:11:BE:95:31") {
 		t.Fatalf("net0 sent to PVE = %q", net0Set)
+	}
+}
+
+// A disabled datacenter firewall makes every guest rule inert, so the
+// install must be refused before anything is written — and the error must
+// say how to fix it.
+func TestApplyEgressPolicyRequiresClusterFirewall(t *testing.T) {
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/cluster/firewall/options", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": {}}`))
+	})
+	for _, path := range []string{
+		"/api2/json/nodes/n1/lxc/123/config",
+		"/api2/json/nodes/n1/lxc/123/firewall/options",
+		"/api2/json/nodes/n1/lxc/123/firewall/rules",
+	} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Write([]byte(`{"data": null}`))
+		})
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	p := &provisioner{pve: proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)}
+
+	err := p.applyEgressPolicy(context.Background(), 123, &ResolvedGateway{Name: "locked"})
+	if err == nil {
+		t.Fatal("a disabled cluster firewall must be refused")
+	}
+	if !strings.Contains(err.Error(), "cluster firewall is disabled") || !strings.Contains(err.Error(), "enable") {
+		t.Errorf("error must name the problem and the fix, got: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("nothing must be written to the container once the check fails, got %d writes", calls)
 	}
 }
 

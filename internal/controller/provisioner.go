@@ -265,10 +265,19 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 }
 
 // applyEgressPolicy installs the gateway's allowlist on the not-yet-started
-// clone: enable the CT firewall on net0 + CT option with default-deny
-// egress, then the implicit DNS/DHCP allows and one ACCEPT rule per spec
-// rule. The container is still stopped, so no hot-apply ordering concerns.
+// clone: verify the datacenter firewall is on (without it PVE ignores every
+// guest rule), enable the guest firewall on net0 + the firewall options
+// (enable + policy_out=DROP), then the implicit DNS/DHCP allows and one
+// ACCEPT rule per spec rule. The container is still stopped, so no
+// hot-apply ordering concerns.
 func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *ResolvedGateway) error {
+	enabled, err := p.pve.ClusterFirewallEnabled(ctx)
+	if err != nil {
+		return fmt.Errorf("check cluster firewall: %w", err)
+	}
+	if !enabled {
+		return fmt.Errorf("cluster firewall is disabled — guest egress rules are inert without it; enable it first (Datacenter > Firewall > Options, or: pvesh set /cluster/firewall/options -enable 1)")
+	}
 	net0, err := p.pve.ContainerNet0(ctx, vmid)
 	if err != nil {
 		return fmt.Errorf("read net0: %w", err)
@@ -279,6 +288,9 @@ func (p *provisioner) applyEgressPolicy(ctx context.Context, vmid int, gw *Resol
 	}
 	if err := p.pve.EnableFirewall(ctx, vmid, net0); err != nil {
 		return fmt.Errorf("enable firewall: %w", err)
+	}
+	if err := p.pve.SetEgressDropPolicy(ctx, vmid); err != nil {
+		return fmt.Errorf("set egress drop policy: %w", err)
 	}
 	// Name resolution and the DHCP lease must survive the firewall: nearly
 	// every real egress is name-based, and the template boots with ip=dhcp.

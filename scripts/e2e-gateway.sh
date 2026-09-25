@@ -218,7 +218,7 @@ if [[ -n $PVE_SSH ]]; then
     else
       bad "pct config on $vmid failed: $cfg"
     fi
-    if fw=$(ssh "${ssh_opts[@]}" "$PVE_SSH" "cat /etc/pve/lxc/$vmid.fw" 2>&1); then
+    if fw=$(ssh "${ssh_opts[@]}" "$PVE_SSH" "cat /etc/pve/firewall/$vmid.fw" 2>&1); then
       for want in "policy_out: DROP" "px: dns" "px: dhcp" "px: gateway $GW_LOCKED"; do
         if grep -qF "$want" <<<"$fw"; then
           ok ".fw has: $want"
@@ -227,7 +227,7 @@ if [[ -n $PVE_SSH ]]; then
         fi
       done
     else
-      bad "reading /etc/pve/lxc/$vmid.fw failed: $fw"
+      bad "reading /etc/pve/firewall/$vmid.fw failed: $fw"
     fi
   fi
 else
@@ -254,6 +254,18 @@ apply < <(task_yaml "$TASK_MISSING" "$GW_LOCKED-nonexistent")
 if wait_phase "$TASK_MISSING" ProvisionFailed; then
   if reason=$("$PX" describe task "$TASK_MISSING" | grep '"reason"'); then
     ok "reason: $(tr -d ' ' <<<"$reason")"
+  fi
+  # A resolved-but-missing gateway must be caught before any container
+  # work: "container" is omitempty in the status JSON, so its absence
+  # proves no VMID was ever persisted.
+  if desc=$("$PX" describe task "$TASK_MISSING"); then
+    if grep -q '"container"' <<<"$desc"; then
+      bad "ProvisionFailed task has a container id: $(grep '"container"' <<<"$desc")"
+    else
+      ok "no container was created for the failed task"
+    fi
+  else
+    bad "describe task $TASK_MISSING failed"
   fi
 else
   "$PX" logs "$TASK_MISSING" 2>/dev/null | tail -5 || true

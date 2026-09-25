@@ -239,16 +239,42 @@ func (c *Client) ContainerNet0(ctx context.Context, vmid int) (string, error) {
 	return cfg.Net0, nil
 }
 
-// EnableFirewall turns on the CT-level LXC firewall with default-deny
-// egress (policy_out=DROP; policy_in stays at its default, so replies ride
-// the same open inbound path as before). net0 must be the container's
-// current value with firewall=1 appended.
+// EnableFirewall sets the guest firewall flag on the container's config
+// (a valid LXC config property, `pct set <vmid> --firewall 1`). net0 must
+// be the container's current value with firewall=1 appended.
 func (c *Client) EnableFirewall(ctx context.Context, vmid int, net0 string) error {
 	form := url.Values{}
 	form.Set("net0", net0)
 	form.Set("firewall", "1")
-	form.Set("policy_out", "DROP")
 	return c.do(ctx, http.MethodPut, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), form, nil)
+}
+
+// SetEgressDropPolicy writes the guest firewall options (the per-guest
+// section under Datacenter > Firewall): enable the guest firewall and
+// default-deny egress — policy_out=DROP; policy_in stays at its default,
+// so replies ride the same open inbound path as before. These are firewall
+// options, not LXC config properties: PVE's parameter schema rejects
+// policy_out on the config endpoint.
+func (c *Client) SetEgressDropPolicy(ctx context.Context, vmid int) error {
+	form := url.Values{}
+	form.Set("enable", "1")
+	form.Set("policy_out", "DROP")
+	return c.do(ctx, http.MethodPut, fmt.Sprintf("/nodes/%s/lxc/%d/firewall/options", c.node, vmid), form, nil)
+}
+
+// ClusterFirewallEnabled reports whether the datacenter-level firewall is
+// enabled. Guest rules only apply when the cluster option is on — with it
+// off PVE ignores every guest rule, which would silently turn an egress
+// allowlist into a no-op, so callers must refuse to provision rather than
+// fake the guarantee.
+func (c *Client) ClusterFirewallEnabled(ctx context.Context) (bool, error) {
+	var opts struct {
+		Enable int `json:"enable"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/cluster/firewall/options", nil, &opts); err != nil {
+		return false, err
+	}
+	return opts.Enable == 1, nil
 }
 
 // FirewallRule is one CT firewall rule to append.
