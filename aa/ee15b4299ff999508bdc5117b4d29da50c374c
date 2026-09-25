@@ -1,0 +1,36 @@
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_e50b5d6d6ea55c 301-306
+docs/e2e.md
+  s_c2f954a86dc8c5::t_87f473117afbe9 15-18
+  s_c2f954a86dc8c5::t_0b3f5f30b72f7b 141-153,156-161
+  s_c2f954a86dc8c5::t_bd48c80c601254 154-155
+  s_c2f954a86dc8c5::t_36fb5ac9dd690c 71-74
+scripts/e2e-exec.sh
+  s_c2f954a86dc8c5::t_e569b1d061a0d7 48-49,51-56
+  s_c2f954a86dc8c5::t_57ece42a7675db 121-124,128
+  s_c2f954a86dc8c5::t_c05354edd1e604 1-24,27-47,66-120,129-161,163,166,182-185
+  s_c2f954a86dc8c5::t_01b021ed1786aa 169-174
+  s_c2f954a86dc8c5::t_2ac33b5c37d3ca 50,57-65
+  s_c2f954a86dc8c5::t_592248f523c9bf 162,164-165,167-168,175-181
+  s_c2f954a86dc8c5::t_e670db547a70f8 25-26
+  s_c2f954a86dc8c5::t_7fd2aa818f3a91 125-127
+scripts/e2e-smoke.sh
+  s_c2f954a86dc8c5::t_2bd0e72fe0df21 119-130,139,142
+  s_c2f954a86dc8c5::t_e1d18eabb845f2 64-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aaee15b4299ff999508bdc5117b4d29da50c374c",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
