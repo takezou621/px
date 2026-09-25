@@ -141,6 +141,18 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     the adoption path: before adopting, the controller verifies ownership
     with `Owned()` so a reused VMID carrying a foreign boot marker fails the
     task instead of running someone else's runner.
+- [x] E2E against the real PVE node (Model kind, `scripts/e2e-model.sh`):
+    a dummy-key Model applied write-only (apply/list/describe never echo
+    the key, describe shows `<redacted>`); re-applying the placeholder
+    rejected with the placeholder-naming error; a task with `spec.model`
+    reached `Succeeded` in ~5s with `ANTHROPIC_API_KEY` (checked by
+    length, never the value) and `ANTHROPIC_BASE_URL` in the runner env;
+    `model.key`/`model.env`/`boot.sh` all `0600` inside the container
+    (the umask fix verified live); delete left no container on the node.
+    Surfaced by the run: the CLI's `describe` HTML-escaped `<` and `>` in
+    the placeholder — it now encodes with
+    `SetEscapeHTML(false)` like the server, so describe output re-applied
+    as YAML still trips the placeholder guard.
 - [ ] Gateway kind: egress allowlist via LXC firewall
 - [x] Model kind: LLM credentials injected as per-task env/secrets
   - Design: `spec.provider` is a closed set (`anthropic`, `openai`) that maps

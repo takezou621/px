@@ -176,24 +176,32 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 		if err := doJSON(http.MethodGet, "/v1/tasks/"+name, nil, &t); err != nil {
 			return err
 		}
-		b, _ := json.MarshalIndent(t, "", "  ")
-		fmt.Println(string(b))
+		printJSONIndent(t)
 	case "workspace":
 		var ws *v1alpha1.Workspace
 		if err := doJSON(http.MethodGet, "/v1/workspaces/"+name, nil, &ws); err != nil {
 			return err
 		}
-		b, _ := json.MarshalIndent(ws, "", "  ")
-		fmt.Println(string(b))
+		printJSONIndent(ws)
 	case "model":
 		var m *v1alpha1.Model
 		if err := doJSON(http.MethodGet, "/v1/models/"+name, nil, &m); err != nil {
 			return err
 		}
-		b, _ := json.MarshalIndent(m, "", "  ")
-		fmt.Println(string(b))
+		printJSONIndent(m)
 	}
 	return nil
+}
+
+// printJSONIndent renders describe output without HTML escaping: the Model
+// key placeholder must show as <redacted>, but json.MarshalIndent escapes
+// < and >, and describe output re-applied as YAML would then no longer
+// match the placeholder guard.
+func printJSONIndent(v any) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
 }
 
 func cmdLogs(fs *flag.FlagSet, args []string) error {

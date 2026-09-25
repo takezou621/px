@@ -66,6 +66,23 @@ It exercises: a task that succeeds (and its logs), a task that fails
 (exit code recorded), goal delivery into the container, deleting a
 running task, and duplicate-apply rejection — then cleans up its tasks.
 
+## 3b. Model-kind test
+
+With the same server running:
+
+```sh
+./scripts/e2e-model.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks); MODEL_KEY (default a dummy)
+```
+
+It exercises: the API key is write-only (apply/list/describe never echo
+it, describe shows `<redacted>`), re-applying the placeholder is
+rejected, a task referencing the model gets `ANTHROPIC_API_KEY`
+(presence + length only — the key never reaches the logs) and
+`ANTHROPIC_BASE_URL`, `/run/px/model.*` are 0600 inside the container,
+and task + model delete cleanly with no container left on the node.
+
 What you should see while it runs (from another terminal):
 
 ```sh
