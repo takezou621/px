@@ -92,6 +92,22 @@ func TestApplyInvalid(t *testing.T) {
 	}
 }
 
+// An empty manifest stream (empty stdin, truncated file) must be a loud 400,
+// not a 201 no-op — the caller would otherwise read exit 0 as "applied".
+func TestApplyEmpty(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for _, body := range []string{"", "\n", "---\n---\n"} {
+		resp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("apply of %q: want 400, got %d", body, resp.StatusCode)
+		}
+	}
+}
+
 func TestApplyDuplicate(t *testing.T) {
 	srv, _ := newTestServer(t)
 	for i := 0; i < 2; i++ {

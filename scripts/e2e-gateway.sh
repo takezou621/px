@@ -85,7 +85,8 @@ api_get_code() { # path
 }
 
 gateway_yaml() { # $1 name; $2 = "empty" for the DNS-only variant
-  if [[ $2 == empty ]]; then
+  local variant="${2:-}"
+  if [[ $variant == empty ]]; then
     cat <<EOF
 apiVersion: px.io/v1alpha1
 kind: Gateway

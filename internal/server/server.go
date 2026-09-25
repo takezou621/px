@@ -66,6 +66,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "%v", err)
 		return
 	}
+	// An empty stream must not read as a successful no-op apply: a caller
+	// whose manifest generation failed (empty stdin, unreadable file) would
+	// otherwise see exit 0 and believe its objects were configured.
+	if len(manifests) == 0 {
+		httpError(w, http.StatusBadRequest, "no manifests in request body")
+		return
+	}
 	var results []string
 	err = s.store.InTx(func(tx *store.Store) error {
 		var aerr error
