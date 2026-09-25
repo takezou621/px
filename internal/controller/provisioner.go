@@ -534,8 +534,10 @@ type ExecResult struct {
 }
 
 func (p *provisioner) Exec(ctx context.Context, vmid int, argv []string) (*ExecResult, error) {
-	var stdout, stderr cappedWriter
-	code, err := p.ssh.RunStreams(pctExecCommand(vmid, argv), execTimeout, &stdout, &stderr)
+	// max must be set explicitly: the zero value (0) would drop every byte.
+	stdout := &cappedWriter{max: maxExecStreamBytes}
+	stderr := &cappedWriter{max: maxExecStreamBytes}
+	code, err := p.ssh.RunStreams(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -546,6 +548,10 @@ func (p *provisioner) Exec(ctx context.Context, vmid int, argv []string) (*ExecR
 		Truncated: stdout.truncated || stderr.truncated,
 	}, nil
 }
+
+// newCappedWriter is the only way to build a cappedWriter outside tests: a
+// zero-value cappedWriter has max 0 and would silently discard all output.
+func newCappedWriter(max int) *cappedWriter { return &cappedWriter{max: max} }
 
 // pctExecCommand builds the node-side command line. Each argument crosses two
 // shells (SSH's remote shell, then pct's argv) as a POSIX single-quoted word,

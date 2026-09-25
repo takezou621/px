@@ -441,7 +441,7 @@ func TestPctExecCommandQuotesArgv(t *testing.T) {
 // succeeding: the ssh copy goroutine must not stall or kill the command over
 // output the caller will not see anyway.
 func TestCappedWriterTruncatesAndKeepsWriting(t *testing.T) {
-	w := &cappedWriter{max: 8}
+	w := newCappedWriter(8)
 	n, err := w.Write([]byte("1234567890"))
 	if n != 10 || err != nil {
 		t.Fatalf("Write = (%d, %v), want (10, nil)", n, err)
