@@ -20,7 +20,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 - [x] `template/runner/`: script to build the LXC runner template
 - [x] Deletion: persisted `deletionTimestamp`, destroy-retry, restart-safe
 - [x] Crash recovery: interrupted provisioning → adopt (booted) or fail + partial-clone cleanup; dead container → Failed
-- [ ] E2E against a real PVE node (blocks M1 sign-off)
+- [x] E2E against a real PVE node (PVE 9.2, node `third`): smoke 14/14 (success/failure/goal delivery/delete-running/duplicate rejection), crash-recovery paths verified live (re-provision after kill, unbooted clone destroyed with no orphans, adopted booted container resumes). Fixes surfaced by the run: LXC clone takes `hostname`, PVE string-form API errors parsed, `-tls-insecure` for PVE's self-signed cert.
 
 ## M2 — Workspaces & lifecycle polish
 
