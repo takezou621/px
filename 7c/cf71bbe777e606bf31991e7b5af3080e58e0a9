@@ -1,0 +1,29 @@
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_b97d0f55a73eb9 160
+  s_c2f954a86dc8c5::t_29d69793523ebe 71-91
+  s_c2f954a86dc8c5::t_0dceb01299ac02 67
+cmd/px-server/main.go
+  s_c2f954a86dc8c5::t_7428eb9334444c 31
+  s_c2f954a86dc8c5::t_00e8ecd737ee47 51
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_89479b6482fc15 26-33,38
+docs/e2e.md
+  s_c2f954a86dc8c5::t_485c577979cee5 42,44-45,48-51
+  s_c2f954a86dc8c5::t_4a2c5a4444ab00 52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7ccf71bbe777e606bf31991e7b5af3080e58e0a9",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
