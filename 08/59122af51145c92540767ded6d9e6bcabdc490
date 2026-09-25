@@ -1,0 +1,25 @@
+scripts/e2e-gateway.sh
+  s_c2f954a86dc8c5::t_604e8371b86867 213-217,219
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_fbde4b946a7d43 242-245
+docs/e2e.md
+  s_c2f954a86dc8c5::t_b53112ac4a9980 113-118
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_cc30b352e3e0f0 154-156,158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0859122af51145c92540767ded6d9e6bcabdc490",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
