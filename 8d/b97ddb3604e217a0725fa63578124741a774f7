@@ -1,0 +1,21 @@
+internal/proxmox/client_test.go
+  s_c2f954a86dc8c5::t_41c2c03e7b8463 7
+  s_c2f954a86dc8c5::t_c69261c708bd5a 119-120,122-194
+  s_c2f954a86dc8c5::t_55329f1462272f 121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8db97ddb3604e217a0725fa63578124741a774f7",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
