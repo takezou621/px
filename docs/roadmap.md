@@ -298,3 +298,9 @@ Small items deferred from reviews; not scheduled.
   session.
 - Distinguish "pct exec itself failed" from "command exited non-zero"
   in `Exec` results, so the CLI can say which layer failed.
+- Workspace deletion: `DELETE /v1/workspaces/{name}` and
+  `px delete workspace NAME` do not exist (found in E2E — the CLI
+  currently routes `delete workspace X` to the task endpoint and gets
+  a misleading 404). A deletion is safe: running tasks keep their
+  cloned copy; only future applies referencing the name fail to
+  resolve.

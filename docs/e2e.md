@@ -12,7 +12,10 @@ Unit tests run without PVE; this is the manual path that closes M1.
 - SSH from the px-server host to the PVE node as root (`root@pam`),
   either with a key file or a loaded agent. px uses SSH + `pct exec`
   for the runner boot step.
-- The `px` and `px-server` binaries: `go build ./cmd/px ./cmd/px-server`.
+- The `px` and `px-server` binaries. Build each package separately —
+  `go build` with multiple packages compiles them but writes no
+  binaries:
+  `go build -o px ./cmd/px && go build -o px-server ./cmd/px-server`.
 
 ## 1. Build the runner template (once per node)
 
@@ -65,6 +68,10 @@ loopback-bound) REST API and runs the reconcile loop.
 It exercises: a task that succeeds (and its logs), a task that fails
 (exit code recorded), goal delivery into the container, deleting a
 running task, and duplicate-apply rejection — then cleans up its tasks.
+Section 3's workspace check clones a public git repository, so the
+sandbox needs outbound git access (point `spec.git.repo` at a local
+mirror if it does not). Workspace deletion does not exist yet (see
+roadmap backlog), so the applied `e2e-ws` stays in the store.
 
 ## 3b. Model-kind test
 
@@ -130,6 +137,27 @@ The deny check targets `https://1.1.1.1/`, so the control task in
 section 4 needs outbound internet from the sandbox; on a fully
 air-gapped lab every "blocked" would pass vacuously — the control task
 exists to catch exactly that.
+
+## 3d. Exec test
+
+With the same server running:
+
+```sh
+./scripts/e2e-exec.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks)
+```
+
+It exercises: `px exec` into a running task separates stdout/stderr and
+propagates the exit code, arguments arrive byte-exact through both
+shells (metacharacters, spaces, embedded quotes, empty argv elements),
+oversized stdout is capped at 1 MiB (the suite checks the stdout side;
+both streams are capped server-side) with a note on stderr,
+gating returns 404 for unknown tasks and 409 for a task that is not
+running (a `ProvisionFailed` task has no container, so the 409 is
+deterministic), and request validation rejects a NUL byte in argv and
+trailing garbage after the JSON body. Cleanup waits the asynchronous
+destroy out before checking the node for leftover containers.
 
 ## 4. Restart-recovery check (manual)
 

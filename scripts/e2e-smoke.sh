@@ -61,6 +61,8 @@ cleanup() { # best-effort: don't leave smoke-test containers behind on timeout
   for t in e2e-ok e2e-fail e2e-goal e2e-long e2e-dup; do
     "$PX" delete task "$t" >/dev/null 2>&1 || true
   done
+  # workspace delete is not implemented (roadmap backlog); e2e-ws stays in
+  # the store — upsert keeps re-runs idempotent.
 }
 trap cleanup EXIT
 
@@ -114,7 +116,18 @@ if wait_phase e2e-fail Failed; then
   [[ $logs == *about-to-fail* ]] && ok "stderr captured in logs" || bad "stderr missing from logs"
 fi
 
-say "3. goal text reaches the container"
+say "3. workspace goal text reaches the container"
+# task.spec.workspaces[].name references a Workspace resource, which the
+# controller clones into /workspace/<name> before the runner starts.
+apply <<'EOF'
+apiVersion: px.io/v1alpha1
+kind: Workspace
+metadata:
+  name: e2e-ws
+spec:
+  git:
+    repo: https://github.com/takezou621/px.git
+EOF
 apply <<'EOF'
 apiVersion: px.io/v1alpha1
 kind: Task
@@ -123,10 +136,10 @@ metadata:
 spec:
   image: px-runner-debian12
   workspaces:
-    - name: ws1
+    - name: e2e-ws
       goal: Fix the flux capacitor
   runner:
-    command: ["sh", "-c", "cat /run/px/goal"]
+    command: ["sh", "-c", "cat /run/px/goal; test -d /workspace/e2e-ws/.git"]
 EOF
 if wait_phase e2e-goal Succeeded; then
   logs=$("$PX" logs e2e-goal)
