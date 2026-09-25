@@ -1,0 +1,61 @@
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_65fb27cde52226 102-104,106
+  s_c2f954a86dc8c5::t_f952c2d4c0c156 16,35-38,46-50,71,76,92-93,120-132,135-137
+  s_c2f954a86dc8c5::t_10ba2626e0b949 72-75,77
+  s_c2f954a86dc8c5::t_0ad21a6c73547e 7
+  s_c2f954a86dc8c5::t_9d330aa7a54f09 20-23,26
+  s_c2f954a86dc8c5::t_31b8479eabce67 133-134,138,149,151,154-156,158-163,172-177
+  s_c2f954a86dc8c5::t_cfe1758d89ca8d 139-140
+  s_c2f954a86dc8c5::t_9121d06659d2ca 178-179
+internal/store/store.go
+  s_c2f954a86dc8c5::t_d3cefb278d37cb 54-57,68-76,81-94
+  s_c2f954a86dc8c5::t_971f2666f5268f 10
+  s_c2f954a86dc8c5::t_b5efa5ded8e180 95-96
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_c6c805c2cc059c 17-23
+  s_c2f954a86dc8c5::t_c7087a0899ef1a 95-99,102,105,110,114,119,121
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_7f5c5cdf4d25d9 5,15-23,28,33
+internal/server/server.go
+  s_c2f954a86dc8c5::t_9cc9710d2ecc08 124-129
+internal/apis/v1alpha1/types.go
+  s_c2f954a86dc8c5::t_491fcaabc79097 100-103
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_02126c54a6b4dc 16-24,27-34,36,41
+  s_c2f954a86dc8c5::t_22df3840b9f804 92-101
+  s_c2f954a86dc8c5::t_02962437ce3915 102-103,107-125
+  s_c2f954a86dc8c5::t_ea9f9a32fc61bf 144-147
+  s_c2f954a86dc8c5::t_38b7ad1e756f3d 282-284,295-324
+  s_c2f954a86dc8c5::t_f33a51d893d0e5 326,350-455
+  s_c2f954a86dc8c5::t_1b07fbd1cacbbd 325,463-465
+  s_4cd73b87fb6fd0::t_ec433f908d4a77 327
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_e9a215724f3605 135-136
+  s_c2f954a86dc8c5::t_952314077846ec 19-20
+internal/store/store_test.go
+  s_c2f954a86dc8c5::t_c16f77bbbb1c6c 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0d37dd7e6a710723c49a92539663b65c59db7359",
+  "prompts": {},
+  "sessions": {
+    "s_4cd73b87fb6fd0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5505b578-cf74-4440-a8b8-624ecb86ad10",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    },
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
