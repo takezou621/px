@@ -1,0 +1,49 @@
+internal/sshexec/exec.go
+  s_c2f954a86dc8c5::t_2881a27fd2e772 203-212,214,216,219,224,228,235-245,248,250,252
+  s_c2f954a86dc8c5::t_7fc49292bd1731 179-198
+  s_c2f954a86dc8c5::t_e5e3d5e39af321 9
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_a8f702876e7859 13
+  s_c2f954a86dc8c5::t_4bb169079f01d5 392-587
+  s_c2f954a86dc8c5::t_b968414e53f4e6 32-34
+  s_c2f954a86dc8c5::t_0821af3f6cb4cf 5-7,15
+  s_c2f954a86dc8c5::t_8af5948afde2d3 28-31
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_992660f314f6dd 423-463
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_be8134a7005fdd 250-270
+README.md
+  s_c2f954a86dc8c5::t_263e3a31baeb7c 87-88
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_183fbda84e45b5 273-338
+  s_c2f954a86dc8c5::t_0d4db58127b47a 554-555
+  s_c2f954a86dc8c5::t_cdb41a03629159 42-43
+docs/threat-model.md
+  s_c2f954a86dc8c5::t_df66f8f893c6a9 96-110
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_da9fca5ac99ac9 517-585
+  s_c2f954a86dc8c5::t_7e3c38da4680c3 53-55
+  s_c2f954a86dc8c5::t_4ffa43c8e057ba 4
+internal/server/server.go
+  s_c2f954a86dc8c5::t_b74ae0e70a72dd 224-227,231-300
+  s_c2f954a86dc8c5::t_8af5948afde2d3 228-230
+  s_c2f954a86dc8c5::t_1b3a6b4edc3fc0 38
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_b6039ff0a697a0 84-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a75fcc0a53cf59d8834af36896f87e77beeffb1e",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
