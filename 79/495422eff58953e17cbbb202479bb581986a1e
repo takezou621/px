@@ -1,0 +1,37 @@
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_f1afd162f27055 34
+  s_c2f954a86dc8c5::t_06f1e33934f45e 22
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_34e2d06791dbbc 17-21,24-25,27-31
+  s_c2f954a86dc8c5::t_52ee63e30fea47 69-71
+  s_c2f954a86dc8c5::t_213c3f365e872b 184-195
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_b442547ba7c131 23,45-48
+  s_c2f954a86dc8c5::t_6421baf3dd6c75 115-117
+  s_c2f954a86dc8c5::t_047e174981d23d 253-255
+  s_c2f954a86dc8c5::t_fe3daea29ca747 83-85
+  s_c2f954a86dc8c5::t_a6318c330277c5 49,385-454
+  s_c2f954a86dc8c5::t_737efb70cb7a5b 50
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_b04d8774d5602c 101-102,104-105,112-140,142
+  s_c2f954a86dc8c5::t_8199864b0de7f1 141
+  s_c2f954a86dc8c5::t_e7ce19c79446c3 188-193,196-200
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_db4711b5ae7e7e 21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "79495422eff58953e17cbbb202479bb581986a1e",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
