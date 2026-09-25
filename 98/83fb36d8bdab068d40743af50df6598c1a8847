@@ -1,0 +1,30 @@
+docs/e2e.md
+  s_c2f954a86dc8c5::t_0d589d8ef7352b 114
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_875852efd4a99c 242-244,252-278
+  s_c2f954a86dc8c5::t_3356802c066686 279
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_ef58956d15d125 268-272,274-280,292-294
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_d919cdad14b322 58-63,68,70-72,87-101,140-142,149-181
+  s_c2f954a86dc8c5::t_61821f1e749c5b 182-183
+scripts/e2e-gateway.sh
+  s_c2f954a86dc8c5::t_cf7dfc039e68ea 221,230
+  s_c2f954a86dc8c5::t_90cc813c95bff8 258-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9883fb36d8bdab068d40743af50df6598c1a8847",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
