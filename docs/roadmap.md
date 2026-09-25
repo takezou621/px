@@ -268,9 +268,33 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     noted in the threat model. stdin/TTY relay is deliberately out: it
     needs a second channel or raw HTTP plumbing that no other verb uses —
     one-shot commands cover debugging (`px exec NAME -- sh -c 'ps aux'`).
+    Post-review hardening (double-agent review): exec dispatches through
+    `RunStreamsOnce` — sshexec's retry path must never re-run a one-shot
+    user command (a retry repeats side effects and splices the first
+    attempt's partial output into the result) — and re-verifies task state
+    plus hostname ownership right before dispatch, so a delete during the
+    body read cannot aim exec at a recycled CTID (residual race accepted,
+    threat model). Empty argv elements are legal; NUL bytes and trailing
+    JSON garbage are rejected.
 - [ ] Multi-node scheduling (PVE cluster, pick node by free resources)
 - [ ] `px suspend` / `px resume` (PVE snapshot / CT freeze)
 
 ## Explicitly deferred
 
 - Kubernetes backend, gRPC API, multi-cloud — see architecture doc non-goals.
+
+## Backlog
+
+Small items deferred from reviews; not scheduled.
+
+- sshexec accepts no `context.Context`: the HTTP handler's request
+  context does not propagate, so a client disconnect leaves exec running
+  up to the 2-minute cap. Thread ctx through the sshexec API (touches
+  every caller; also revisit whether `redial` should close a shared,
+  possibly-in-use client).
+- sshexec has no fake-server tests: dial/redial, the 2-minute timeout
+  path, and stdout/stderr stream separation are covered only by the
+  in-memory executor fake at the server layer, not against a real SSH
+  session.
+- Distinguish "pct exec itself failed" from "command exited non-zero"
+  in `Exec` results, so the CLI can say which layer failed.

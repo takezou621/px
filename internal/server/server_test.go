@@ -399,6 +399,9 @@ type execProv struct {
 	stderr   string
 	exitCode int
 	err      error
+	// noOwn/ownErr shape the Owned verdict (true, nil by default).
+	noOwn  bool
+	ownErr error
 }
 
 func (p *execProv) Exec(_ context.Context, _ int, argv []string) (*controller.ExecResult, error) {
@@ -409,6 +412,10 @@ func (p *execProv) Exec(_ context.Context, _ int, argv []string) (*controller.Ex
 		return nil, p.err
 	}
 	return &controller.ExecResult{Stdout: p.stdout, Stderr: p.stderr, ExitCode: p.exitCode}, nil
+}
+
+func (p *execProv) Owned(_ context.Context, _ string, _ int) (bool, error) {
+	return !p.noOwn, p.ownErr
 }
 
 func newExecServer(t *testing.T, prov *execProv) (*httptest.Server, *store.Store) {
@@ -551,11 +558,12 @@ func TestTaskExecRejectsBadRequests(t *testing.T) {
 	}{
 		{"no command", `{}`},
 		{"empty command", `{"command": []}`},
-		{"empty argument", `{"command": ["sh", ""]}`},
+		{"NUL byte in argument", `{"command": ["a` + `\u0000` + `b"]}`},
 		{"too many arguments", `{"command": [` + strings.TrimSuffix(strings.Repeat(`"a",`, 17), ",") + `]}`},
 		{"oversize argument", `{"command": ["` + strings.Repeat("x", 4<<10+1) + `"]}`},
 		{"malformed body", `{"command":`},
 		{"not a list", `{"command": "true"}`},
+		{"trailing garbage", `{"command": ["true"]} extra`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -571,6 +579,51 @@ func TestTaskExecRejectsBadRequests(t *testing.T) {
 	prov.mu.Unlock()
 	if reached {
 		t.Fatal("a rejected request must not reach the provisioner")
+	}
+}
+
+// Empty strings are legal argv ("printf '%s\n' ''") and must pass through
+// byte-exact — the quoting layer renders them as ''.
+func TestTaskExecAcceptsEmptyArguments(t *testing.T) {
+	prov := &execProv{}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	resp, body := postExec(t, srv, `{"command": ["printf", "%s", ""]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	prov.mu.Lock()
+	got := prov.argv
+	prov.mu.Unlock()
+	if diff := cmpArgs(got, []string{"printf", "%s", ""}); diff != "" {
+		t.Fatalf("argv mangled: %s", diff)
+	}
+}
+
+// Exec must not reach a container that no longer belongs to the task: a
+// racing delete (and PVE's CTID reuse) is caught by the hostname check.
+func TestTaskExecRefusesForeignContainer(t *testing.T) {
+	prov := &execProv{noOwn: true}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42)
+	resp, body := postExec(t, srv, `{"command": ["true"]}`)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409, got %d: %s", resp.StatusCode, body)
+	}
+	prov.mu.Lock()
+	reached := prov.argv != nil
+	prov.mu.Unlock()
+	if reached {
+		t.Fatal("an unowned container must not be exec'd into")
+	}
+
+	// An ownership probe failure (node unreachable) is a 502, not a guess.
+	prov2 := &execProv{ownErr: errors.New("pve down")}
+	srv2, st2 := newExecServer(t, prov2)
+	seedExecTask(t, st2, v1alpha1.TaskRunning, 42)
+	resp2, body := postExec(t, srv2, `{"command": ["true"]}`)
+	if resp2.StatusCode != http.StatusBadGateway {
+		t.Fatalf("want 502, got %d: %s", resp2.StatusCode, body)
 	}
 }
 

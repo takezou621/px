@@ -537,7 +537,11 @@ func (p *provisioner) Exec(ctx context.Context, vmid int, argv []string) (*ExecR
 	// max must be set explicitly: the zero value (0) would drop every byte.
 	stdout := &cappedWriter{max: maxExecStreamBytes}
 	stderr := &cappedWriter{max: maxExecStreamBytes}
-	code, err := p.ssh.RunStreams(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
+	// RunStreamsOnce, never a retrying path: a retry would re-run a command
+	// that may have already started (repeating its side effects) and splice
+	// the first attempt's partial output into the result. A failed exec is
+	// final — the user re-runs it.
+	code, err := p.ssh.RunStreamsOnce(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
 	if err != nil {
 		return nil, err
 	}

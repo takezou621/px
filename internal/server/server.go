@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/controller"
@@ -230,8 +231,16 @@ const (
 	execMaxCmdBytes = 32 << 10
 )
 
+// execReady reports whether the task state names a live sandbox exec can use.
+// Checked twice per request: once on entry, once just before dispatch — the
+// body read is a window in which the task can be deleted.
+func execReady(t *v1alpha1.Task) bool {
+	return t.Status.Phase == v1alpha1.TaskRunning && t.Status.Container != 0 && t.Status.DeletionTimestamp == nil
+}
+
 func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
-	t, err := s.store.GetTask(r.PathValue("name"))
+	name := r.PathValue("name")
+	t, err := s.store.GetTask(name)
 	if errors.Is(err, store.ErrNotFound) {
 		httpError(w, http.StatusNotFound, "task not found")
 		return
@@ -240,7 +249,7 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if t.Status.Phase != v1alpha1.TaskRunning || t.Status.Container == 0 || t.Status.DeletionTimestamp != nil {
+	if !execReady(t) {
 		httpError(w, http.StatusConflict, "task %s is not running (phase %s) — exec needs a live sandbox", t.Metadata.Name, t.Status.Phase)
 		return
 	}
@@ -261,6 +270,12 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "parse body: %v", err)
 		return
 	}
+	// Only one JSON value counts as well-formed here: trailing garbage after
+	// the object is a caller bug, not an ignored suffix.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		httpError(w, http.StatusBadRequest, "body must be a single JSON object")
+		return
+	}
 	if len(req.Command) == 0 {
 		httpError(w, http.StatusBadRequest, "command must be a non-empty list of arguments")
 		return
@@ -271,8 +286,11 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 	}
 	total := 0
 	for i, a := range req.Command {
-		if len(a) == 0 {
-			httpError(w, http.StatusBadRequest, "command argument %d is empty", i)
+		// Empty elements are legal argv ("printf '%s\n' ''"); a NUL byte is
+		// not — sshd hands the command to the shell as a C string, so it
+		// would truncate the request mid-line.
+		if strings.ContainsRune(a, '\x00') {
+			httpError(w, http.StatusBadRequest, "command argument %d contains a NUL byte", i)
 			return
 		}
 		if len(a) > execMaxArgBytes {
@@ -283,6 +301,33 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 	}
 	if total > execMaxCmdBytes {
 		httpError(w, http.StatusBadRequest, "command totals %d bytes, at most %d", total, execMaxCmdBytes)
+		return
+	}
+	// Re-read the task and verify the container still belongs to it right
+	// before dispatch: a delete (and PVE's later reuse of the CTID) during
+	// the body read must not send exec into someone else's sandbox. This
+	// narrows the race to milliseconds, same discipline as DestroyOwned —
+	// full serialization with deletion is not attempted (threat model).
+	t, err = s.store.GetTask(name)
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusConflict, "task %s was deleted while the request was in flight", name)
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if !execReady(t) {
+		httpError(w, http.StatusConflict, "task %s is not running (phase %s) — exec needs a live sandbox", t.Metadata.Name, t.Status.Phase)
+		return
+	}
+	owned, err := s.prov.Owned(r.Context(), name, t.Status.Container)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, "check ownership of ct %d: %v", t.Status.Container, err)
+		return
+	}
+	if !owned {
+		httpError(w, http.StatusConflict, "container %d no longer belongs to task %s — refusing to exec", t.Status.Container, name)
 		return
 	}
 	res, err := s.prov.Exec(r.Context(), t.Status.Container, req.Command)

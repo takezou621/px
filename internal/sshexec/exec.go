@@ -198,25 +198,26 @@ func (w *lockedWriter) String() string {
 
 // Run executes a command on the node, returning combined output and exit code.
 // A dead connection is re-dialed once before giving up; a remote command that
-// exits non-zero is not a connection failure and is not retried.
+// exits non-zero is not a connection failure and is not retried. Each attempt
+// starts from a fresh buffer: a retry means the previous attempt died
+// mid-flight, and its partial output must not splice into the final result.
 func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
 	var out lockedWriter
-	code, err := e.RunStreams(cmd, timeout, &out, &out)
+	code, err := e.RunStreamsOnce(cmd, timeout, &out, &out)
+	if err != nil && e.redial() {
+		out = lockedWriter{}
+		code, err = e.RunStreamsOnce(cmd, timeout, &out, &out)
+	}
 	return out.String(), code, err
 }
 
-// RunStreams is Run with stdout and stderr routed to separate writers (the
+// RunStreamsOnce is Run with stdout and stderr routed to separate writers (the
 // same single writer receives both streams interleaved when it is passed
-// twice), so a caller can keep the streams apart — `px exec` does.
-func (e *Executor) RunStreams(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
-	code, err := e.runStreamsOnce(cmd, timeout, stdout, stderr)
-	if err != nil && e.redial() {
-		code, err = e.runStreamsOnce(cmd, timeout, stdout, stderr)
-	}
-	return code, err
-}
-
-func (e *Executor) runStreamsOnce(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
+// twice), and it never retries: the caller running a one-shot user command
+// (`px exec`) must not have it executed a second time — a retry repeats side
+// effects and splices the first attempt's partial output into the result. A
+// failure here is final; the user re-runs the command.
+func (e *Executor) RunStreamsOnce(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
 	e.mu.Lock()
 	client := e.client
 	e.mu.Unlock()

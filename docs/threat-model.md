@@ -108,6 +108,17 @@ workspace state) is readable by an exec'd `cat`. That is already true
 of the runner itself, so the boundary stays: the token is the
 operator.
 
+One residual race is accepted rather than engineered away: between
+the request's entry and its dispatch, a delete (and PVE's later
+recycling of the CTID) could in principle aim exec at a container
+that no longer belongs to the task. exec therefore re-reads the task
+and re-verifies hostname ownership immediately before dispatch — the
+same discipline as `DestroyOwned` — which narrows the window to
+milliseconds. Serializing exec fully against deletion is not
+attempted; the small residual window stays, and closing it would
+require blocking deletes on in-flight execs for no attacker that the
+token does not already cover.
+
 ## Node SSH
 
 px-server holds **root SSH access to the PVE node** — the largest
