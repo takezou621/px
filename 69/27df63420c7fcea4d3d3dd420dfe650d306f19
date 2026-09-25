@@ -1,0 +1,61 @@
+internal/controller/controller.go
+  s_c2f954a86dc8c5::t_b63cf23ae48a15 212
+  s_c2f954a86dc8c5::t_f7e30320e6a7ef 229-247
+  s_c2f954a86dc8c5::t_7f49db9092e760 20-25,39,50
+  s_c2f954a86dc8c5::t_f660b6fd6351b8 183-187
+cmd/px/main.go
+  s_c2f954a86dc8c5::t_944b675070d5e0 89-90,92-125
+  s_c2f954a86dc8c5::t_3d03b852789752 142-144,149,154-168
+  s_c2f954a86dc8c5::t_42eebb0d842208 302,304
+internal/controller/controller_test.go
+  s_c2f954a86dc8c5::t_dcab2d3d189e2d 361-429
+  s_c2f954a86dc8c5::t_d9bfe8a57d9e41 18,25,36,42
+  s_c2f954a86dc8c5::t_28c1a554c3bab8 88,91-106
+internal/server/server_test.go
+  s_c2f954a86dc8c5::t_13d2aeba67bed1 19-25
+  s_c2f954a86dc8c5::t_6914630e179c5c 122-188
+internal/apis/v1alpha1/manifest.go
+  s_c2f954a86dc8c5::t_f3ef3da61c1706 89,94-97
+internal/apis/v1alpha1/manifest_test.go
+  s_c2f954a86dc8c5::t_47badd0b38a03a 73-113
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_d155be01fbfb02 77-81
+  s_c2f954a86dc8c5::t_e3c425297a44e9 160
+  s_c2f954a86dc8c5::t_10cc61b694ecdd 177-183
+  s_c2f954a86dc8c5::t_35489c0bf5fc78 109-116
+  s_c2f954a86dc8c5::t_c70283892afe71 90-91,98
+  s_c2f954a86dc8c5::t_87e3ef4cc2fff1 87-89,92-97
+  s_c2f954a86dc8c5::t_93820d8a006e32 54-62,67,76,84-86,99-108,117-118,125-126
+  s_c2f954a86dc8c5::t_8821fd6c2bba42 24-27
+internal/apis/v1alpha1/types.go
+  s_c2f954a86dc8c5::t_039dd802a5cabb 37-38,40-42
+internal/store/store.go
+  s_c2f954a86dc8c5::t_21b45b4f1c5bb8 161-183,193
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_05caed543d517f 28-38
+internal/server/server.go
+  s_c2f954a86dc8c5::t_e07074ab250737 38-39
+  s_c2f954a86dc8c5::t_612bd0d38217b7 161-185
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_9599452a634b92 92
+  s_c2f954a86dc8c5::t_b7f9c32ee54c12 25,56-64,68-73,75-76,78,88-91,93-95
+  s_c2f954a86dc8c5::t_c0ff404c3b71f4 43-46
+  s_c2f954a86dc8c5::t_236136bc92302b 65-67,74,77,79-87
+  s_c2f954a86dc8c5::t_83741964183ffe 96-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6927df63420c7fcea4d3d3dd420dfe650d306f19",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
