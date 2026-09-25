@@ -9,7 +9,7 @@
 # (/run/px/{goal,cmd.sh,task.log,exit} created at runtime by the controller).
 set -euo pipefail
 
-CTID="${1:?usage: build.sh <CTID> [bridge] [storage]}"
+CTID="${1:?usage: build.sh <CTID> [bridge] [storage] [tpl-storage]}"
 BRIDGE="${2:-vmbr0}"
 STORAGE="${3:-local-lvm}"
 TPL_STORAGE="${4:-local}"
@@ -20,7 +20,6 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-echo "==> downloading Debian 12 image (once)"
 pveam update >/dev/null
 IMAGE="$(pveam available --section system | awk '/debian-12-standard/ {print $2; exit}')"
 [[ -n "$IMAGE" ]] || { echo "no debian-12 image found" >&2; exit 1; }
@@ -28,7 +27,8 @@ IMAGE="$(pveam available --section system | awk '/debian-12-standard/ {print $2;
 # local-lvm reject them, so images land on TPL_STORAGE (default: local).
 # pct create must then reference the volume from that same storage — using
 # STORAGE here makes PVE parse the filename as an lvm volume name.
-if ! pvesm list "$TPL_STORAGE" --content vztmpl 2>/dev/null | grep -q "$IMAGE"; then
+if ! pvesm list "$TPL_STORAGE" --content vztmpl 2>/dev/null | grep -qF "$IMAGE"; then
+  echo "==> downloading Debian 12 image"
   pveam download "$TPL_STORAGE" "$IMAGE"
 else
   echo "==> $IMAGE already on $TPL_STORAGE, skipping download"
