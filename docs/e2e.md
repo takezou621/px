@@ -39,10 +39,16 @@ export PX_PVE_ENDPOINT="https://<PVE_HOST>:8006"
 export PX_PVE_NODE="<NODE_NAME>"
 export PX_PVE_TOKEN="root@pam!px=<SECRET>"    # or your user@realm!tokenid
 
-go run ./cmd/px-server
+go run ./cmd/px-server -tls-insecure
 # flags: -listen 127.0.0.1:7420 -db px.db -pve-endpoint ... -pve-node ...
-#        -pve-token ... -ssh-user root -ssh-key <path> -reconcile-interval 2s
+#        -pve-token ... -tls-insecure -ssh-user root -ssh-key <path>
+#        -reconcile-interval 2s
 ```
+
+A stock PVE node presents a self-signed cert (`pve-ssl`); unless you
+imported the PVE root CA into the machine running px-server, pass
+`-tls-insecure` (or `PX_PVE_TLS_INSECURE=1`) — the same trade-off as
+kubectl's `--insecure-skip-tls-verify`.
 
 On startup px-server dials the PVE API and the node SSH once and fails
 fast if either is unreachable; it then serves the (unauthenticated,

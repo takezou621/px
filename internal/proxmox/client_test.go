@@ -64,8 +64,29 @@ func newMockPVE(t *testing.T) (*Client, *mockPVE) {
 
 	srv := httptest.NewServer(m.mux)
 	t.Cleanup(srv.Close)
-	c := New(srv.URL, "n1", "root@pam!px=fake")
+	c := New(srv.URL, "n1", "root@pam!px=fake", false)
 	return c, m
+}
+
+func TestSkipTLSVerify(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"data": "104"}`))
+	}))
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	trusting := New(srv.URL, "n1", "root@pam!px=fake", true)
+	if id, err := trusting.NextID(ctx); err != nil {
+		t.Fatalf("NextID with skipTLSVerify: %v", err)
+	} else if id != 104 {
+		t.Fatalf("want id 104, got %d", id)
+	}
+
+	verifying := New(srv.URL, "n1", "root@pam!px=fake", false)
+	if _, err := verifying.NextID(ctx); err == nil {
+		t.Fatal("expected certificate verification to fail when skipTLSVerify is off")
+	}
 }
 
 func TestCloneStartFlow(t *testing.T) {
@@ -136,7 +157,7 @@ func TestAuthHeader(t *testing.T) {
 		w.Write([]byte(`{"data": "142"}`))
 	}))
 	defer srv.Close()
-	c := New(srv.URL, "n1", "root@pam!px=SECRET")
+	c := New(srv.URL, "n1", "root@pam!px=SECRET", false)
 	_, _ = c.NextID(context.Background())
 	if got != "PVEAPIToken=root@pam!px=SECRET" {
 		t.Fatalf("auth header = %q", got)

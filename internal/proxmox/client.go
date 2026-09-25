@@ -23,12 +23,19 @@ type Client struct {
 	http     *http.Client
 }
 
-func New(endpoint, node, token string) *Client {
+func New(endpoint, node, token string, skipTLSVerify bool) *Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if skipTLSVerify {
+		// PVE installs a self-signed node cert (pve-ssl) by default; homelab
+		// deployments opt into skipping verification via px-server's
+		// -tls-insecure flag.
+		tr.TLSClientConfig.InsecureSkipVerify = true
+	}
 	return &Client{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		node:     node,
 		token:    token,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		http:     &http.Client{Timeout: 30 * time.Second, Transport: tr},
 	}
 }
 

@@ -28,6 +28,7 @@ func main() {
 		pveEndpoint = flag.String("pve-endpoint", os.Getenv("PX_PVE_ENDPOINT"), "Proxmox VE API endpoint (https://host:8006)")
 		pveNode     = flag.String("pve-node", os.Getenv("PX_PVE_NODE"), "Proxmox VE node name")
 		pveToken    = flag.String("pve-token", os.Getenv("PX_PVE_TOKEN"), "PVE API token: user@realm!tokenid=secret")
+		tlsInsecure = flag.Bool("tls-insecure", os.Getenv("PX_PVE_TLS_INSECURE") == "1", "skip TLS verification of the PVE endpoint (for PVE's default self-signed node cert)")
 		sshUser     = flag.String("ssh-user", "root", "SSH user on the PVE node")
 		sshKey      = flag.String("ssh-key", "", "SSH private key path (defaults to ssh-agent)")
 		interval    = flag.Duration("reconcile-interval", 2*time.Second, "controller reconcile interval")
@@ -47,7 +48,7 @@ func main() {
 	}
 	defer st.Close()
 
-	pve := proxmox.New(*pveEndpoint, *pveNode, *pveToken)
+	pve := proxmox.New(*pveEndpoint, *pveNode, *pveToken, *tlsInsecure)
 	ssh, err := sshexec.Dial(10*time.Second, sshexec.Config{Host: hostOf(*pveEndpoint), User: *sshUser, KeyPath: *sshKey})
 	if err != nil {
 		// Fail fast: without node SSH access the provisioner cannot boot
