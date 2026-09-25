@@ -16,13 +16,13 @@ import (
 
 type nopProv struct{}
 
-func (nopProv) Allocate(_ context.Context) (int, error)                 { return 0, nil }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int) error { return nil }
-func (nopProv) Booted(_ context.Context, _ int) (bool, error)           { return false, nil }
-func (nopProv) Exit(_ context.Context, _ int) (*int, error)             { return nil, nil }
-func (nopProv) Running(_ context.Context, _ int) (bool, error)          { return true, nil }
-func (nopProv) Logs(_ context.Context, _ int) (string, error)           { return "", nil }
-func (nopProv) Destroy(_ context.Context, _ int) error                  { return nil }
+func (nopProv) Allocate(_ context.Context) (int, error)                                     { return 0, nil }
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace) error { return nil }
+func (nopProv) Booted(_ context.Context, _ int) (bool, error)                               { return false, nil }
+func (nopProv) Exit(_ context.Context, _ int) (*int, error)                                 { return nil, nil }
+func (nopProv) Running(_ context.Context, _ int) (bool, error)                              { return true, nil }
+func (nopProv) Logs(_ context.Context, _ int) (string, error)                               { return "", nil }
+func (nopProv) Destroy(_ context.Context, _ int) error                                      { return nil }
 
 const manifest = `
 apiVersion: px.io/v1alpha1
@@ -116,6 +116,73 @@ func TestGetUnknown(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+}
+
+const workspaceManifest = `
+apiVersion: px.io/v1alpha1
+kind: Workspace
+metadata:
+  name: demo
+spec:
+  git:
+    repo: https://example.com/demo.git
+    branch: main
+`
+
+func TestWorkspaces(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	resp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(workspaceManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("apply: want 201, got %d: %s", resp.StatusCode, body)
+	}
+
+	// List shows the workspace.
+	listResp, err := http.Get(srv.URL + "/v1/workspaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listData, _ := io.ReadAll(listResp.Body)
+	listResp.Body.Close()
+	if listResp.StatusCode != 200 || !strings.Contains(string(listData), `"name": "demo"`) {
+		t.Fatalf("list: want 200 with demo, got %d: %s", listResp.StatusCode, listData)
+	}
+
+	// Get returns the spec.
+	getResp, err := http.Get(srv.URL + "/v1/workspaces/demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getData, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if getResp.StatusCode != 200 || !strings.Contains(string(getData), "https://example.com/demo.git") {
+		t.Fatalf("get: want repo in body, got %d: %s", getResp.StatusCode, getData)
+	}
+
+	// Re-apply upserts (no conflict, unlike Task).
+	resp2, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(workspaceManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("re-apply: want 201, got %d", resp2.StatusCode)
+	}
+
+	// Unknown workspace is a 404.
+	resp3, err := http.Get(srv.URL + "/v1/workspaces/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp3.StatusCode)
 	}
 }
 

@@ -86,10 +86,15 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			}
 		}
 		var goalBytes int
+		seenWS := map[string]bool{}
 		for i, ws := range s.Workspaces {
 			if ws.Name == "" {
 				return nil, fmt.Errorf("task %q: workspaces[%d].name is required", m.Metadata.Name, i)
 			}
+			if seenWS[ws.Name] {
+				return nil, fmt.Errorf("task %q: workspaces[%d].name %q is duplicated", m.Metadata.Name, i, ws.Name)
+			}
+			seenWS[ws.Name] = true
 			goalBytes += len(ws.Goal)
 		}
 		if goalBytes > MaxGoalBytes {

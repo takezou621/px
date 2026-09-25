@@ -25,6 +25,17 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 ## M2 — Workspaces & lifecycle polish
 
 - [ ] Workspace kind: git clone into the container before runner exec
+  - Design: `task.spec.workspaces[].name` references a Workspace resource
+    (`spec.git.repo`, optional `spec.git.branch`). The controller resolves
+    the references at provision time — an unknown name is a ProvisionFailed
+    reason like any other provision error. The boot script clones each repo
+    (depth 1) into `/workspace/<name>` before spawning the runner, so a
+    clone failure dies before the `booted` marker and rides the existing
+    provision-failure path (partial clone destroyed, no orphans). A
+    Workspace is declarative config, not a reconciled object: apply upserts
+    it, there is no status. Public repos only in M2 — credentials belong to
+    Model (M3). Server: GET /v1/workspaces and /v1/workspaces/{name}; CLI:
+    `px get workspaces`, `px describe workspace NAME`.
 - [ ] API token auth (px-server is unauthenticated today; loopback-only by default)
 - [ ] `px watch` (phase transition streaming)
 

@@ -17,6 +17,12 @@ type TaskReader interface {
 	ListTasks() ([]*v1alpha1.Task, error)
 }
 
+// WorkspaceReader resolves task workspace references against stored
+// Workspace resources.
+type WorkspaceReader interface {
+	GetWorkspace(name string) (*v1alpha1.Workspace, error)
+}
+
 // TaskWriter lets the controller persist status changes. UpsertTask
 // implementations must preserve an already-persisted DeletionTimestamp: the
 // controller works on stale snapshots, and a status write must never erase a
@@ -30,6 +36,7 @@ type TaskWriter interface {
 type Controller struct {
 	store interface {
 		TaskReader
+		WorkspaceReader
 		TaskWriter
 	}
 	prov Provisioner
@@ -40,6 +47,7 @@ type Controller struct {
 
 func New(store interface {
 	TaskReader
+	WorkspaceReader
 	TaskWriter
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
@@ -172,6 +180,11 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	if ctx.Err() != nil {
 		return
 	}
+	mounts, err := c.resolveWorkspaces(t)
+	if err != nil {
+		c.failProvision(t, err)
+		return
+	}
 	t.Status.Phase = v1alpha1.TaskProvisioning
 	t.Status.Reason = "cloning template and starting container"
 	c.persist(t)
@@ -196,7 +209,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
-	if err := c.prov.Create(ctx, t, vmid); err != nil {
+	if err := c.prov.Create(ctx, t, vmid, mounts); err != nil {
 		// Create cleans up its own partial work, so the VMID no longer names
 		// a container of ours. Clear it: a later destroy must never target an
 		// id that Create may have lost to another owner (PVE's nextid is a
@@ -211,6 +224,25 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Reason = ""
 	c.log.Info("task running", "task", t.Metadata.Name, "vmid", vmid)
 	c.persist(t)
+}
+
+// resolveWorkspaces resolves the task's workspace references against the
+// store, before any container work: a reference to a missing Workspace is a
+// provision failure, not a container that boots and fails later.
+func (c *Controller) resolveWorkspaces(t *v1alpha1.Task) ([]ResolvedWorkspace, error) {
+	var mounts []ResolvedWorkspace
+	for _, ws := range t.Spec.Workspaces {
+		w, err := c.store.GetWorkspace(ws.Name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve workspace %q: %w", ws.Name, err)
+		}
+		mounts = append(mounts, ResolvedWorkspace{
+			Name:   ws.Name,
+			Repo:   w.Spec.Git.Repo,
+			Branch: w.Spec.Git.Branch,
+		})
+	}
+	return mounts, nil
 }
 
 func (c *Controller) failProvision(t *v1alpha1.Task, err error) {

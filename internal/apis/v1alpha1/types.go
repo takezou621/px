@@ -34,9 +34,12 @@ type TaskSpec struct {
 }
 
 type TaskWorkspace struct {
+	// Name references a Workspace resource: the controller clones its git
+	// repo into /workspace/<name> before the runner starts.
 	Name string `json:"name" yaml:"name"`
-	// Goal is the instruction passed to the runner for this workspace.
-	Goal string `json:"goal" yaml:"goal"`
+	// Goal is the optional instruction passed to the runner for this
+	// workspace.
+	Goal string `json:"goal,omitempty" yaml:"goal,omitempty"`
 }
 
 type RunnerSpec struct {

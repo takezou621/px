@@ -35,6 +35,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/tasks/{name}", s.handleGetTask)
 	mux.HandleFunc("DELETE /v1/tasks/{name}", s.handleDeleteTask)
 	mux.HandleFunc("GET /v1/tasks/{name}/logs", s.handleTaskLogs)
+	mux.HandleFunc("GET /v1/workspaces", s.handleListWorkspaces)
+	mux.HandleFunc("GET /v1/workspaces/{name}", s.handleGetWorkspace)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -154,6 +156,31 @@ func (s *Server) handleTaskLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte(logs))
+}
+
+func (s *Server) handleListWorkspaces(w http.ResponseWriter, _ *http.Request) {
+	wss, err := s.store.ListWorkspaces()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if wss == nil {
+		wss = []*v1alpha1.Workspace{}
+	}
+	writeJSON(w, http.StatusOK, wss)
+}
+
+func (s *Server) handleGetWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, err := s.store.GetWorkspace(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ws)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

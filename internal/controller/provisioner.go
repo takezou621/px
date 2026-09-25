@@ -21,9 +21,10 @@ type Provisioner interface {
 	// failed Create.
 	Allocate(ctx context.Context) (int, error)
 	// Create clones the template into vmid, starts the container and boots
-	// the runner. On failure it destroys any partial work, so the vmid no
-	// longer names a container of ours.
-	Create(ctx context.Context, t *v1alpha1.Task, vmid int) error
+	// the runner. mounts are workspace repos cloned into the container before
+	// the runner starts. On failure it destroys any partial work, so the vmid
+	// no longer names a container of ours.
+	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error
 	// Booted reports whether the container's boot script reached the runner
 	// spawn step and touched its marker (/run/px/booted) — see runnerScript
 	// for why the marker sits after the spawn. A provision interrupted by a
@@ -50,11 +51,20 @@ func NewProvisioner(pve *proxmox.Client, ssh *sshexec.Executor) Provisioner {
 	return &provisioner{pve: pve, ssh: ssh}
 }
 
+// ResolvedWorkspace is a task workspace reference resolved against the
+// store: the repo the boot script clones into /workspace/<name> before the
+// runner starts.
+type ResolvedWorkspace struct {
+	Name   string
+	Repo   string
+	Branch string
+}
+
 // runnerScript builds the container-side boot script.
 // Everything user-controlled is embedded base64-encoded, so no quoting
 // pitfalls; the runner's output goes to /run/px/task.log, its exit code
 // to /run/px/exit.
-func runnerScript(t *v1alpha1.Task) string {
+func runnerScript(t *v1alpha1.Task, mounts []ResolvedWorkspace) string {
 	goal := ""
 	for i, ws := range t.Spec.Workspaces {
 		if i > 0 {
@@ -63,20 +73,57 @@ func runnerScript(t *v1alpha1.Task) string {
 		goal += fmt.Sprintf("## %s\n%s", ws.Name, ws.Goal)
 	}
 	cmd := quoteCommand(t.Spec.Runner.Command)
-	return fmt.Sprintf(`#!/bin/sh
-mkdir -p /run/px
+	var s strings.Builder
+	s.WriteString("#!/bin/sh\nmkdir -p /run/px")
+	if len(mounts) > 0 {
+		s.WriteString("\nmkdir -p /workspace")
+	}
+	fmt.Fprintf(&s, `
 printf '%%s' '%s' | base64 -d > /run/px/goal
 printf '%%s' '%s' | base64 -d > /run/px/cmd.sh
-nohup sh -c 'sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
+`,
+		base64.StdEncoding.EncodeToString([]byte(goal)),
+		base64.StdEncoding.EncodeToString([]byte(cmd)))
+	// The container was started seconds ago and DHCP may not have handed out
+	// a lease yet, so the first clone would die on DNS. Wait (max 20s) for a
+	// default route before any clone.
+	if len(mounts) > 0 {
+		s.WriteString(`i=0
+while [ $i -lt 20 ]; do
+  ip route 2>/dev/null | grep -q default && grep -q nameserver /etc/resolv.conf 2>/dev/null && break
+  i=$((i+1))
+  sleep 1
+done
+`)
+	}
+	for i, ws := range mounts {
+		fmt.Fprintf(&s, "printf '%%s' '%s' | base64 -d > /run/px/ws%d.repo\n",
+			base64.StdEncoding.EncodeToString([]byte(ws.Repo)), i)
+		branchFlag := ""
+		if ws.Branch != "" {
+			fmt.Fprintf(&s, "printf '%%s' '%s' | base64 -d > /run/px/ws%d.branch\n",
+				base64.StdEncoding.EncodeToString([]byte(ws.Branch)), i)
+			branchFlag = fmt.Sprintf("--branch \"$(cat /run/px/ws%d.branch)\" ", i)
+		}
+		// ws.Name is DNS-1123-validated, safe as a path segment and inside a
+		// single-quoted echo. The boot runs right after container start, when
+		// DHCP may not have handed out a lease yet, so wait for the default
+		// route (max 20s) and retry the clone once before failing. A failed
+		// clone exits before the runner spawns, so PX_BOOT_OK is never
+		// printed and Create cleans up the container.
+		fmt.Fprintf(&s, `clone_ws%d() { git clone --depth 1 %s"$(cat /run/px/ws%d.repo)" /workspace/%s; }
+clone_ws%d || { sleep 2; clone_ws%d; } || { echo 'px: git clone %s failed' >&2; exit 1; }
+`, i, branchFlag, i, ws.Name, i, i, ws.Name)
+	}
+	s.WriteString(`nohup sh -c 'sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
 # marker for Booted(), touched only after the runner is spawned so that a
 # present marker proves the runner process exists — a restart mid-boot can
 # then tell a live runner from a partial clone whose boot died with the SSH
 # session.
 touch /run/px/booted
 echo PX_BOOT_OK
-`,
-		base64.StdEncoding.EncodeToString([]byte(goal)),
-		base64.StdEncoding.EncodeToString([]byte(cmd)))
+`)
+	return s.String()
 }
 
 // bootCommand wraps the boot script so it lands inside the container via
@@ -110,7 +157,7 @@ func (p *provisioner) Allocate(ctx context.Context) (int, error) {
 	return p.pve.NextID(ctx)
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int) error {
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error {
 	templateVMID, err := p.pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
 		return fmt.Errorf("find template: %w", err)
@@ -127,7 +174,13 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int) er
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return fmt.Errorf("start: %w", err)
 	}
-	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t)), 60*time.Second)
+	bootTimeout := 60 * time.Second
+	if len(mounts) > 0 {
+		// The DHCP wait (max 20s) and one retried clone per workspace ride on
+		// top of the plain boot.
+		bootTimeout = 180 * time.Second
+	}
+	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts)), bootTimeout)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)

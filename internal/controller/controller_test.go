@@ -15,13 +15,14 @@ import (
 type fakeProv struct {
 	mu          sync.Mutex
 	allocateErr error
-	createErr   error
+	createErr   error        // returned by Create as a provision failure
 	exitErr     error        // returned by Exit as a probe failure
 	destroyErr  error        // returned by Destroy until cleared
 	exits       map[int]int  // vmid -> exit code; missing = still running
 	dead        map[int]bool // vmids whose container is not running
 	booted      map[int]bool // vmids whose container reached the runner launch
 	created     []int
+	mounts      []ResolvedWorkspace // mounts passed to the last Create
 	destroyed   []int
 }
 
@@ -32,12 +33,13 @@ func (f *fakeProv) Allocate(_ context.Context) (int, error) {
 	return 100 + len(f.created), nil
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int) error {
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
 	f.mu.Lock()
 	f.created = append(f.created, vmid)
+	f.mounts = mounts
 	f.mu.Unlock()
 	return nil
 }
@@ -83,9 +85,25 @@ type memStore struct {
 	mu          sync.Mutex
 	failUpserts int // fail the next N UpsertTask calls, then succeed
 	tasks       map[string]*v1alpha1.Task
+	workspaces  map[string]*v1alpha1.Workspace
 }
 
-func newMemStore() *memStore { return &memStore{tasks: map[string]*v1alpha1.Task{}} }
+func newMemStore() *memStore {
+	return &memStore{
+		tasks:      map[string]*v1alpha1.Task{},
+		workspaces: map[string]*v1alpha1.Workspace{},
+	}
+}
+
+func (m *memStore) GetWorkspace(name string) (*v1alpha1.Workspace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ws, ok := m.workspaces[name]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return ws, nil
+}
 
 func (m *memStore) ListTasks() ([]*v1alpha1.Task, error) {
 	m.mu.Lock()
@@ -337,6 +355,75 @@ func TestRequestDestroyUnknownTask(t *testing.T) {
 	ctl := New(st, prov, slog.New(slog.DiscardHandler))
 	if err := ctl.RequestDestroy("nope"); err == nil {
 		t.Fatal("want error for unknown task")
+	}
+}
+
+// Task workspace references resolve against stored Workspaces, and the
+// resolved repos ride into Create as mounts.
+func TestWorkspacesResolvedIntoCreate(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	st.workspaces["repo-a"] = &v1alpha1.Workspace{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindWorkspace,
+		Metadata:   v1alpha1.ObjectMeta{Name: "repo-a"},
+		Spec:       v1alpha1.WorkspaceSpec{Git: v1alpha1.GitSpec{Repo: "https://example.com/a.git", Branch: "main"}},
+	}
+	st.workspaces["repo-b"] = &v1alpha1.Workspace{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindWorkspace,
+		Metadata:   v1alpha1.ObjectMeta{Name: "repo-b"},
+		Spec:       v1alpha1.WorkspaceSpec{Git: v1alpha1.GitSpec{Repo: "https://example.com/b.git"}},
+	}
+	task := testTask(0)
+	task.Spec.Workspaces = []v1alpha1.TaskWorkspace{
+		{Name: "repo-a", Goal: "work on a"},
+		{Name: "repo-b"},
+	}
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	mounts := prov.mounts
+	prov.mu.Unlock()
+	want := []ResolvedWorkspace{
+		{Name: "repo-a", Repo: "https://example.com/a.git", Branch: "main"},
+		{Name: "repo-b", Repo: "https://example.com/b.git"},
+	}
+	if len(mounts) != len(want) {
+		t.Fatalf("want mounts %v, got %v", want, mounts)
+	}
+	for i := range want {
+		if mounts[i] != want[i] {
+			t.Errorf("mounts[%d] = %v, want %v", i, mounts[i], want[i])
+		}
+	}
+}
+
+// A reference to a Workspace that was never applied fails the provision
+// before any container work starts.
+func TestUnknownWorkspaceFailsProvision(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Spec.Workspaces = []v1alpha1.TaskWorkspace{{Name: "missing"}}
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run for an unresolved workspace, created %v", prov.created)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container 0, got %d", task.Status.Container)
+	}
+	if task.Status.Reason == "" {
+		t.Fatal("Reason should name the missing workspace")
 	}
 }
 

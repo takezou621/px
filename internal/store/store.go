@@ -158,6 +158,29 @@ func (s *Store) UpsertWorkspace(w *v1alpha1.Workspace) error {
 
 func (s *Store) GetWorkspace(name string) (*v1alpha1.Workspace, error) {
 	row := s.db.QueryRow(`SELECT name, spec FROM workspaces WHERE name = ?`, name)
+	return scanWorkspace(row)
+}
+
+func (s *Store) ListWorkspaces() ([]*v1alpha1.Workspace, error) {
+	rows, err := s.db.Query(`SELECT name, spec FROM workspaces ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var wss []*v1alpha1.Workspace
+	for rows.Next() {
+		w, err := scanWorkspace(rows)
+		if err != nil {
+			return nil, err
+		}
+		wss = append(wss, w)
+	}
+	return wss, rows.Err()
+}
+
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanWorkspace(row rowScanner) (*v1alpha1.Workspace, error) {
 	w := &v1alpha1.Workspace{APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindWorkspace}
 	var spec string
 	if err := row.Scan(&w.Metadata.Name, &spec); err != nil {
@@ -167,12 +190,10 @@ func (s *Store) GetWorkspace(name string) (*v1alpha1.Workspace, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(spec), &w.Spec); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("workspace %s spec: %w", w.Metadata.Name, err)
 	}
 	return w, nil
 }
-
-type rowScanner interface{ Scan(dest ...any) error }
 
 func scanTask(row rowScanner) (*v1alpha1.Task, error) {
 	t := &v1alpha1.Task{APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindTask}

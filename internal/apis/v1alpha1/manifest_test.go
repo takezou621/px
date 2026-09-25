@@ -70,6 +70,47 @@ func TestParseManifestsEmptyDocs(t *testing.T) {
 	}
 }
 
+func TestParseRejectsDuplicateWorkspaceRef(t *testing.T) {
+	in := `apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: t1
+spec:
+  image: tmpl
+  workspaces:
+    - name: demo
+      goal: one
+    - name: demo
+      goal: two
+  runner:
+    command: ["true"]
+`
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for duplicated workspace name")
+	}
+}
+
+func TestParseAcceptsWorkspaceRefWithoutGoal(t *testing.T) {
+	in := `apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: t1
+spec:
+  image: tmpl
+  workspaces:
+    - name: demo
+  runner:
+    command: ["true"]
+`
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Task.Workspaces[0].Goal != "" {
+		t.Errorf("goal should be optional, got %q", objs[0].Task.Workspaces[0].Goal)
+	}
+}
+
 func TestParseRejectsUnknownKind(t *testing.T) {
 	in := "apiVersion: px.io/v1alpha1\nkind: Pod\nmetadata:\n  name: x\n"
 	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
