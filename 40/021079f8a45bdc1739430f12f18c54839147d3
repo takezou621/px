@@ -1,0 +1,45 @@
+docs/roadmap.md
+  s_c2f954a86dc8c5::t_5fd855b0a28080 226-233
+  s_c2f954a86dc8c5::t_9970a813bde185 224-225,234-239,245-246
+  s_c2f954a86dc8c5::t_c6f07d175cecbe 242-244
+internal/store/store_test.go
+  s_c2f954a86dc8c5::t_82efbbe81e2288 35-70
+  s_c2f954a86dc8c5::t_601813e9770832 5
+docs/threat-model.md
+  s_c2f954a86dc8c5::t_6ae369ba1cb9ba 32-38
+  s_c2f954a86dc8c5::t_4bcf6fd7defda3 73-75,80-85
+  s_c2f954a86dc8c5::t_5bca5eb2bdd82d 1-31,39-72,76-79,86-101,106-108,118-133
+  s_c2f954a86dc8c5::t_fdd17888f70610 109-117
+  s_c2f954a86dc8c5::t_89c33fd6a8c1ca 102-105
+internal/store/store.go
+  s_c2f954a86dc8c5::t_752b8c0dc7b24f 68-76
+  s_c2f954a86dc8c5::t_7250db7b0a18ad 9
+docs/architecture.md
+  s_c2f954a86dc8c5::t_1227b65caefbd2 83
+  s_c2f954a86dc8c5::t_25350b5b549ff8 82,84-85
+internal/controller/provisioner.go
+  s_c2f954a86dc8c5::t_664ae2e80ec6d3 249-262
+internal/proxmox/client.go
+  s_c2f954a86dc8c5::t_1451993e5eb3a5 229-241
+  s_c2f954a86dc8c5::t_9406bd189a35bc 242-243
+internal/controller/provisioner_test.go
+  s_c2f954a86dc8c5::t_e5eb7b0f383317 209
+  s_c2f954a86dc8c5::t_038946ea15c7a3 310,312-314,327-329
+  s_c2f954a86dc8c5::t_333231bd1cc7cb 296-309,311,315-326,330-332
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "40021079f8a45bdc1739430f12f18c54839147d3",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
