@@ -1,0 +1,26 @@
+scripts/e2e-smoke.sh
+  s_c2f954a86dc8c5::t_355eedd98b3452 1-15,19-27,29,31-57,59,67,69-70,72-86,88-106,108-112,114-131,133-147,149-162,164-177,179-181,183-188
+  s_c2f954a86dc8c5::t_8f111599328c34 87,113,132,148,163,178,182
+  s_c2f954a86dc8c5::t_0e86289b9148e7 58,60-66,68
+  s_c2f954a86dc8c5::t_569b190525f2e5 16-18,28,30
+  s_c2f954a86dc8c5::t_da7fa92788fb4b 107
+  s_c2f954a86dc8c5::t_58e49c429187a9 71
+docs/e2e.md
+  s_c2f954a86dc8c5::t_9dc1b7211370ed 1-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "81eeb0a8120e7b121688bfbfb2d26b5313275f5e",
+  "prompts": {},
+  "sessions": {
+    "s_c2f954a86dc8c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2447dca9-51e9-45b8-8c09-05a30d443677",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
