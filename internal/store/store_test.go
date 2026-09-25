@@ -216,3 +216,58 @@ func TestNonTxPathStillWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func testModel(name string) *v1alpha1.Model {
+	return &v1alpha1.Model{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindModel,
+		Metadata:   v1alpha1.ObjectMeta{Name: name},
+		Spec:       v1alpha1.ModelSpec{Provider: v1alpha1.ProviderAnthropic, APIKey: "sk-x"},
+	}
+}
+
+func TestModelLifecycle(t *testing.T) {
+	st := openTestStore(t)
+
+	if _, err := st.GetModel("m1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound before upsert, got %v", err)
+	}
+	if err := st.UpsertModel(testModel("m1")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetModel("m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Provider != v1alpha1.ProviderAnthropic || got.Spec.APIKey != "sk-x" {
+		t.Fatalf("spec not persisted: %+v", got.Spec)
+	}
+	if got.Kind != v1alpha1.KindModel {
+		t.Fatalf("Kind = %q", got.Kind)
+	}
+
+	// Upsert replaces the spec.
+	updated := testModel("m1")
+	updated.Spec = v1alpha1.ModelSpec{Provider: v1alpha1.ProviderOpenAI, APIKey: "sk-oai", BaseURL: "https://p.example.com"}
+	if err := st.UpsertModel(updated); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetModel("m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Provider != v1alpha1.ProviderOpenAI || got.Spec.APIKey != "sk-oai" {
+		t.Fatalf("upsert did not replace spec: %+v", got.Spec)
+	}
+
+	if _, err := st.ListModels(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.DeleteModel("m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteModel("m1"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}

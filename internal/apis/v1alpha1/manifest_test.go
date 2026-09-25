@@ -243,3 +243,114 @@ func TestParseRejectsOversizedBranch(t *testing.T) {
 		t.Fatal("want error for branch over MaxBranchBytes")
 	}
 }
+
+func modelManifestWith(spec string) string {
+	return "apiVersion: px.io/v1alpha1\nkind: Model\nmetadata:\n  name: m\nspec:\n" + spec
+}
+
+func TestParseModel(t *testing.T) {
+	in := modelManifestWith("  provider: anthropic\n  apiKey: sk-test\n  baseUrl: https://proxy.example.com/v1\n")
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m := objs[0]
+	if m.Kind != KindModel || m.Model == nil {
+		t.Fatalf("want Model, got kind=%s manifest=%+v", m.Kind, m)
+	}
+	if m.Model.Provider != ProviderAnthropic || m.Model.APIKey != "sk-test" || m.Model.BaseURL != "https://proxy.example.com/v1" {
+		t.Errorf("model spec = %+v", m.Model)
+	}
+}
+
+func TestParseModelBaseUrlOptional(t *testing.T) {
+	in := modelManifestWith("  provider: openai\n  apiKey: sk-oai\n")
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Model.Provider != ProviderOpenAI || objs[0].Model.BaseURL != "" {
+		t.Errorf("model spec = %+v", objs[0].Model)
+	}
+}
+
+func TestParseRejectsUnknownProvider(t *testing.T) {
+	in := modelManifestWith("  provider: mistral\n  apiKey: sk-x\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for provider outside the closed set")
+	}
+}
+
+func TestParseRejectsMissingAPIKey(t *testing.T) {
+	in := modelManifestWith("  provider: anthropic\n")
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for missing spec.apiKey")
+	}
+}
+
+func TestParseRejectsOversizedAPIKey(t *testing.T) {
+	in := modelManifestWith(fmt.Sprintf("  provider: anthropic\n  apiKey: %q\n", strings.Repeat("k", MaxAPIKeyBytes+1)))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for apiKey over MaxAPIKeyBytes")
+	}
+}
+
+func TestParseRejectsOversizedBaseURL(t *testing.T) {
+	in := modelManifestWith(fmt.Sprintf("  provider: anthropic\n  apiKey: sk\n  baseUrl: %q\n", strings.Repeat("u", MaxBaseURLBytes+1)))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error for baseUrl over MaxBaseURLBytes")
+	}
+}
+
+// GET output carries the placeholder, and Model apply upserts — so a
+// round-tripped dump must be rejected, or it would silently replace the
+// real key with the placeholder and the next provision would fail obscurely.
+func TestParseRejectsRedactedPlaceholder(t *testing.T) {
+	in := modelManifestWith(fmt.Sprintf("  provider: anthropic\n  apiKey: %q\n", RedactedAPIKey))
+	_, err := ParseManifests(strings.NewReader(in))
+	if err == nil {
+		t.Fatal("want error for the redaction placeholder as apiKey")
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error must name the placeholder problem, got: %v", err)
+	}
+}
+
+// Values are injected into the runner via shell command substitution
+// ("$(cat ...)"), which strips trailing newlines — a stored value with
+// surrounding whitespace or control bytes would reach the runner as a
+// different value than the one apply accepted, so apply rejects it.
+func TestParseRejectsUnstableSecretValues(t *testing.T) {
+	for _, tt := range []struct{ field, value string }{
+		{"apiKey", "sk-x\n"},
+		{"apiKey", " sk-x"},
+		{"apiKey", "sk-x "},
+		{"apiKey", "\t"},
+		{"apiKey", "sk-\tx"},
+		{"baseUrl", "https://proxy.example.com/v1\n"},
+		{"baseUrl", " https://proxy.example.com/v1"},
+	} {
+		in := modelManifestWith(fmt.Sprintf("  provider: anthropic\n  %s: %q\n", tt.field, tt.value))
+		if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+			t.Errorf("%s = %q must be rejected", tt.field, tt.value)
+		}
+	}
+}
+
+// The model reference resolves into boot-script env names via the stored
+// Model, but the name itself rides a Go map key and a log line, so a task
+// must not sneak in a name the Model kind would have rejected.
+func TestParseTaskModelRefName(t *testing.T) {
+	ok := taskManifest("  image: t\n  model: claude-proxy\n  runner:\n    command: [\"true\"]\n")
+	objs, err := ParseManifests(strings.NewReader(ok))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Task.Model != "claude-proxy" {
+		t.Errorf("model = %q", objs[0].Task.Model)
+	}
+	bad := taskManifest("  image: t\n  model: \"../etc\"\n  runner:\n    command: [\"true\"]\n")
+	if _, err := ParseManifests(strings.NewReader(bad)); err == nil {
+		t.Fatal("want error for invalid model reference name")
+	}
+}

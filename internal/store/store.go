@@ -49,6 +49,11 @@ func Open(path string) (*Store, error) {
 			spec TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS models (
+			name TEXT PRIMARY KEY,
+			spec TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
@@ -202,6 +207,51 @@ func (s *Store) ListWorkspaces() ([]*v1alpha1.Workspace, error) {
 	return wss, rows.Err()
 }
 
+// UpsertModel stores the model spec (including its API key — write-only at
+// the API layer, see server.redacted).
+func (s *Store) UpsertModel(m *v1alpha1.Model) error {
+	spec, err := json.Marshal(m.Spec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO models (name, spec) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec`, m.Metadata.Name, string(spec))
+	return err
+}
+
+func (s *Store) GetModel(name string) (*v1alpha1.Model, error) {
+	row := s.db.QueryRow(`SELECT name, spec FROM models WHERE name = ?`, name)
+	return scanModel(row)
+}
+
+func (s *Store) ListModels() ([]*v1alpha1.Model, error) {
+	rows, err := s.db.Query(`SELECT name, spec FROM models ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var models []*v1alpha1.Model
+	for rows.Next() {
+		m, err := scanModel(rows)
+		if err != nil {
+			return nil, err
+		}
+		models = append(models, m)
+	}
+	return models, rows.Err()
+}
+
+func (s *Store) DeleteModel(name string) error {
+	res, err := s.db.Exec(`DELETE FROM models WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanWorkspace(row rowScanner) (*v1alpha1.Workspace, error) {
@@ -235,4 +285,19 @@ func scanTask(row rowScanner) (*v1alpha1.Task, error) {
 		return nil, fmt.Errorf("task %s status: %w", t.Metadata.Name, err)
 	}
 	return t, nil
+}
+
+func scanModel(row rowScanner) (*v1alpha1.Model, error) {
+	m := &v1alpha1.Model{APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindModel}
+	var spec string
+	if err := row.Scan(&m.Metadata.Name, &spec); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(spec), &m.Spec); err != nil {
+		return nil, fmt.Errorf("model %s spec: %w", m.Metadata.Name, err)
+	}
+	return m, nil
 }

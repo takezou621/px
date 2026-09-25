@@ -142,7 +142,37 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     with `Owned()` so a reused VMID carrying a foreign boot marker fails the
     task instead of running someone else's runner.
 - [ ] Gateway kind: egress allowlist via LXC firewall
-- [ ] Model kind: LLM credentials injected as per-task env/secrets
+- [x] Model kind: LLM credentials injected as per-task env/secrets
+  - Design: `spec.provider` is a closed set (`anthropic`, `openai`) that maps
+    to the well-known env names (`ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`,
+    `OPENAI_API_KEY`/`OPENAI_BASE_URL`) — no free-form env mapping to keep
+    apply-time validation total. `spec.apiKey` is required; `spec.baseUrl`
+    overrides the default endpoint (proxies, Azure-style gateways). A Task
+    references at most one Model (`task.spec.model`, optional, by name);
+    resolution happens at provision time exactly like Workspaces — an
+    unknown name is a ProvisionFailed reason, so a Model deleted mid-run
+    only affects the next task. The APIKey is a write-only secret: the
+    store keeps it in SQLite (single-binary axis; the DB file is operator
+    territory — 0600 ownership is documented in the threat model), but GET
+    /v1/models and describe return the spec with `apiKey` replaced by
+    `<redacted>`, and the key never appears in controller logs or provision
+    errors. Injection rides the existing base64 boot path: the boot script
+    decodes the key into /run/px/model.key and writes a static
+    /run/px/model.env that exports the provider's env names from it, and
+    the runner spawn sources model.env before cmd.sh — so the key crosses
+    SSH as base64 argv (no quoting, no MAX_ARG_STRLEN surprises) and lands
+    in the runner's environment, not in the boot log (task.log captures the
+    runner only). Manifest caps: MaxAPIKeyBytes 4KiB, MaxBaseURLBytes 512.
+    Server: GET /v1/models, /v1/models/{name}, DELETE /v1/models/{name};
+    CLI: `px get models`, `px describe model NAME`, `px delete model NAME`.
+    Review hardening: the boot script and the pct exec wrapper set
+    `umask 077` before any write, so model.key/model.env/boot.sh (which
+    embeds the key base64-encoded) never fall back to the container's
+    default 0644; apply rejects apiKey/baseUrl values with surrounding
+    whitespace or control bytes (command substitution on the container side
+    strips trailing newlines — such a value would reach the runner mutated);
+    and apply rejects the literal `<redacted>` placeholder, so re-applying
+    a fetched Model fails loudly instead of silently replacing the real key.
 - [ ] unprivileged CT default; docs on threat model
 
 ## M4 — Beyond one node

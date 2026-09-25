@@ -93,7 +93,7 @@ func cmdApply(fs *flag.FlagSet, args []string) error {
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: px get tasks|workspaces")
+		return fmt.Errorf("usage: px get tasks|workspaces|models")
 	}
 	switch args[0] {
 	case "tasks":
@@ -127,8 +127,21 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 			fmt.Printf("%-24s %s\n", ws.Metadata.Name, git)
 		}
 		return nil
+	case "models":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		var models []*v1alpha1.Model
+		if err := doJSON(http.MethodGet, "/v1/models", nil, &models); err != nil {
+			return err
+		}
+		fmt.Printf("%-24s %-12s %s\n", "NAME", "PROVIDER", "BASEURL")
+		for _, m := range models {
+			fmt.Printf("%-24s %-12s %s\n", m.Metadata.Name, m.Spec.Provider, m.Spec.BaseURL)
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: px get tasks|workspaces")
+		return fmt.Errorf("usage: px get tasks|workspaces|models")
 	}
 }
 
@@ -146,13 +159,13 @@ func popName(args []string) (string, []string, error) {
 
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	kind := "task" // bare NAME is treated as a task
-	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME")
+		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -171,6 +184,13 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		b, _ := json.MarshalIndent(ws, "", "  ")
+		fmt.Println(string(b))
+	case "model":
+		var m *v1alpha1.Model
+		if err := doJSON(http.MethodGet, "/v1/models/"+name, nil, &m); err != nil {
+			return err
+		}
+		b, _ := json.MarshalIndent(m, "", "  ")
 		fmt.Println(string(b))
 	}
 	return nil
@@ -211,21 +231,32 @@ func cmdLogs(fs *flag.FlagSet, args []string) error {
 }
 
 func cmdDelete(fs *flag.FlagSet, args []string) error {
-	if len(args) > 0 && args[0] == "task" {
+	kind := "task"
+	if len(args) > 0 && (args[0] == "task" || args[0] == "model") {
+		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px delete task NAME [-server URL]")
+		return fmt.Errorf("usage: px delete task NAME | delete model NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	var out map[string]string
-	if err := doJSON(http.MethodDelete, "/v1/tasks/"+name, nil, &out); err != nil {
-		return err
+	switch kind {
+	case "task":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/tasks/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("task.px.io/%s deleting\n", name)
+	case "model":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/models/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("model.px.io/%s deleted\n", name)
 	}
-	fmt.Printf("task.px.io/%s deleting\n", name)
 	return nil
 }
 
@@ -401,11 +432,14 @@ Usage:
   px apply -f <file|->            Apply a YAML manifest
   px get tasks                    List tasks
   px get workspaces               List workspaces
+  px get models                   List models (API keys redacted)
   px describe task NAME           Show one task as JSON
   px describe workspace NAME      Show one workspace as JSON
+  px describe model NAME          Show one model as JSON (API key redacted)
   px logs NAME [-f]               Stream runner logs
   px watch                        Stream task phase transitions
   px delete task NAME             Delete a task and its container
+  px delete model NAME            Delete a model
   px version                      Show version
 
 Flags:

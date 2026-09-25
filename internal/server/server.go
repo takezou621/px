@@ -37,6 +37,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/tasks/{name}/logs", s.handleTaskLogs)
 	mux.HandleFunc("GET /v1/workspaces", s.handleListWorkspaces)
 	mux.HandleFunc("GET /v1/workspaces/{name}", s.handleGetWorkspace)
+	mux.HandleFunc("GET /v1/models", s.handleListModels)
+	mux.HandleFunc("GET /v1/models/{name}", s.handleGetModel)
+	mux.HandleFunc("DELETE /v1/models/{name}", s.handleDeleteModel)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -103,6 +106,17 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 				return nil, fmt.Errorf("upsert workspace %s: %w", m.Metadata.Name, err)
 			}
 			results = append(results, fmt.Sprintf("workspace.px.io/%s configured", m.Metadata.Name))
+		case v1alpha1.KindModel:
+			mo := &v1alpha1.Model{
+				APIVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindModel,
+				Metadata:   m.Metadata,
+				Spec:       *m.Model,
+			}
+			if err := st.UpsertModel(mo); err != nil {
+				return nil, fmt.Errorf("upsert model %s: %w", m.Metadata.Name, err)
+			}
+			results = append(results, fmt.Sprintf("model.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
 			t := &v1alpha1.Task{
 				APIVersion: v1alpha1.APIVersion,
@@ -210,11 +224,61 @@ func (s *Server) handleGetWorkspace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ws)
 }
 
+func (s *Server) handleListModels(w http.ResponseWriter, _ *http.Request) {
+	models, err := s.store.ListModels()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	out := make([]*v1alpha1.Model, 0, len(models))
+	for _, m := range models {
+		out = append(out, redacted(m))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
+	m, err := s.store.GetModel(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "model not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, redacted(m))
+}
+
+func (s *Server) handleDeleteModel(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteModel(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "model not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// redacted returns a copy of the model with the API key masked: the key is
+// write-only — it was accepted at apply time and must never leave the
+// server again, so even an authenticated GET only sees the placeholder.
+func redacted(m *v1alpha1.Model) *v1alpha1.Model {
+	cp := *m
+	cp.Spec = m.Spec
+	cp.Spec.APIKey = v1alpha1.RedactedAPIKey
+	return &cp
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false) // keep "<redacted>" readable instead of <
 	_ = enc.Encode(v)
 }
 

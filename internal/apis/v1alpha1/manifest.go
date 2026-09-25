@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,6 +17,7 @@ type Manifest struct {
 
 	Task      *TaskSpec      // non-nil when Kind == Task
 	Workspace *WorkspaceSpec // non-nil when Kind == Workspace
+	Model     *ModelSpec     // non-nil when Kind == Model
 }
 
 // ParseManifests parses a multi-document YAML manifest stream.
@@ -117,6 +119,11 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 		if cmdBytes > MaxCommandBytes {
 			return nil, fmt.Errorf("task %q: spec.runner.command exceeds %d bytes", m.Metadata.Name, MaxCommandBytes)
 		}
+		if s.Model != "" {
+			if err := ValidateName(s.Model); err != nil {
+				return nil, fmt.Errorf("task %q: spec.model: %w", m.Metadata.Name, err)
+			}
+		}
 		m.Task = s
 	case KindWorkspace:
 		s := &WorkspaceSpec{}
@@ -133,10 +140,54 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			return nil, fmt.Errorf("workspace %q: spec.git.branch exceeds %d bytes", m.Metadata.Name, MaxBranchBytes)
 		}
 		m.Workspace = s
+	case KindModel:
+		s := &ModelSpec{}
+		if err := strictDecode(spec, s); err != nil {
+			return nil, fmt.Errorf("model %q: %w", m.Metadata.Name, err)
+		}
+		if err := ValidateProvider(s.Provider); err != nil {
+			return nil, fmt.Errorf("model %q: %w", m.Metadata.Name, err)
+		}
+		if s.APIKey == "" {
+			return nil, fmt.Errorf("model %q: spec.apiKey is required", m.Metadata.Name)
+		}
+		if s.APIKey == RedactedAPIKey {
+			return nil, fmt.Errorf("model %q: spec.apiKey is the redaction placeholder; provide the real key", m.Metadata.Name)
+		}
+		if err := validateSecretValue("spec.apiKey", s.APIKey); err != nil {
+			return nil, fmt.Errorf("model %q: %w", m.Metadata.Name, err)
+		}
+		if len(s.APIKey) > MaxAPIKeyBytes {
+			return nil, fmt.Errorf("model %q: spec.apiKey exceeds %d bytes", m.Metadata.Name, MaxAPIKeyBytes)
+		}
+		if len(s.BaseURL) > MaxBaseURLBytes {
+			return nil, fmt.Errorf("model %q: spec.baseUrl exceeds %d bytes", m.Metadata.Name, MaxBaseURLBytes)
+		}
+		if err := validateSecretValue("spec.baseUrl", s.BaseURL); err != nil {
+			return nil, fmt.Errorf("model %q: %w", m.Metadata.Name, err)
+		}
+		m.Model = s
 	default:
 		return nil, fmt.Errorf("unknown kind %q", m.Kind)
 	}
 	return m, nil
+}
+
+// validateSecretValue rejects Model secret values that could not survive the
+// boot-script round-trip intact: /run/px/model.env reads the stored files via
+// shell command substitution, which strips trailing newlines — so a value
+// applied with surrounding whitespace or control bytes would reach the
+// runner as a different value than the one apply accepted.
+func validateSecretValue(field, v string) error {
+	if strings.TrimSpace(v) != v {
+		return fmt.Errorf("%s must not have leading or trailing whitespace", field)
+	}
+	for _, r := range v {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s must not contain control characters", field)
+		}
+	}
+	return nil
 }
 
 // strictDecode decodes YAML data into out, rejecting unknown fields.

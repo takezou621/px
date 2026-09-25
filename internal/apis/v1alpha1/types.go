@@ -12,6 +12,7 @@ const (
 
 	KindTask      = "Task"
 	KindWorkspace = "Workspace"
+	KindModel     = "Model"
 )
 
 // ObjectMeta identifies a manifest object.
@@ -31,6 +32,9 @@ type TaskSpec struct {
 	Resources Resources `json:"resources,omitempty" yaml:"resources,omitempty"`
 	// TTLSecondsAfterFinished deletes the container this long after the task ends.
 	TTLSecondsAfterFinished int `json:"ttlSecondsAfterFinished,omitempty" yaml:"ttlSecondsAfterFinished,omitempty"`
+	// Model optionally references a Model resource by name; the runner then
+	// gets the provider's credentials as environment variables.
+	Model string `json:"model,omitempty" yaml:"model,omitempty"`
 }
 
 type TaskWorkspace struct {
@@ -61,6 +65,39 @@ type WorkspaceSpec struct {
 type GitSpec struct {
 	Repo   string `json:"repo" yaml:"repo"`
 	Branch string `json:"branch,omitempty" yaml:"branch,omitempty"`
+}
+
+// ModelProvider names a supported LLM provider; each maps to the env names
+// its SDK reads by default (controller.EnvNamesForProvider).
+type ModelProvider string
+
+const (
+	ProviderAnthropic ModelProvider = "anthropic"
+	ProviderOpenAI    ModelProvider = "openai"
+)
+
+// ModelSpec declares LLM credentials task runners receive as env vars.
+type ModelSpec struct {
+	// Provider selects which provider's env names the runner gets.
+	Provider ModelProvider `json:"provider" yaml:"provider"`
+	// APIKey is the provider credential. It is write-only: the API returns
+	// "<redacted>" and px never logs it.
+	APIKey string `json:"apiKey" yaml:"apiKey"`
+	// BaseURL overrides the provider's default endpoint (proxy or gateway).
+	BaseURL string `json:"baseUrl,omitempty" yaml:"baseUrl,omitempty"`
+}
+
+// RedactedAPIKey is the placeholder every Model read returns instead of the
+// real key. Apply rejects it, so re-applying a fetched Model fails loudly
+// instead of silently replacing the stored credential with the placeholder.
+const RedactedAPIKey = "<redacted>"
+
+// Model is the API representation of a Model object.
+type Model struct {
+	APIVersion string     `json:"apiVersion"`
+	Kind       string     `json:"kind"`
+	Metadata   ObjectMeta `json:"metadata"`
+	Spec       ModelSpec  `json:"spec"`
 }
 
 // TaskPhase is the lifecycle phase of a Task.
@@ -121,7 +158,18 @@ const (
 	MaxRepoBytes    = 2 << 10  // per workspace spec.git.repo
 	MaxBranchBytes  = 256      // per workspace spec.git.branch
 	MaxWorkspaces   = 8        // per task spec.workspaces
+	MaxAPIKeyBytes  = 4 << 10  // per model spec.apiKey
+	MaxBaseURLBytes = 512      // per model spec.baseUrl
 )
+
+// ValidateProvider checks spec.provider is a known provider.
+func ValidateProvider(p ModelProvider) error {
+	switch p {
+	case ProviderAnthropic, ProviderOpenAI:
+		return nil
+	}
+	return fmt.Errorf("invalid provider %q: must be one of anthropic, openai", p)
+}
 
 // ValidateName checks DNS-1123-style naming.
 func ValidateName(name string) error {

@@ -17,7 +17,7 @@ import (
 type nopProv struct{}
 
 func (nopProv) Allocate(_ context.Context) (int, error) { return 0, nil }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace) error {
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel) error {
 	return nil
 }
 func (nopProv) Booted(_ context.Context, _ int) (bool, error)          { return false, nil }
@@ -261,5 +261,107 @@ func TestDelete(t *testing.T) {
 	resp2.Body.Close()
 	if resp2.StatusCode != 404 {
 		t.Fatalf("want 404 after delete, got %d", resp2.StatusCode)
+	}
+}
+
+const modelManifest = `
+apiVersion: px.io/v1alpha1
+kind: Model
+metadata:
+  name: claude
+spec:
+  provider: anthropic
+  apiKey: sk-super-secret
+  baseUrl: https://proxy.example.com/v1
+`
+
+// The API key is write-only: apply accepts it, every GET returns the
+// placeholder, and delete removes the record.
+func TestModels(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	resp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(modelManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("apply: want 201, got %d: %s", resp.StatusCode, body)
+	}
+	// The key is write-only: even the apply acknowledgement must not echo it.
+	if strings.Contains(string(body), "sk-super-secret") {
+		t.Fatalf("raw key leaked via apply response: %s", body)
+	}
+
+	getResp, err := http.Get(srv.URL + "/v1/models/claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if getResp.StatusCode != 200 {
+		t.Fatalf("get: want 200, got %d", getResp.StatusCode)
+	}
+	if !strings.Contains(string(data), "<redacted>") {
+		t.Fatalf("get must redact the key, got: %s", data)
+	}
+	if strings.Contains(string(data), "sk-super-secret") {
+		t.Fatalf("raw key leaked via GET: %s", data)
+	}
+
+	listResp, err := http.Get(srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listData, _ := io.ReadAll(listResp.Body)
+	listResp.Body.Close()
+	if listResp.StatusCode != 200 || !strings.Contains(string(listData), `"name": "claude"`) {
+		t.Fatalf("list: want claude, got %d: %s", listResp.StatusCode, listData)
+	}
+	if strings.Contains(string(listData), "sk-super-secret") {
+		t.Fatalf("raw key leaked via list: %s", listData)
+	}
+
+	// Re-applying a fetched Model must be rejected loudly: its apiKey is the
+	// placeholder, and upserting that would silently break the next
+	// provision instead of surfacing the mistake here.
+	roundTrip := strings.Replace(modelManifest, "sk-super-secret", v1alpha1.RedactedAPIKey, 1)
+	rtResp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(roundTrip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtBody, _ := io.ReadAll(rtResp.Body)
+	rtResp.Body.Close()
+	if rtResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("re-applying the redacted placeholder: want 400, got %d: %s", rtResp.StatusCode, rtBody)
+	}
+	if !strings.Contains(string(rtBody), "placeholder") {
+		t.Fatalf("rejection must name the placeholder problem: %s", rtBody)
+	}
+
+	// Upsert replaces the spec (no conflict, unlike Task).
+	resp2, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(modelManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("re-apply: want 201, got %d", resp2.StatusCode)
+	}
+
+	delReq, _ := http.NewRequest(http.MethodDelete, srv.URL+"/v1/models/claude", nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delResp.Body.Close()
+	if delResp.StatusCode != 200 {
+		t.Fatalf("delete: want 200, got %d", delResp.StatusCode)
+	}
+	goneResp, _ := http.Get(srv.URL + "/v1/models/claude")
+	goneResp.Body.Close()
+	if goneResp.StatusCode != 404 {
+		t.Fatalf("want 404 after delete, got %d", goneResp.StatusCode)
 	}
 }

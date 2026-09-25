@@ -25,6 +25,7 @@ type fakeProv struct {
 	booted      map[int]bool // vmids whose container reached the runner launch
 	created     []int
 	mounts      []ResolvedWorkspace // mounts passed to the last Create
+	model       *ResolvedModel      // model passed to the last Create
 	destroyed   []int
 	hostnames   map[int]string // vmid -> hostname; empty or missing = owned
 }
@@ -36,13 +37,14 @@ func (f *fakeProv) Allocate(_ context.Context) (int, error) {
 	return 100 + len(f.created), nil
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error {
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
 	f.mu.Lock()
 	f.created = append(f.created, vmid)
 	f.mounts = mounts
+	f.model = model
 	f.mu.Unlock()
 	return nil
 }
@@ -111,13 +113,25 @@ type memStore struct {
 	failUpserts int // fail the next N UpsertTask calls, then succeed
 	tasks       map[string]*v1alpha1.Task
 	workspaces  map[string]*v1alpha1.Workspace
+	models      map[string]*v1alpha1.Model
 }
 
 func newMemStore() *memStore {
 	return &memStore{
 		tasks:      map[string]*v1alpha1.Task{},
 		workspaces: map[string]*v1alpha1.Workspace{},
+		models:     map[string]*v1alpha1.Model{},
 	}
+}
+
+func (m *memStore) GetModel(name string) (*v1alpha1.Model, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mo, ok := m.models[name]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return mo, nil
 }
 
 func (m *memStore) GetWorkspace(name string) (*v1alpha1.Workspace, error) {
@@ -533,6 +547,78 @@ func TestUnknownWorkspaceFailsProvision(t *testing.T) {
 	}
 	if task.Status.Reason == "" {
 		t.Fatal("Reason should name the missing workspace")
+	}
+}
+
+// A task model reference resolves against the stored Model and rides into
+// Create as credentials for the boot script.
+func TestModelResolvedIntoCreate(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	st.models["claude"] = &v1alpha1.Model{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindModel,
+		Metadata:   v1alpha1.ObjectMeta{Name: "claude"},
+		Spec:       v1alpha1.ModelSpec{Provider: v1alpha1.ProviderAnthropic, APIKey: "sk-secret", BaseURL: "https://proxy.example.com"},
+	}
+	task := testTask(0)
+	task.Spec.Model = "claude"
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	model := prov.model
+	prov.mu.Unlock()
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s", task.Status.Phase)
+	}
+	if model == nil || model.Provider != v1alpha1.ProviderAnthropic || model.APIKey != "sk-secret" || model.BaseURL != "https://proxy.example.com" {
+		t.Fatalf("Create got wrong model: %+v", model)
+	}
+}
+
+// A task without a model reference passes nil, so the boot script carries no
+// credential machinery at all.
+func TestNoModelPassesNil(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	prov.mu.Lock()
+	model := prov.model
+	prov.mu.Unlock()
+	if model != nil {
+		t.Fatalf("model-less task must pass nil, got %+v", model)
+	}
+}
+
+// A reference to a Model that was never applied fails the provision before
+// any container work starts.
+func TestUnknownModelFailsProvision(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := testTask(0)
+	task.Spec.Model = "missing"
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	if len(prov.created) != 0 {
+		t.Fatalf("Create must not run for an unresolved model, created %v", prov.created)
+	}
+	task = get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s", task.Status.Phase)
+	}
+	if task.Status.Container != 0 {
+		t.Fatalf("want container 0, got %d", task.Status.Container)
+	}
+	if !strings.Contains(task.Status.Reason, "missing") {
+		t.Fatalf("Reason should name the missing model, got %q", task.Status.Reason)
 	}
 }
 

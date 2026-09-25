@@ -22,7 +22,7 @@ func testProvTask() *v1alpha1.Task {
 }
 
 func TestRunnerScriptLayout(t *testing.T) {
-	script := runnerScript(testProvTask(), nil)
+	script := runnerScript(testProvTask(), nil, nil)
 	for _, want := range []string{
 		"#!/bin/sh",
 		"mkdir -p /run/px",
@@ -35,6 +35,11 @@ func TestRunnerScriptLayout(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("boot script missing %q:\n%s", want, script)
 		}
+	}
+	// The umask must precede every write, so the credential files never fall
+	// back to the container's default (0644 under the usual 022).
+	if !strings.HasPrefix(script, "#!/bin/sh\numask 077\n") {
+		t.Errorf("boot script must set umask 077 before any writes:\n%s", script)
 	}
 	// The goal must be embedded base64-encoded, never raw.
 	if strings.Contains(script, "Fix bug #123") {
@@ -58,7 +63,7 @@ func TestRunnerScriptClonesWorkspaces(t *testing.T) {
 		{Name: "repo-a", Repo: "https://example.com/a.git", Branch: "main"},
 		{Name: "repo-b", Repo: "https://example.com/b.git"},
 	}
-	script := runnerScript(testProvTask(), mounts)
+	script := runnerScript(testProvTask(), mounts, nil)
 	if !strings.Contains(script, "mkdir -p /workspace") {
 		t.Errorf("missing /workspace mkdir:\n%s", script)
 	}
@@ -108,10 +113,11 @@ func TestQuoteCommandExportsGoalAndQuotesArgv(t *testing.T) {
 
 func TestBootCommandMkdirBeforeRedirect(t *testing.T) {
 	cmd := bootCommand(142, "", "echo hi")
+	um := strings.Index(cmd, "umask 077")
 	mk := strings.Index(cmd, "mkdir -p /run/px")
 	rd := strings.Index(cmd, "> /run/px/boot.sh")
-	if mk == -1 || rd == -1 || mk > rd {
-		t.Fatalf("mkdir must precede the /run/px/boot.sh redirect: %s", cmd)
+	if um == -1 || mk == -1 || rd == -1 || um > mk || mk > rd {
+		t.Fatalf("umask and mkdir must precede the /run/px/boot.sh redirect: %s", cmd)
 	}
 	if !strings.Contains(cmd, "pct exec 142 -- sh -c '") {
 		t.Fatalf("bad pct invocation: %s", cmd)
@@ -153,5 +159,96 @@ func TestProbeVerdict(t *testing.T) {
 		if _, err := probeVerdict(bad); err == nil {
 			t.Errorf("output %q must be an error, not a verdict", bad)
 		}
+	}
+}
+
+// embeddedPayload decodes the base64 embedding the boot script carries for
+// target (e.g. "/run/px/model.env"). base64 contains no single quotes, so the
+// quoted token before the redirect marker is unambiguous.
+func embeddedPayload(t *testing.T, script, target string) string {
+	t.Helper()
+	marker := "| base64 -d > " + target
+	i := strings.Index(script, marker)
+	if i < 0 {
+		t.Fatalf("no base64 embedding for %s:\n%s", target, script)
+	}
+	j := strings.LastIndex(script[:i], "'")
+	k := strings.LastIndex(script[:j], "'")
+	if j < 0 || k < 0 {
+		t.Fatalf("malformed embedding for %s:\n%s", target, script)
+	}
+	dec, err := base64.StdEncoding.DecodeString(script[k+1 : j])
+	if err != nil {
+		t.Fatalf("bad base64 payload for %s: %v", target, err)
+	}
+	return string(dec)
+}
+
+// A resolved model must land in the boot script base64-encoded: the key file
+// holds the raw key, the env file references it by cat — neither the key nor
+// the base URL may appear raw anywhere in the script, and the runner spawn
+// must source the env file so the vars reach the runner and its children.
+func TestRunnerScriptInjectsModelEnv(t *testing.T) {
+	model := &ResolvedModel{
+		Provider: v1alpha1.ProviderAnthropic,
+		APIKey:   "sk-test-123",
+		BaseURL:  "https://proxy.example.com/v1",
+	}
+	script := runnerScript(testProvTask(), nil, model)
+
+	for _, raw := range []string{"sk-test-123", "https://proxy.example.com", "ANTHROPIC_API_KEY=\"sk"} {
+		if strings.Contains(script, raw) {
+			t.Errorf("credential leaked raw into boot script: %q", raw)
+		}
+	}
+	if got := embeddedPayload(t, script, "/run/px/model.key"); got != "sk-test-123" {
+		t.Errorf("model.key payload = %q, want the raw key", got)
+	}
+	env := embeddedPayload(t, script, "/run/px/model.env")
+	for _, want := range []string{
+		`export ANTHROPIC_API_KEY="$(cat /run/px/model.key)"`,
+		`export ANTHROPIC_BASE_URL="$(cat /run/px/model.baseurl)"`,
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("model.env missing %q, got:\n%s", want, env)
+		}
+	}
+	if !strings.Contains(script, "> /run/px/model.baseurl") {
+		t.Errorf("missing model.baseurl write:\n%s", script)
+	}
+	spawn := strings.Index(script, "nohup sh -c")
+	if spawn == -1 || !strings.Contains(script[spawn:], ". /run/px/model.env 2>/dev/null;") {
+		t.Errorf("runner spawn must source model.env:\n%s", script)
+	}
+}
+
+// An OpenAI model maps to the OPENAI_* names, per the provider env map.
+func TestRunnerScriptOpenAIEnvPrefix(t *testing.T) {
+	model := &ResolvedModel{Provider: v1alpha1.ProviderOpenAI, APIKey: "sk-oai"}
+	script := runnerScript(testProvTask(), nil, model)
+	env := embeddedPayload(t, script, "/run/px/model.env")
+	if !strings.Contains(env, `export OPENAI_API_KEY="$(cat /run/px/model.key)"`) {
+		t.Errorf("model.env missing OPENAI_API_KEY export, got:\n%s", env)
+	}
+	if strings.Contains(env, "BASE_URL") {
+		t.Errorf("empty baseUrl must not emit a BASE_URL export, got:\n%s", env)
+	}
+	if strings.Contains(script, "> /run/px/model.baseurl") {
+		t.Errorf("empty baseUrl must not write model.baseurl:\n%s", script)
+	}
+}
+
+// A task without a model must not write any credential files. The spawn line
+// still references model.env (one boot script serves both shapes), so the
+// reference must be the guarded no-op source, never an unguarded one.
+func TestRunnerScriptWithoutModel(t *testing.T) {
+	script := runnerScript(testProvTask(), nil, nil)
+	for _, absent := range []string{"> /run/px/model.key", "> /run/px/model.env", "> /run/px/model.baseurl"} {
+		if strings.Contains(script, absent) {
+			t.Errorf("model-less script writes %s:\n%s", absent, script)
+		}
+	}
+	if !strings.Contains(script, ". /run/px/model.env 2>/dev/null;") {
+		t.Errorf("spawn must tolerate a missing model.env:\n%s", script)
 	}
 }

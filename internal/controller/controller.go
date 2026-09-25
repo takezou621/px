@@ -24,6 +24,11 @@ type WorkspaceReader interface {
 	GetWorkspace(name string) (*v1alpha1.Workspace, error)
 }
 
+// ModelReader resolves task model references against stored Model resources.
+type ModelReader interface {
+	GetModel(name string) (*v1alpha1.Model, error)
+}
+
 // TaskWriter lets the controller persist status changes. UpsertTask
 // implementations must preserve an already-persisted DeletionTimestamp: the
 // controller works on stale snapshots, and a status write must never erase a
@@ -38,6 +43,7 @@ type Controller struct {
 	store interface {
 		TaskReader
 		WorkspaceReader
+		ModelReader
 		TaskWriter
 	}
 	prov Provisioner
@@ -49,6 +55,7 @@ type Controller struct {
 func New(store interface {
 	TaskReader
 	WorkspaceReader
+	ModelReader
 	TaskWriter
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
@@ -224,6 +231,11 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		c.failProvision(t, err)
 		return
 	}
+	model, err := c.resolveModel(t)
+	if err != nil {
+		c.failProvision(t, err)
+		return
+	}
 	t.Status.Phase = v1alpha1.TaskProvisioning
 	t.Status.Reason = "cloning template and starting container"
 	c.persist(t)
@@ -248,7 +260,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
-	if err := c.prov.Create(ctx, t, vmid, mounts); err != nil {
+	if err := c.prov.Create(ctx, t, vmid, mounts, model); err != nil {
 		// Create cleans up its own partial work, so the VMID no longer names
 		// a container of ours. Clear it: a later destroy must never target an
 		// id that Create may have lost to another owner (PVE's nextid is a
@@ -282,6 +294,20 @@ func (c *Controller) resolveWorkspaces(t *v1alpha1.Task) ([]ResolvedWorkspace, e
 		})
 	}
 	return mounts, nil
+}
+
+// resolveModel resolves the task's model reference (at most one) the same
+// way — before any container work. A deleted Model only affects tasks
+// applied after the deletion; running containers keep their injected env.
+func (c *Controller) resolveModel(t *v1alpha1.Task) (*ResolvedModel, error) {
+	if t.Spec.Model == "" {
+		return nil, nil
+	}
+	m, err := c.store.GetModel(t.Spec.Model)
+	if err != nil {
+		return nil, fmt.Errorf("resolve model %q: %w", t.Spec.Model, err)
+	}
+	return &ResolvedModel{Provider: m.Spec.Provider, APIKey: m.Spec.APIKey, BaseURL: m.Spec.BaseURL}, nil
 }
 
 func (c *Controller) failProvision(t *v1alpha1.Task, err error) {

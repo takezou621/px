@@ -30,9 +30,10 @@ type Provisioner interface {
 	Allocate(ctx context.Context) (int, error)
 	// Create clones the template into vmid, starts the container and boots
 	// the runner. mounts are workspace repos cloned into the container before
-	// the runner starts. On failure it destroys any partial work, so the vmid
-	// no longer names a container of ours.
-	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error
+	// the runner starts; model, when non-nil, carries provider credentials
+	// the runner gets as environment variables. On failure it destroys any
+	// partial work, so the vmid no longer names a container of ours.
+	Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error
 	// Booted reports whether the container's boot script reached the runner
 	// spawn step and touched its marker (/run/px/booted) — see runnerScript
 	// for why the marker sits after the spawn. A provision interrupted by a
@@ -78,11 +79,30 @@ type ResolvedWorkspace struct {
 	Branch string
 }
 
+// ResolvedModel is a task model reference resolved against the store: the
+// provider credentials the boot script hands the runner as env vars. The
+// APIKey rides the same base64 embedding as every other user-controlled
+// boot input — it never appears raw in a command line or a log.
+type ResolvedModel struct {
+	Provider v1alpha1.ModelProvider
+	APIKey   string
+	BaseURL  string
+}
+
+// envPrefix maps a provider to its credential env names. Apply-time
+// validation keeps Provider within the known set, so the default is safe.
+func envPrefix(p v1alpha1.ModelProvider) string {
+	if p == v1alpha1.ProviderOpenAI {
+		return "OPENAI"
+	}
+	return "ANTHROPIC"
+}
+
 // runnerScript builds the container-side boot script.
 // Everything user-controlled is embedded base64-encoded, so no quoting
 // pitfalls; the runner's output goes to /run/px/task.log, its exit code
 // to /run/px/exit.
-func runnerScript(t *v1alpha1.Task, mounts []ResolvedWorkspace) string {
+func runnerScript(t *v1alpha1.Task, mounts []ResolvedWorkspace, model *ResolvedModel) string {
 	goal := ""
 	for i, ws := range t.Spec.Workspaces {
 		if i > 0 {
@@ -92,7 +112,11 @@ func runnerScript(t *v1alpha1.Task, mounts []ResolvedWorkspace) string {
 	}
 	cmd := quoteCommand(t.Spec.Runner.Command)
 	var s strings.Builder
-	s.WriteString("#!/bin/sh\nmkdir -p /run/px")
+	// umask 077 before any writes: everything under /run/px is this task's
+	// private state, and the credential files (model.key, model.env, and
+	// boot.sh itself with its base64 embeddings) must not fall back to the
+	// container's default umask (0644 with the usual 022).
+	s.WriteString("#!/bin/sh\numask 077\nmkdir -p /run/px")
 	if len(mounts) > 0 {
 		s.WriteString("\nmkdir -p /workspace")
 	}
@@ -102,6 +126,20 @@ printf '%%s' '%s' | base64 -d > /run/px/cmd.sh
 `,
 		base64.StdEncoding.EncodeToString([]byte(goal)),
 		base64.StdEncoding.EncodeToString([]byte(cmd)))
+	if model != nil {
+		prefix := envPrefix(model.Provider)
+		fmt.Fprintf(&s, "printf '%%s' '%s' | base64 -d > /run/px/model.key\n",
+			base64.StdEncoding.EncodeToString([]byte(model.APIKey)))
+		var env strings.Builder
+		fmt.Fprintf(&env, "export %s_API_KEY=\"$(cat /run/px/model.key)\"\n", prefix)
+		if model.BaseURL != "" {
+			fmt.Fprintf(&s, "printf '%%s' '%s' | base64 -d > /run/px/model.baseurl\n",
+				base64.StdEncoding.EncodeToString([]byte(model.BaseURL)))
+			fmt.Fprintf(&env, "export %s_BASE_URL=\"$(cat /run/px/model.baseurl)\"\n", prefix)
+		}
+		fmt.Fprintf(&s, "printf '%%s' '%s' | base64 -d > /run/px/model.env\n",
+			base64.StdEncoding.EncodeToString([]byte(env.String())))
+	}
 	// The container was started seconds ago and DHCP may not have handed out
 	// a lease yet, so the first clone would die on DNS. Wait (max 20s) for a
 	// default route before any clone.
@@ -136,7 +174,7 @@ done
 clone_ws%d || { rm -rf /workspace/%s; sleep 2; clone_ws%d; } || { echo 'px: git clone %s failed' >&2; exit 1; }
 `, i, branchFlag, i, ws.Name, i, ws.Name, i, ws.Name)
 	}
-	s.WriteString(`nohup sh -c 'sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
+	s.WriteString(`nohup sh -c '. /run/px/model.env 2>/dev/null; sh /run/px/cmd.sh; echo $? > /run/px/exit' > /run/px/task.log 2>&1 &
 # marker for Booted(), touched only after the runner is spawned so that a
 # present marker proves the runner process exists — a restart mid-boot can
 # then tell a live runner from a partial clone whose boot died with the SSH
@@ -150,7 +188,9 @@ echo PX_BOOT_OK
 // bootCommand wraps the boot script so it lands inside the container via
 // base64. mkdir runs before the redirect on purpose: /run is tmpfs and the
 // template does not carry /run/px, so the redirect would fail before
-// boot.sh ever executes.
+// boot.sh ever executes. The umask precedes the redirect too, so boot.sh —
+// which embeds the model credential base64-encoded — is not left
+// world-readable by the outer shell's default umask.
 func bootCommand(vmid int, user, script string) string {
 	userArg := ""
 	if user != "" {
@@ -158,7 +198,7 @@ func bootCommand(vmid int, user, script string) string {
 	}
 	b64 := base64.StdEncoding.EncodeToString([]byte(script))
 	return fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg,
-		shellQuote("mkdir -p /run/px && echo "+b64+" | base64 -d > /run/px/boot.sh && sh /run/px/boot.sh"))
+		shellQuote("umask 077; mkdir -p /run/px && echo "+b64+" | base64 -d > /run/px/boot.sh && sh /run/px/boot.sh"))
 }
 
 func quoteCommand(argv []string) string {
@@ -178,7 +218,7 @@ func (p *provisioner) Allocate(ctx context.Context) (int, error) {
 	return p.pve.NextID(ctx)
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace) error {
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel) error {
 	templateVMID, err := p.pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
 		return fmt.Errorf("find template: %w", err)
@@ -198,7 +238,7 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, vmid int, mo
 	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
 	// top of the plain boot, so give each workspace its own 30s budget.
 	bootTimeout := 60*time.Second + time.Duration(len(mounts))*30*time.Second
-	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts)), bootTimeout)
+	out, code, err := p.ssh.Run(bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts, model)), bootTimeout)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), vmid)
 		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
