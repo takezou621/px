@@ -151,12 +151,11 @@ func TestFirewallWrites(t *testing.T) {
 	if got := cfgForm.Get("net0"); got == "" {
 		t.Error("config write must carry net0")
 	}
-	if got := cfgForm.Get("firewall"); got != "1" {
-		t.Errorf("config write firewall flag = %q, want 1", got)
-	}
-	for _, must := range []string{"policy_out", "enable"} {
+	// There is no top-level firewall LXC config property (QEMU-only); PVE
+	// rejects it with "Unknown option: firewall".
+	for _, must := range []string{"firewall", "policy_out", "enable"} {
 		if _, ok := cfgForm[must]; ok {
-			t.Errorf("config write must not carry %q (guest firewall option, not an LXC property)", must)
+			t.Errorf("config write must not carry %q (not a valid LXC config property)", must)
 		}
 	}
 

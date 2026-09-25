@@ -239,13 +239,13 @@ func (c *Client) ContainerNet0(ctx context.Context, vmid int) (string, error) {
 	return cfg.Net0, nil
 }
 
-// EnableFirewall sets the guest firewall flag on the container's config
-// (a valid LXC config property, `pct set <vmid> --firewall 1`). net0 must
-// be the container's current value with firewall=1 appended.
+// EnableFirewall turns the guest firewall on via the container's net0
+// interface flag. There is no top-level `firewall` LXC config property —
+// that exists only for QEMU VMs; PVE rejects it here ("Unknown option:
+// firewall"), so the per-interface flag is the only switch an LXC has.
 func (c *Client) EnableFirewall(ctx context.Context, vmid int, net0 string) error {
 	form := url.Values{}
 	form.Set("net0", net0)
-	form.Set("firewall", "1")
 	return c.do(ctx, http.MethodPut, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), form, nil)
 }
 

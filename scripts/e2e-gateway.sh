@@ -210,10 +210,13 @@ if [[ -n $PVE_SSH ]]; then
   else
     ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5)
     if cfg=$(ssh "${ssh_opts[@]}" "$PVE_SSH" "pct config $vmid" 2>&1); then
-      if grep -q 'firewall=1' <<<"$cfg" && grep -q '^firewall: 1' <<<"$cfg"; then
-        ok "net0 carries firewall=1 and the CT option firewall is on"
+      # net0 firewall=1 is the only switch an LXC has — there is no
+      # top-level firewall config property (that is QEMU-only, and pct
+      # rejects it with "Unknown option: firewall").
+      if grep -q 'firewall=1' <<<"$cfg"; then
+        ok "net0 carries firewall=1"
       else
-        bad "firewall flag missing: $(grep -E '^(net0|firewall)' <<<"$cfg")"
+        bad "firewall flag missing from net0: $(grep '^net0' <<<"$cfg")"
       fi
     else
       bad "pct config on $vmid failed: $cfg"
