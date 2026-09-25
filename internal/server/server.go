@@ -41,6 +41,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/tasks/{name}/resume", s.handleTaskResume)
 	mux.HandleFunc("GET /v1/workspaces", s.handleListWorkspaces)
 	mux.HandleFunc("GET /v1/workspaces/{name}", s.handleGetWorkspace)
+	mux.HandleFunc("DELETE /v1/workspaces/{name}", s.handleDeleteWorkspace)
 	mux.HandleFunc("GET /v1/models", s.handleListModels)
 	mux.HandleFunc("GET /v1/models/{name}", s.handleGetModel)
 	mux.HandleFunc("DELETE /v1/models/{name}", s.handleDeleteModel)
@@ -431,12 +432,17 @@ func (s *Server) handleTaskExec(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadGateway, "exec: %v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"stdout":    res.Stdout,
 		"stderr":    res.Stderr,
 		"exitCode":  res.ExitCode,
 		"truncated": res.Truncated,
-	})
+	}
+	if res.PctFailed {
+		out["pctFailed"] = true
+		out["pctReason"] = res.PctReason
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleListWorkspaces(w http.ResponseWriter, _ *http.Request) {
@@ -462,6 +468,22 @@ func (s *Server) handleGetWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, ws)
+}
+
+// Deleting a Workspace is immediate (declarative config, no status): tasks
+// already provisioned keep their cloned copy, and only future applies that
+// reference the name fail to resolve at provision time.
+func (s *Server) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteWorkspace(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, _ *http.Request) {

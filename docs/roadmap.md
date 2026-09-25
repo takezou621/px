@@ -2,6 +2,47 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
+## M5 — API completeness & operational robustness (done)
+
+Pulled up from the backlog after M4: small items that close visible holes
+rather than add new surfaces. Order: workspace deletion first (user-visible
+404 bug), then exec result layering, then the sshexec work (ctx, tests).
+
+- [x] Workspace deletion (`DELETE /v1/workspaces/{name}` + `px delete
+  workspace NAME`) — previously the CLI routed `delete workspace X` to the
+  task endpoint and reported a misleading 404 (found in the M2 E2E).
+  Deletion is safe: running tasks keep their cloned copy; only future
+  applies referencing the name fail to resolve. Declarative config, so
+  deletion is immediate — no reconcile, no status. The store keeps the
+  delete single-statement like the other deletes; the CLI routes on the
+  resource word, not the noun order.
+- [x] Distinguish "pct exec itself failed" from "command exited non-zero"
+  in `Exec` results, so the CLI can say which layer failed instead of
+  printing an empty stdout with an unrelated exit code. The node-side
+  wrapper guards on `pct status` output (`status: running` — the exit code
+  alone is zero for a stopped container too) and prints a verdict line
+  (`PX_PCT:<n>` / `PX_PCT_ABSENT`) on stderr after a leading newline, so it
+  is an exact final line even when the command's stderr lacks one;
+  `ExecResult` carries `pctFailed`/`pctReason`, stdout stays byte-exact,
+  and the verdict is trimmed off stderr only on an exact tail match and
+  only while stderr survived the cap uncropped. No verdict at all is
+  fail-closed (pctFailed, ExitCode -1).
+- [x] sshexec accepts a `context.Context`: the HTTP handler's request
+  context propagates, so a client disconnect cancels the in-flight exec
+  (previously it ran to the 2-minute cap). Cancelation closes the session
+  but not the shared client, and is never a redial — it races `NewSession`
+  too, so a node that stalls mid-handshake cannot hang a canceled call.
+  `redial` no longer closes whatever client is current: it only replaces
+  the client the failed attempt actually used (runStreams returns it), so
+  a concurrent re-dial by another caller is kept, not torn down.
+- [x] sshexec fake-server tests: an in-process SSH server (x/crypto/ssh,
+  per-exec handler) covers dial/auth, redial after a mid-run drop, the
+  one-shot no-retry path, the per-call timeout, ctx cancel + shared-client
+  survival, and stdout/stderr separation — previously covered only by the
+  in-memory executor fake at the server layer. The redial tests also count
+  TCP connections at the server, so a "retry" that reused the failed
+  connection (or tore down another caller's re-dial) would fail the count.
+
 ## M0 — Foundation (done)
 
 - [x] Vision, architecture doc, repo layout
@@ -370,22 +411,5 @@ Goal: `px apply` a Task and watch it run in an LXC container.
 
 ## Backlog
 
-Small items deferred from reviews; not scheduled.
-
-- sshexec accepts no `context.Context`: the HTTP handler's request
-  context does not propagate, so a client disconnect leaves exec running
-  up to the 2-minute cap. Thread ctx through the sshexec API (touches
-  every caller; also revisit whether `redial` should close a shared,
-  possibly-in-use client).
-- sshexec has no fake-server tests: dial/redial, the 2-minute timeout
-  path, and stdout/stderr stream separation are covered only by the
-  in-memory executor fake at the server layer, not against a real SSH
-  session.
-- Distinguish "pct exec itself failed" from "command exited non-zero"
-  in `Exec` results, so the CLI can say which layer failed.
-- Workspace deletion: `DELETE /v1/workspaces/{name}` and
-  `px delete workspace NAME` do not exist (found in E2E — the CLI
-  currently routes `delete workspace X` to the task endpoint and gets
-  a misleading 404). A deletion is safe: running tasks keep their
-  cloned copy; only future applies referencing the name fail to
-  resolve.
+Small items deferred from reviews; not scheduled. (The former backlog's
+four items moved to M5, 2026-09-26.)

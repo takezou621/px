@@ -246,6 +246,17 @@ func (s *Store) ListWorkspaces() ([]*v1alpha1.Workspace, error) {
 	return wss, rows.Err()
 }
 
+func (s *Store) DeleteWorkspace(name string) error {
+	res, err := s.db.Exec(`DELETE FROM workspaces WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // UpsertModel stores the model spec (including its API key — write-only at
 // the API layer, see server.redacted).
 func (s *Store) UpsertModel(m *v1alpha1.Model) error {

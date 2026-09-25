@@ -5,6 +5,7 @@ package sshexec
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -359,12 +360,15 @@ func (w *lockedWriter) String() string {
 // exits non-zero is not a connection failure and is not retried. Each attempt
 // starts from a fresh buffer: a retry means the previous attempt died
 // mid-flight, and its partial output must not splice into the final result.
-func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
+// A canceled ctx is never a redial — the connection is fine, only the caller
+// is gone. The retry dials only if the client the failed attempt actually
+// used is still current; another caller's re-dial is left alone.
+func (e *Executor) Run(ctx context.Context, cmd string, timeout time.Duration) (string, int, error) {
 	var out lockedWriter
-	code, err := e.RunStreamsOnce(cmd, timeout, &out, &out)
-	if err != nil && e.redial() {
+	used, code, err := e.runStreams(ctx, cmd, timeout, &out, &out)
+	if err != nil && ctx.Err() == nil && e.redial(used) {
 		out = lockedWriter{}
-		code, err = e.RunStreamsOnce(cmd, timeout, &out, &out)
+		_, code, err = e.runStreams(ctx, cmd, timeout, &out, &out)
 	}
 	return out.String(), code, err
 }
@@ -374,22 +378,62 @@ func (e *Executor) Run(cmd string, timeout time.Duration) (string, int, error) {
 // twice), and it never retries: the caller running a one-shot user command
 // (`px exec`) must not have it executed a second time — a retry repeats side
 // effects and splices the first attempt's partial output into the result. A
-// failure here is final; the user re-runs the command.
-func (e *Executor) RunStreamsOnce(cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
+// failure here is final; the user re-runs the command. A canceled ctx closes
+// the session (killing the remote command) but not the shared client, which
+// other users of the node still hold.
+func (e *Executor) RunStreamsOnce(ctx context.Context, cmd string, timeout time.Duration, stdout, stderr io.Writer) (int, error) {
+	_, code, err := e.runStreams(ctx, cmd, timeout, stdout, stderr)
+	return code, err
+}
+
+// runStreams is RunStreamsOnce, also returning the client the attempt ran on
+// so a retrying caller can redial exactly that connection.
+func (e *Executor) runStreams(ctx context.Context, cmd string, timeout time.Duration, stdout, stderr io.Writer) (*ssh.Client, int, error) {
 	e.mu.Lock()
 	client := e.client
 	e.mu.Unlock()
 	if client == nil {
-		return -1, fmt.Errorf("ssh not connected")
+		return nil, -1, fmt.Errorf("ssh not connected")
 	}
-	sess, err := client.NewSession()
-	if err != nil {
-		return -1, err
+	// NewSession opens a channel on the live connection and can stall if the
+	// node stops answering without dropping TCP, so race it against ctx: a
+	// cancel returns promptly. A session that still arrives afterwards is
+	// closed as soon as it opens — the shared client stays up.
+	resCh := make(chan sessionResult, 1)
+	go func() {
+		sess, err := client.NewSession()
+		resCh <- sessionResult{sess: sess, err: err}
+	}()
+	var sess *ssh.Session
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return client, -1, res.err
+		}
+		sess = res.sess
+	case <-ctx.Done():
+		go func() {
+			if res := <-resCh; res.sess != nil {
+				_ = res.sess.Close()
+			}
+		}()
+		return client, -1, fmt.Errorf("canceled: %w", ctx.Err())
 	}
 	defer sess.Close()
 	if timeout > 0 {
 		t := time.AfterFunc(timeout, func() { _ = sess.Close() })
 		defer t.Stop()
+	}
+	if done := ctx.Done(); done != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-done:
+				_ = sess.Close()
+			case <-stop:
+			}
+		}()
 	}
 	// Leaving a stream unset would wire the session to os.Stdout of this
 	// process; everything must land in the caller's writers.
@@ -401,19 +445,46 @@ func (e *Executor) RunStreamsOnce(cmd string, timeout time.Duration, stdout, std
 	if stderr != nil {
 		sess.Stderr = stderr
 	}
-	err = sess.Run(cmd)
+	err := sess.Run(cmd)
 	if err != nil {
-		if ee, ok := err.(*ssh.ExitError); ok {
-			return ee.ExitStatus(), nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return client, -1, fmt.Errorf("canceled: %w", ctxErr)
 		}
-		return -1, err
+		if ee, ok := err.(*ssh.ExitError); ok {
+			return client, ee.ExitStatus(), nil
+		}
+		return client, -1, err
 	}
-	return 0, nil
+	return client, 0, nil
 }
 
-func (e *Executor) redial() bool {
+// sessionResult carries a NewSession outcome across the race goroutine.
+type sessionResult struct {
+	sess *ssh.Session
+	err  error
+}
+
+// current reports the live client, or nil after a failed redial. A read-only
+// helper for callers that need to observe the connection identity (tests, and
+// nothing else).
+func (e *Executor) current() *ssh.Client {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.client
+}
+
+// redial replaces the connection after a failed attempt. The caller passes
+// the client its attempt actually ran on (runStreams returns it), so the
+// only client ever closed is the one known to have failed: a concurrent
+// caller may have already re-dialed between that attempt's failure and now,
+// and their client is healthy — blindly closing whatever is current (the old
+// behavior) would tear down sessions it just started.
+func (e *Executor) redial(prev *ssh.Client) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.client != prev {
+		return e.client != nil
+	}
 	if e.client != nil {
 		_ = e.client.Close()
 	}

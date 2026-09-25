@@ -439,18 +439,69 @@ func TestQuoteCommandExportsGoalAndQuotesArgv(t *testing.T) {
 
 // The exec command line must quote every argument for both shells it crosses:
 // metacharacters, whitespace and quotes reach pct's argv byte-exact, and the
-// caller's `; rm -rf /` stays an inert argument, never a second command.
+// caller's `; rm -rf /` stays an inert argument, never a second command. The
+// wrapper shape (status guard + verdict trailer on stderr) lets Exec tell a
+// pct-level refusal from a command's own non-zero exit.
 func TestPctExecCommandQuotesArgv(t *testing.T) {
 	out := pctExecCommand(142, []string{"sh", "-c", "echo hi; rm -rf /"})
-	if out != `pct exec 142 -- 'sh' '-c' 'echo hi; rm -rf /'` {
+	want := `if pct status 142 2>/dev/null | grep -q '^status: running$'; then pct exec 142 -- 'sh' '-c' 'echo hi; rm -rf /';` +
+		" printf '\\nPX_PCT:%s\\n' \"$?\" >&2; else printf '\\nPX_PCT_ABSENT\\n' >&2; fi"
+	if out != want {
 		t.Fatalf("got %q", out)
 	}
 	out = pctExecCommand(7, []string{"it's", "a b", `"q"`})
-	if out != `pct exec 7 -- 'it'\''s' 'a b' '"q"'` {
+	if out != `if pct status 7 2>/dev/null | grep -q '^status: running$'; then pct exec 7 -- 'it'\''s' 'a b' '"q"';`+
+		" printf '\\nPX_PCT:%s\\n' \"$?\" >&2; else printf '\\nPX_PCT_ABSENT\\n' >&2; fi" {
 		t.Fatalf("got %q", out)
 	}
-	if out := pctExecCommand(7, nil); out != "pct exec 7 --" {
+	if out := pctExecCommand(7, nil); out != `if pct status 7 2>/dev/null | grep -q '^status: running$'; then pct exec 7 --;`+
+		" printf '\\nPX_PCT:%s\\n' \"$?\" >&2; else printf '\\nPX_PCT_ABSENT\\n' >&2; fi" {
 		t.Fatalf("empty argv got %q", out)
+	}
+}
+
+// The verdict must be the exact final line of the tail: user output that
+// merely contains the text (earlier lines, or a line joined with other
+// output) is not a verdict, and an absent verdict fails closed.
+func TestPctVerdict(t *testing.T) {
+	code, absent, ok := pctVerdict("cmd out\nPX_PCT:0\n")
+	if !ok || absent || code != 0 {
+		t.Fatalf("PX_PCT:0 got (%d, %v, %v)", code, absent, ok)
+	}
+	code, absent, ok = pctVerdict("PX_PCT:3")
+	if !ok || absent || code != 3 {
+		t.Fatalf("PX_PCT:3 (no trailing newline) got (%d, %v, %v)", code, absent, ok)
+	}
+	code, absent, ok = pctVerdict("x\nPX_PCT_ABSENT\n")
+	if !ok || !absent || code != 0 {
+		t.Fatalf("absent got (%d, %v, %v)", code, absent, ok)
+	}
+	// Non-verdict tails: a mid-stream mention, garbage, an empty tail, a
+	// negative code ($? is never negative), or output joined onto the marker
+	// without a separating newline — which the wrapper's leading \n exists
+	// to prevent.
+	for _, tail := range []string{"", "PX_PCT:0 lost\nnext line\n", "px says PX_PCT: hi\n", "PX_PCT:notanumber\n", "x\nPX_PCT:-5\n", "oopsPX_PCT:1\n"} {
+		if _, _, ok := pctVerdict(tail); ok {
+			t.Fatalf("tail %q must not parse as a verdict", tail)
+		}
+	}
+}
+
+// tailWriter hands back only the stream's final bytes, so the verdict rides
+// out even when the capped stream truncated long before it.
+func TestTailWriterKeepsTail(t *testing.T) {
+	w := &tailWriter{}
+	w.Write([]byte(strings.Repeat("a", 200)))
+	w.Write([]byte("PX_PCT:0\n"))
+	if got := w.String(); len(got) != len(w.buf) {
+		t.Fatalf("tail must cap at %d bytes, got %d", len(w.buf), len(got))
+	}
+	if !strings.HasSuffix(w.String(), "PX_PCT:0\n") {
+		t.Fatalf("tail lost the verdict: %q", w.String())
+	}
+	w.Write([]byte(strings.Repeat("b", 100)))
+	if got := w.String(); len(got) != 64 || !strings.HasSuffix(got, strings.Repeat("b", 64)) {
+		t.Fatalf("tail must keep the most recent 64 bytes, got %d bytes", len(got))
 	}
 }
 

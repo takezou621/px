@@ -169,6 +169,22 @@ func TestMarkTaskPhaseCAS(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDeletion(t *testing.T) {
+	st := openTestStore(t)
+	if err := st.UpsertWorkspace(testWorkspace("ws1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteWorkspace("ws1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetWorkspace("ws1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound after delete, got %v", err)
+	}
+	if err := st.DeleteWorkspace("ws1"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound for a second delete, got %v", err)
+	}
+}
+
 // UpsertTask must never erase a deletion request that was persisted while the
 // caller held a stale snapshot. Also exercises json_set/json_extract, which
 // the mark-preserving UPSERT depends on.

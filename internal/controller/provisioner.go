@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,13 +139,14 @@ func fixedNodePVE(c *proxmox.Client) func(string) *proxmox.Client {
 }
 
 // nodeSSH runs one command on the given node, dialing that node's executor
-// on first use.
-func (p *provisioner) nodeSSH(node, cmd string, timeout time.Duration) (string, int, error) {
+// on first use. The caller's ctx propagates, so a canceled reconcile or a
+// disconnected HTTP client kills the in-flight remote command.
+func (p *provisioner) nodeSSH(ctx context.Context, node, cmd string, timeout time.Duration) (string, int, error) {
 	e, err := p.ssh.Executor(node)
 	if err != nil {
 		return "", -1, err
 	}
-	return e.Run(cmd, timeout)
+	return e.Run(ctx, cmd, timeout)
 }
 
 // cgroupOpTimeout bounds one node-level cgroup probe or write: a single SSH
@@ -228,7 +231,7 @@ func (p *provisioner) setFrozen(ctx context.Context, node string, vmid int, free
 	if freeze {
 		want = "1"
 	}
-	out, code, err := p.nodeSSH(node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
+	out, code, err := p.nodeSSH(ctx, node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
 [ -n "$p" ] || { echo PX_NO_CGROUP; exit 1; }
 echo %s > "/sys/fs/cgroup$p/cgroup.freeze"`, pid, want), cgroupOpTimeout)
 	if err != nil {
@@ -256,7 +259,7 @@ func (p *provisioner) Frozen(ctx context.Context, node string, vmid int) (bool, 
 	if err != nil {
 		return false, err
 	}
-	out, code, err := p.nodeSSH(node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
+	out, code, err := p.nodeSSH(ctx, node, fmt.Sprintf(`p=$(sed -n 's/^0:://p' /proc/%d/cgroup)
 [ -n "$p" ] || { echo PX_NO_CGROUP; exit 1; }
 [ -r "/sys/fs/cgroup$p/cgroup.events" ] || { echo PX_NO_EVENTS; exit 1; }
 grep -qx 'frozen 1' "/sys/fs/cgroup$p/cgroup.events" && echo PX_FROZEN=1 || echo PX_FROZEN=0`, pid), cgroupOpTimeout)
@@ -502,7 +505,7 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, node string,
 	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
 	// top of the plain boot, so give each workspace its own 30s budget.
 	bootTimeout := 60*time.Second + time.Duration(len(mounts))*30*time.Second
-	out, code, err := p.nodeSSH(node, bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts, model)), bootTimeout)
+	out, code, err := p.nodeSSH(ctx, node, bootCommand(vmid, t.Spec.Runner.User, runnerScript(t, mounts, model)), bootTimeout)
 	if err != nil || code != 0 || !strings.Contains(out, "PX_BOOT_OK") {
 		_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 		return fmt.Errorf("boot runner: exit=%d out=%q err=%v", code, strings.TrimSpace(out), err)
@@ -580,7 +583,7 @@ func (p *provisioner) waitForEgressEnforcement(ctx context.Context, node string,
 		shellQuote(chain), shellQuote(chain))
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		_, code, err := p.nodeSSH(node, probe, 10*time.Second)
+		_, code, err := p.nodeSSH(ctx, node, probe, 10*time.Second)
 		if err == nil && code == 0 {
 			return nil
 		}
@@ -628,7 +631,7 @@ func (p *provisioner) applyResources(ctx context.Context, node string, vmid int,
 	if len(parts) == 0 {
 		return nil
 	}
-	out, code, err := p.nodeSSH(node, fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
+	out, code, err := p.nodeSSH(ctx, node, fmt.Sprintf("pct set %d %s", vmid, strings.Join(parts, " ")), 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -639,7 +642,7 @@ func (p *provisioner) applyResources(ctx context.Context, node string, vmid int,
 }
 
 func (p *provisioner) Exit(ctx context.Context, node string, vmid int) (*int, error) {
-	out, code, err := p.nodeSSH(node,
+	out, code, err := p.nodeSSH(ctx, node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("cat /run/px/exit 2>/dev/null || echo __RUNNING__")),
 		30*time.Second)
 	if err != nil {
@@ -674,7 +677,7 @@ func (p *provisioner) Booted(ctx context.Context, node string, vmid int) (bool, 
 	// clone step died prints "no" and is cleaned up, while a transient pct
 	// failure on a live container must not be read as "unbooted" (that would
 	// destroy a runner that may be mid-boot).
-	out, code, err := p.nodeSSH(node,
+	out, code, err := p.nodeSSH(ctx, node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("test -f /run/px/booted; echo PX_PROBE:$?")),
 		30*time.Second)
 	if err != nil {
@@ -713,7 +716,7 @@ func probeVerdict(out string) (bool, error) {
 }
 
 func (p *provisioner) Logs(ctx context.Context, node string, vmid int) (string, error) {
-	out, _, err := p.nodeSSH(node,
+	out, _, err := p.nodeSSH(ctx, node,
 		fmt.Sprintf("pct exec %d -- sh -c %s", vmid, shellQuote("cat /run/px/task.log 2>/dev/null || echo '(no log yet)'")),
 		30*time.Second)
 	return out, err
@@ -730,18 +733,24 @@ const maxExecStreamBytes = 1 << 20
 
 // ExecResult is one `px exec` invocation's outcome. Truncated marks a stream
 // that overflowed maxExecStreamBytes (the excess is discarded, the command
-// keeps running to completion).
+// keeps running to completion). PctFailed marks that the command never ran:
+// pct refused the dispatch at probe time (container absent or stopped), so
+// ExitCode is meaningless and PctReason names the failure — a non-zero exit
+// from a command that did run is a result, not a pct failure.
 type ExecResult struct {
 	Stdout    string
 	Stderr    string
 	ExitCode  int
 	Truncated bool
+	PctFailed bool
+	PctReason string
 }
 
 func (p *provisioner) Exec(ctx context.Context, node string, vmid int, argv []string) (*ExecResult, error) {
 	// max must be set explicitly: the zero value (0) would drop every byte.
 	stdout := &cappedWriter{max: maxExecStreamBytes}
 	stderr := &cappedWriter{max: maxExecStreamBytes}
+	tail := &tailWriter{}
 	e, err := p.ssh.Executor(node)
 	if err != nil {
 		return nil, err
@@ -749,18 +758,97 @@ func (p *provisioner) Exec(ctx context.Context, node string, vmid int, argv []st
 	// RunStreamsOnce, never a retrying path: a retry would re-run a command
 	// that may have already started (repeating its side effects) and splice
 	// the first attempt's partial output into the result. A failed exec is
-	// final — the user re-runs it.
-	code, err := e.RunStreamsOnce(pctExecCommand(vmid, argv), execTimeout, stdout, stderr)
+	// final — the user re-runs it. ctx propagates: a disconnected px client
+	// kills the in-flight command instead of letting it run to the cap.
+	code, err := e.RunStreamsOnce(ctx, pctExecCommand(vmid, argv), execTimeout, stdout, io.MultiWriter(stderr, tail))
 	if err != nil {
 		return nil, err
 	}
-	return &ExecResult{
+	res := &ExecResult{
 		Stdout:    stdout.String(),
 		Stderr:    stderr.String(),
-		ExitCode:  code,
 		Truncated: stdout.truncated || stderr.truncated,
-	}, nil
+	}
+	exit, absent, ok := pctVerdict(tail.String())
+	// The verdict is only trimmable while stderr is intact: once the stream
+	// hit the cap the verdict lies beyond it, and an exact-tail match against
+	// user output would delete the user's bytes instead.
+	trimVerdict := func(verdict string) {
+		if !stderr.truncated {
+			res.Stderr = strings.TrimSuffix(res.Stderr, verdict)
+		}
+	}
+	switch {
+	case absent:
+		res.PctFailed = true
+		res.PctReason = fmt.Sprintf("ct %d is not running (pct status failed)", vmid)
+		trimVerdict(pctAbsentVerdict)
+	case ok:
+		res.ExitCode = exit
+		trimVerdict(fmt.Sprintf("\nPX_PCT:%d\n", exit))
+	default:
+		// The wrapper died without printing a verdict (connection severed
+		// mid-run is the err path above; reaching here means the node shell
+		// itself failed). No exit code is trustworthy — say so rather than
+		// reporting pct's shell exit as the command's.
+		res.PctFailed = true
+		res.ExitCode = -1
+		res.PctReason = fmt.Sprintf("no verdict from the node (ssh exit %d)", code)
+	}
+	return res, nil
 }
+
+// pctAbsentVerdict is what the exec wrapper prints to stderr when the
+// container failed the running probe: the command never ran.
+const pctAbsentVerdict = "\n" + absentMark + "\n"
+
+// absentMark is that verdict without its framing newlines — the exact line
+// pctVerdict matches on.
+const absentMark = "PX_PCT_ABSENT"
+
+// pctVerdict parses the trailing PX_PCT:<n> / PX_PCT_ABSENT line the exec
+// wrapper prints to stderr. Only an exact final line counts — user output
+// that merely contains the text is not a verdict.
+func pctVerdict(tail string) (exitCode int, absent bool, ok bool) {
+	s := strings.TrimSuffix(tail, "\n")
+	line := s
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		line = s[i+1:]
+	}
+	if line == absentMark {
+		return 0, true, true
+	}
+	// $? is never negative; refusing negatives keeps a user line like
+	// "PX_PCT:-5" from parsing as a verdict by accident.
+	if code, err := strconv.Atoi(strings.TrimPrefix(line, "PX_PCT:")); err == nil && code >= 0 && strings.HasPrefix(line, "PX_PCT:") {
+		return code, false, true
+	}
+	return 0, false, false
+}
+
+// tailWriter keeps the last few bytes of a stream on their own: the verdict
+// trailer rides the end of stderr, past anything cappedWriter keeps for the
+// user, so a truncated stream cannot eat it.
+type tailWriter struct {
+	buf [64]byte
+	n   int
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	if len(p) >= len(w.buf) {
+		w.n = copy(w.buf[:], p[len(p)-len(w.buf):])
+		return len(p), nil
+	}
+	if w.n+len(p) > len(w.buf) {
+		shift := w.n + len(p) - len(w.buf)
+		copy(w.buf[:], w.buf[shift:w.n])
+		w.n -= shift
+	}
+	w.n += copy(w.buf[w.n:], p)
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string { return string(w.buf[:w.n]) }
 
 // newCappedWriter is the only way to build a cappedWriter outside tests: a
 // zero-value cappedWriter has max 0 and would silently discard all output.
@@ -770,13 +858,26 @@ func newCappedWriter(max int) *cappedWriter { return &cappedWriter{max: max} }
 // shells (SSH's remote shell, then pct's argv) as a POSIX single-quoted word,
 // so what the caller wrote reaches the container byte-exact — same discipline
 // the boot script enforces by embedding everything base64.
+//
+// pct propagates the command's exit status, so a non-zero code alone cannot
+// say whether pct or the command failed. The wrapper probes the container and
+// only proceeds when it reports "status: running" — pct status exits zero for
+// a stopped container too, so the probe must read its output, not just its
+// exit code. The verdict line goes to stderr, preceded by a newline so it is
+// an exact final line even when the command's own stderr does not end in one
+// — stdout stays untouched so `px exec` output remains byte-exact;
+// provisioner.Exec strips the verdict from stderr before returning it. A pct
+// exec that fails inside pct (container stopping between probe and exec, or
+// an internal pct error) is indistinguishable from a command exit and is
+// reported as one; both are non-zero, and pct's own message reaches stderr.
 func pctExecCommand(vmid int, argv []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "pct exec %d --", vmid)
+	fmt.Fprintf(&b, "if pct status %d 2>/dev/null | grep -q '^status: running$'; then pct exec %d --", vmid, vmid)
 	for _, a := range argv {
 		b.WriteByte(' ')
 		b.WriteString(shellQuote(a))
 	}
+	b.WriteString(`; printf '\nPX_PCT:%s\n' "$?" >&2; else printf '\nPX_PCT_ABSENT\n' >&2; fi`)
 	return b.String()
 }
 

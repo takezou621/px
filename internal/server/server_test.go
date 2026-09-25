@@ -221,6 +221,44 @@ func TestWorkspaces(t *testing.T) {
 	if resp3.StatusCode != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", resp3.StatusCode)
 	}
+
+	// Delete removes it; a second delete is 404 (no idempotence for
+	// declarative config), and the name is gone from get and list.
+	del := func() (*http.Response, []byte, error) {
+		req, err := http.NewRequest(http.MethodDelete, srv.URL+"/v1/workspaces/demo", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, body, nil
+	}
+	delResp, delBody, err := del()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delResp.StatusCode != 200 || !strings.Contains(string(delBody), "deleted") {
+		t.Fatalf("delete: want 200 deleted, got %d: %s", delResp.StatusCode, delBody)
+	}
+	resp4, err := http.Get(srv.URL + "/v1/workspaces/demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusNotFound {
+		t.Fatalf("workspace must be gone after delete, got %d", resp4.StatusCode)
+	}
+	resp5, _, err := del()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp5.StatusCode != http.StatusNotFound {
+		t.Fatalf("second delete: want 404, got %d", resp5.StatusCode)
+	}
 }
 
 // The whole apply is one store transaction, so document order cannot matter:
@@ -402,12 +440,14 @@ func TestModels(t *testing.T) {
 // execProv records the argv an exec handed it and returns canned results.
 type execProv struct {
 	nopProv
-	mu       sync.Mutex
-	argv     []string
-	stdout   string
-	stderr   string
-	exitCode int
-	err      error
+	mu        sync.Mutex
+	argv      []string
+	stdout    string
+	stderr    string
+	exitCode  int
+	err       error
+	pctFailed bool
+	pctReason string
 	// noOwn/ownErr shape the Owned verdict (true, nil by default).
 	noOwn  bool
 	ownErr error
@@ -420,7 +460,13 @@ func (p *execProv) Exec(_ context.Context, _ string, _ int, argv []string) (*con
 	if p.err != nil {
 		return nil, p.err
 	}
-	return &controller.ExecResult{Stdout: p.stdout, Stderr: p.stderr, ExitCode: p.exitCode}, nil
+	return &controller.ExecResult{
+		Stdout:    p.stdout,
+		Stderr:    p.stderr,
+		ExitCode:  p.exitCode,
+		PctFailed: p.pctFailed,
+		PctReason: p.pctReason,
+	}, nil
 }
 
 func (p *execProv) Owned(_ context.Context, _, _ string, _ int) (bool, error) {
@@ -541,6 +587,29 @@ func TestTaskExecReturnsResult(t *testing.T) {
 	}
 	if out.Stdout != "out\n" || out.Stderr != "err\n" || out.ExitCode != 3 || out.Truncated {
 		t.Fatalf("result = %+v", out)
+	}
+}
+
+// A pct-level refusal (ct not running, no verdict) still returns 200 with the
+// result, but flags the refusal so the CLI can report which layer failed.
+func TestTaskExecPctFailure(t *testing.T) {
+	prov := &execProv{pctFailed: true, pctReason: "ct 42 is not running (pct status failed)"}
+	srv, st := newExecServer(t, prov)
+	seedExecTask(t, st, v1alpha1.TaskRunning, 42, "n1")
+
+	resp, body := postExec(t, srv, `{"command": ["true"]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, body)
+	}
+	var out struct {
+		PctFailed bool   `json:"pctFailed"`
+		PctReason string `json:"pctReason"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if !out.PctFailed || out.PctReason != prov.pctReason {
+		t.Fatalf("pct failure not surfaced: %+v", out)
 	}
 }
 

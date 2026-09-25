@@ -327,6 +327,8 @@ func cmdExec(fs *flag.FlagSet, args []string) error {
 		Stderr    string `json:"stderr"`
 		ExitCode  int    `json:"exitCode"`
 		Truncated bool   `json:"truncated"`
+		PctFailed bool   `json:"pctFailed"`
+		PctReason string `json:"pctReason"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
 		return err
@@ -335,6 +337,12 @@ func cmdExec(fs *flag.FlagSet, args []string) error {
 	_, _ = os.Stderr.WriteString(out.Stderr)
 	if out.Truncated {
 		fmt.Fprintln(os.Stderr, "(px exec: output truncated at 1 MiB per stream)")
+	}
+	// A pct-level refusal means the command never ran: say which layer
+	// failed instead of exiting with an unrelated code.
+	if out.PctFailed {
+		fmt.Fprintf(os.Stderr, "px exec: pct refused the command: %s\n", out.PctReason)
+		os.Exit(1)
 	}
 	// Like kubectl, exit with the command's code. Everything above is already
 	// written synchronously, so skipping the deferred close hurts nothing.
@@ -346,13 +354,13 @@ func cmdExec(fs *flag.FlagSet, args []string) error {
 
 func cmdDelete(fs *flag.FlagSet, args []string) error {
 	kind := "task"
-	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway" || args[0] == "workspace") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME")
+		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME | delete workspace NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -376,6 +384,12 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		fmt.Printf("gateway.px.io/%s deleted\n", name)
+	case "workspace":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/workspaces/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("workspace.px.io/%s deleted\n", name)
 	}
 	return nil
 }
@@ -587,6 +601,7 @@ Usage:
   px delete task NAME             Delete a task and its container
   px delete model NAME            Delete a model
   px delete gateway NAME          Delete a gateway
+  px delete workspace NAME        Delete a workspace
   px suspend task NAME            Suspend a running task (freezes its container)
   px resume task NAME             Resume a suspended task
   px version                      Show version
