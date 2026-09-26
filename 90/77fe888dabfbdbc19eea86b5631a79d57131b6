@@ -1,0 +1,23 @@
+scripts/e2e-sessions.sh
+  s_e6a860663c7e72::t_a342b7f0b317da 23,26-27
+  s_e6a860663c7e72::t_68137ce7864692 175,191-198
+  s_e6a860663c7e72::t_d35f29ef517f00 199-201
+docs/roadmap.md
+  s_e6a860663c7e72::t_674d26e4e2f99e 320
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9077fe888dabfbdbc19eea86b5631a79d57131b6",
+  "prompts": {},
+  "sessions": {
+    "s_e6a860663c7e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09127d2b-fdd9-4f3b-aa47-c9cb9d1842bd",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
