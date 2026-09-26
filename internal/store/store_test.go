@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"testing"
@@ -363,5 +364,86 @@ func TestModelLifecycle(t *testing.T) {
 	}
 	if err := st.DeleteModel("m1"); err != ErrNotFound {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// Session archives are upsert-by-task (a task owns at most one capture) and
+// the row dies with the task record — continuations read the capture only
+// while the source task exists.
+func TestSessionLifecycle(t *testing.T) {
+	st := openTestStore(t)
+
+	if _, err := st.GetSession("t1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound before save, got %v", err)
+	}
+	archive := []byte("tar.gz-archive-bytes")
+	if err := st.SaveSession("t1", archive); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSession("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, archive) {
+		t.Fatalf("archive not persisted: %q", got)
+	}
+
+	// Resaving replaces the blob (a retried capture overwrites nothing).
+	replaced := []byte("second-capture")
+	if err := st.SaveSession("t1", replaced); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetSession("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, replaced) {
+		t.Fatalf("resave did not replace: %q", got)
+	}
+
+	if err := st.DeleteSession("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession("t1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound after delete, got %v", err)
+	}
+	if err := st.DeleteSession("t1"); err != nil {
+		t.Fatalf("delete must be idempotent, got %v", err)
+	}
+
+	// A capture with no bytes is stored and read back empty-but-present:
+	// "the source ran, there was nothing to capture" — distinct from a
+	// missing row. (The controller only saves non-empty captures today, so
+	// this pins the store contract, not a path it drives.)
+	if err := st.SaveSession("empty", []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetSession("empty")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("empty capture: got %q err=%v", got, err)
+	}
+}
+
+// Recreating a task name clears any session row the previous record left
+// behind (a DeleteSession that failed mid-destroy, say): without this, a
+// later continueFrom on that name would silently restore a dead task's
+// session.
+func TestCreateTaskClearsStaleSessionRow(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.CreateTask(testTask("t1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSession("t1", []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteTask("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(testTask("t1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession("t1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a fresh record must clear the stale session row, got %v", err)
 	}
 }

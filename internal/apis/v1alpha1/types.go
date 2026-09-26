@@ -52,6 +52,20 @@ type TaskSpec struct {
 	// opt-in attack surface (see docs/threat-model.md) and requires a
 	// Running container, like exec.
 	Ports []PortSpec `json:"ports,omitempty" yaml:"ports,omitempty"`
+	// Session optionally continues a previous task's agent session: the
+	// controller captures the source task's ~/.claude/projects at its
+	// container teardown and unpacks it into this task's container before
+	// the runner boots. See the controller for reference validation —
+	// unknown/unfinished/uncaptured sources fail at provision, not here.
+	Session *SessionSpec `json:"session,omitempty" yaml:"session,omitempty"`
+}
+
+// SessionSpec references the task whose agent session this task continues.
+type SessionSpec struct {
+	// ContinueFrom names the source task: it must exist, be finished
+	// (Succeeded/Failed — ProvisionFailed never had a container), and
+	// still hold its captured session.
+	ContinueFrom string `json:"continueFrom" yaml:"continueFrom"`
 }
 
 // PortSpec publishes one TCP port: the container listens on Port, the node
@@ -218,6 +232,14 @@ type TaskStatus struct {
 	// The controller keeps the node-side forwards alive while the task is
 	// Running and removes them the moment it is not.
 	Ports []PortStatus `json:"ports,omitempty" yaml:"ports,omitempty"`
+	// SessionSaved reports the capture completed for this task's session:
+	// either the archive is in the store (SessionBytes > 0) or the task
+	// provably had nothing to capture (no container, or no session
+	// directory inside it). Destroy paths wait for this flag, so a task
+	// never loses its container before the capture is settled.
+	SessionSaved bool `json:"sessionSaved,omitempty" yaml:"sessionSaved,omitempty"`
+	// SessionBytes is the captured archive's size (0 = nothing to capture).
+	SessionBytes int `json:"sessionBytes,omitempty" yaml:"sessionBytes,omitempty"`
 }
 
 // PortStatus is the realized form of one spec.ports entry: the resolved
@@ -249,6 +271,13 @@ const (
 	MaxCIDRBytes    = 64       // per egress rule cidr
 	MaxPortsBytes   = 64       // per egress rule ports
 	MaxPorts        = 8        // per task spec.ports
+
+	// MaxSessionBytes caps a captured session archive (gzip+tar, before
+	// base64) — the SQLite BLOB side. Session JSONL is text and compresses
+	// an order of magnitude, so this bounds well beyond a plausible Claude
+	// Code conversation; a capture that exceeds it fails loudly rather
+	// than truncating into an unusable session.
+	MaxSessionBytes = 32 << 20
 
 	// HostPortMin/HostPortMax bound every published hostPort, explicit or
 	// auto-assigned: the px-reserved node port range (the NodePort
@@ -318,6 +347,22 @@ func ValidatePorts(ps []PortSpec) error {
 			return fmt.Errorf("ports[%d].hostPort %d is duplicated", i, p.HostPort)
 		}
 		hports[p.HostPort] = true
+	}
+	return nil
+}
+
+// ValidateSession checks spec.session's reference is a plausible task
+// name. Reachability (the source exists, is finished, still holds its
+// capture) is the controller's call at provision time — like Gateway,
+// an unresolvable reference resolves to ProvisionFailed rather than an
+// apply-time error, because a check that is true at apply can go stale
+// while the manifest sits in the store.
+func ValidateSession(s *SessionSpec) error {
+	if s == nil {
+		return nil
+	}
+	if err := ValidateName(s.ContinueFrom); err != nil {
+		return fmt.Errorf("session.continueFrom: %w", err)
 	}
 	return nil
 }

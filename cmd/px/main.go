@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -119,6 +120,11 @@ func (w *wsList) Set(v string) error {
 // --dangerously-skip-permissions under root/sudo outright.
 var defaultAgentCommand = []string{"sh", "-c", `IS_SANDBOX=1 claude --dangerously-skip-permissions -p "$GOAL"`}
 
+// continueAgentCommand is defaultAgentCommand's variant for a continued
+// session: --continue resumes the most recent conversation in the restored
+// ~/.claude/projects, and the goal arrives as the next user turn.
+var continueAgentCommand = []string{"sh", "-c", `IS_SANDBOX=1 claude --dangerously-skip-permissions --continue -p "$GOAL"`}
+
 // splitRunArgs splits args at the first bare "--": everything before it
 // goes to flag parsing, everything after is the explicit runner command.
 // The flag package stops at the first non-flag arg, so flags must precede
@@ -147,18 +153,46 @@ func cmdRun(fs *flag.FlagSet, args []string) error {
 	cores := fs.Int("cores", 0, "CPU cores (0 = template default)")
 	memory := fs.Int("memory", 0, "memory MB (0 = template default)")
 	noWait := fs.Bool("no-wait", false, "return immediately after apply")
+	continueFrom := fs.String("continue", "", "continue the finished task NAME's agent session, copying its spec")
 	flags, cmd := splitRunArgs(args)
 	if err := fs.Parse(flags); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return fmt.Errorf("usage: px run GOAL [-model NAME] [-workspace NAME[=GOAL]]... [-gateway NAME] [-- COMMAND...]")
+		return fmt.Errorf("usage: px run GOAL [-model NAME] [-workspace NAME[=GOAL]]... [-gateway NAME] [-continue TASK] [-- COMMAND...]")
 	}
 	if len(rest) > 1 {
 		return fmt.Errorf("unexpected arguments after the goal: %q (quote the goal; flags must precede it)", rest[1:])
 	}
 	goal := rest[0]
+
+	// -continue copies these from the source spec, so re-specifying one is
+	// a contradiction rather than an override. Detection uses flag.Visit —
+	// only flags the user actually set — so "-cores 0" is a rejection too,
+	// not a silent no-op the copy would clobber. Name and TTL stay local by
+	// design (a new task may well want a different TTL).
+	var src *v1alpha1.Task
+	if *continueFrom != "" {
+		copied := map[string]bool{"image": true, "model": true, "workspace": true, "gateway": true, "cores": true, "memory": true}
+		overridden := make([]string, 0, 7)
+		fs.Visit(func(f *flag.Flag) {
+			if copied[f.Name] {
+				overridden = append(overridden, "-"+f.Name)
+			}
+		})
+		if len(cmd) > 0 {
+			overridden = append(overridden, "-- COMMAND")
+		}
+		if len(overridden) > 0 {
+			return fmt.Errorf("-continue already copies image, model, gateway, workspaces and resources from task %s; drop %s",
+				*continueFrom, strings.Join(overridden, ", "))
+		}
+		if err := doJSON(http.MethodGet, "/v1/tasks/"+*continueFrom, nil, &src); err != nil {
+			return fmt.Errorf("read task %s to continue: %w", *continueFrom, err)
+		}
+	}
+
 	if len(cmd) == 0 {
 		cmd = defaultAgentCommand
 	}
@@ -184,6 +218,22 @@ func cmdRun(fs *flag.FlagSet, args []string) error {
 	for _, ref := range wss {
 		n, g, _ := strings.Cut(ref, "=")
 		t.Spec.Workspaces = append(t.Spec.Workspaces, v1alpha1.TaskWorkspace{Name: n, Goal: g})
+	}
+	if src != nil {
+		// Carry the source spec wholesale, then replace only what defines
+		// this run: a new goal, the session reference, and the locally
+		// chosen TTL (-ttl stays meaningful with -continue). Ports
+		// deliberately do not survive the copy — the follow-up is a fresh
+		// task, not a re-run of the source's exposure policy.
+		ttl := t.Spec.TTLSecondsAfterFinished
+		t.Spec = src.Spec
+		t.Spec.Goal = goal
+		t.Spec.TTLSecondsAfterFinished = ttl
+		t.Spec.Ports = nil
+		t.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: *continueFrom}
+		if slices.Equal(t.Spec.Runner.Command, defaultAgentCommand) {
+			t.Spec.Runner.Command = continueAgentCommand
+		}
 	}
 	body, err := yaml.Marshal(t)
 	if err != nil {

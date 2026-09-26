@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -256,7 +258,7 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 	// deterministic while still pinning WHEN enforcement is awaited.
 	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
 	p := &provisioner{
-		pve:    pve,
+		pve:     pve,
 		nodePVE: fixedNodePVE(pve),
 		// The ":1" port glued onto the host makes the pool's dial address
 		// ("127.0.0.1:1:22") unparseable, so the boot step fails fast and
@@ -274,7 +276,7 @@ func TestCreateOrdersEgressBeforeStart(t *testing.T) {
 		}}
 
 	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil,
-		&ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443"}}})
+		&ResolvedGateway{Name: "locked", Egress: []v1alpha1.EgressRule{{CIDR: "10.0.0.0/8", Ports: "443"}}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "boot runner") {
 		t.Fatalf("Create must fail at the (unreachable) SSH boot step, got: %v", err)
 	}
@@ -338,7 +340,7 @@ func TestCreateRefusesPrivilegedClone(t *testing.T) {
 	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
 	p := NewProvisioner(pve, fixedNodePVE(pve), sshexec.NewPool(time.Second, sshexec.Config{}, nil), "")
 
-	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil, nil)
+	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "privileged") {
 		t.Fatalf("a privileged clone must fail the provision naming the problem, got: %v", err)
 	}
@@ -578,6 +580,77 @@ func TestBootCommandUser(t *testing.T) {
 	}
 	if cmd := bootCommand(142, "", "echo hi"); strings.Contains(cmd, "--user") {
 		t.Fatalf("no --user expected for empty runner.user: %s", cmd)
+	}
+}
+
+// decodeSessionArchive must round-trip CaptureSession's output, and fail
+// loudly on garbage or on an archive over the cap — a silently truncated
+// session would continue with a corrupted conversation.
+func TestDecodeSessionArchiveCapsSize(t *testing.T) {
+	data, err := decodeSessionArchive(base64.StdEncoding.EncodeToString([]byte("archive")))
+	if err != nil || string(data) != "archive" {
+		t.Fatalf("round-trip: %q err=%v", data, err)
+	}
+	over := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), v1alpha1.MaxSessionBytes+1))
+	if _, err := decodeSessionArchive(over); err == nil {
+		t.Fatal("an over-cap archive must fail loudly")
+	}
+	if _, err := decodeSessionArchive("not base64!"); err == nil {
+		t.Fatal("garbage output must fail loudly")
+	}
+}
+
+// pct exec --user does not export HOME, so every session script resolves it
+// from the passwd entry and fails loudly rather than unpacking to an empty
+// path. The staging file is written umask 077, truncated on the first
+// chunk, appended after, and removed by the unpack.
+func TestSessionScriptsResolveHomeThemselves(t *testing.T) {
+	scripts := map[string]string{
+		"capture":   captureScript(),
+		"stage-1st": restoreStageScript(true, "AAAA"),
+		"stage-nth": restoreStageScript(false, "AAAA"),
+		"unpack":    restoreUnpackScript(),
+	}
+	for name, s := range scripts {
+		if !strings.Contains(s, `getent passwd $(id -u) | cut -d: -f6`) {
+			t.Fatalf("%s must resolve HOME itself: %s", name, s)
+		}
+		if !strings.Contains(s, `|| exit 3`) {
+			t.Fatalf("%s must fail loudly without a HOME: %s", name, s)
+		}
+	}
+	if !strings.Contains(scripts["stage-1st"], `>"$h/`) {
+		t.Fatalf("the first chunk must truncate: %s", scripts["stage-1st"])
+	}
+	if !strings.Contains(scripts["stage-nth"], `>>"$h/`) {
+		t.Fatalf("later chunks must append: %s", scripts["stage-nth"])
+	}
+	if !strings.Contains(scripts["unpack"], "rm -f") {
+		t.Fatalf("unpack must remove the staging file: %s", scripts["unpack"])
+	}
+	// The capture's du guard sits at twice the decoded cap: it is the
+	// remote check that stops a runaway directory from flowing through
+	// base64 before the decoded-size check can refuse it, and exit 42 is
+	// the settled-failure signal CaptureSession maps to ErrSessionTooLarge.
+	guard := fmt.Sprintf("-le %d", v1alpha1.MaxSessionBytes*2/1024)
+	if !strings.Contains(scripts["capture"], guard) || !strings.Contains(scripts["capture"], "exit 42") {
+		t.Fatalf("capture must refuse an over-cap directory remotely (want %q and exit 42): %s", guard, scripts["capture"])
+	}
+}
+
+// Chunks reassemble exactly; base64 concatenation decodes across boundaries
+// regardless of where they fall, so no multiple-of-4 constraint is needed.
+func TestChunkString(t *testing.T) {
+	if got := chunkString("", 4); len(got) != 1 || got[0] != "" {
+		t.Fatalf("empty input stays one empty chunk, got %q", got)
+	}
+	s := strings.Repeat("a", 10)
+	got := chunkString(s, 4)
+	if len(got) != 3 || got[2] != "aa" {
+		t.Fatalf("want 3 chunks, got %q", got)
+	}
+	if strings.Join(got, "") != s {
+		t.Fatal("chunks must reassemble the input")
 	}
 }
 

@@ -48,6 +48,102 @@ web-shaped has no way to show it to a human — the missing piece is
   needs an explicit allow for 30000–32767 in cluster.fw (see
   docs/e2e.md Prerequisites).
 
+## M8 — Session continuation (done 2026-09-26)
+
+Chosen 2026-09-26 after M7 (candidates: session continuation,
+observability, user-defined templates). M6 deferred this believing it
+needed snapshots or a shared volume; it turns out neither is true — the
+Claude Code conversation lives as JSONL files under the runner user's
+`~/.claude/projects`, a directory of text that tars to a few MB, so a
+capture/restore pair over the existing node-SSH + `pct exec` channel
+covers it. The gap today: a task's agent work evaporates when its
+container is destroyed at TTL cleanup or delete, so "run the follow-up
+against what the agent learned" is impossible. Scope: carry that
+conversation from a finished task into the next one.
+
+Design decisions:
+
+- What transfers: the runner user's `~/.claude/projects` only. Code
+  inheritance is already solved by git Workspaces — a continuing task
+  re-clones. Full-container snapshots (vzdump) are rejected as
+  minutes-heavy and modeling state px does not own; a shared LXC mount
+  (mpX) is rejected because `local`/`local-lvm` rootfs storage cannot
+  cross nodes, which would break M4 multi-node.
+- Capture window: a terminal task's container stays alive until TTL
+  cleanup or delete destroys it, so capture hooks the three paths that
+  destroy: the tick that settles Succeeded/Failed, the delete path, and
+  the TTL-destroy gate. Each saves once per task (a status flag marks
+  it), retries on the next tick when the SSH/capture step fails (the
+  RemovePorts pattern — destroy does not proceed past an uncaptured
+  task), and proceeds when the container is already gone (nothing to
+  capture, ProvisionFailed tasks included).
+- Storage: a `sessions` SQLite table (task name → gzip+base64 tar of
+  the archive, capped at 32 MiB — session JSONL is text and compresses
+  well), not the Task status JSON: status is re-persisted every tick and
+  must not carry megabytes. Status carries only a saved flag and byte
+  count. Deleting the source task drops its session row — `continueFrom`
+  reads the source task's own record, so the row's lifetime is the
+  source task's lifetime. (A source task with the default TTL never
+  auto-cleans, so the common case keeps working.)
+- Restore path: the continuing task's Create unpacks the archive inside
+  the container before the runner boots, through the same `pct exec`
+  channel in chunked base64 writes — the kernel's MAX_ARG_STRLEN caps a
+  single argv element at 128 KiB, so the boot-command embedding pattern
+  does not scale to megabytes. Everything runs as the runner user
+  (`pct exec --user`), staging under the user's own HOME (resolved
+  in-container via getent, never assumed), umask 077 like the rest of
+  the /run/px staging.
+- API: `spec.session.continueFrom: <taskname>`. Reference validation
+  mirrors the Gateway pattern: unknown source, source not yet finished,
+  or source without a captured session resolves to ProvisionFailed
+  before any container is created; a self-reference is an apply-time
+  rejection (knowable immediately). A continuing task copies nothing
+  from the source — its own spec is authoritative.
+- CLI: `px run --continue TASK "goal"` — sugar that copies the source
+  task's spec (image, runner command/user, resources, model, gateway,
+  workspaces), swaps the goal, sets continueFrom, and swaps the default
+  agent command for a `claude --continue` variant when the source used
+  the default. Flags that restate copied fields (-image, -model,
+  -workspace, -gateway, -cores, -memory) are rejected — the copy is the
+  point; -name, -ttl, -no-wait stay allowed. TTL and spec.ports are
+  deliberately not copied: a short TTL inherited by every link of a
+  chain would end sessions by accident, and an explicit hostPort still
+  claimed by the living source task would fail the apply.
+- Explicitly out: named Session resources (one conversation, many
+  tasks — revisit if divergence matters), `~/.claude.json` (settings,
+  not conversation), capture of a Running task's live state.
+
+- [x] `spec.session.continueFrom` + validation (self-ref rejected at
+  apply; unknown/unfinished/uncaptured source resolves to
+  ProvisionFailed)
+- [x] Capture on the three destroy paths (terminal tick, delete, TTL
+  gate), one save per task, retried until the container is gone
+- [x] `sessions` table in the store; source-task deletion drops the
+  row; status carries the saved flag and byte count
+- [x] Restore in Create before boot (chunked base64 through pct exec as
+  the runner user, HOME resolved in-container)
+- [x] `px run --continue`
+- [x] Unit tests: store round-trip, capture on each destroy path,
+  restore round-trip through the fake provisioner, validation matrix
+- [x] E2E on the real node (`scripts/e2e-session.sh`): a fake session
+  JSONL (no real API key, runner template suffices), capture on
+  success, restore into a continuing task whose runner reads the
+  restored file, ProvisionFailed for unknown/unfinished/uncaptured
+  sources, the TTL path, and cleanup
+
+Shipped after the double-agent self-review (Codex + a fresh Claude
+reviewer, independent passes over the same diff). Both flagged the
+capture path's missing ownership gate and a size-unbounded capture;
+the Claude pass additionally caught that `Owned()` checks the config
+hostname and returns true for a stopped container, so capture also
+probes `Running` before exec and settles when the container is gone
+(an uncapturable capture must not block delete/TTL forever). The
+capture settles rather than retries on a remote size refusal
+(`ErrSessionTooLarge`), the terminal-tick transition captures in the
+same tick to close a delete race, restore-stage writes run un-retried
+(a redialed chunk append would corrupt the archive), and a fresh task
+record clears any session row a same-named predecessor left behind.
+
 ## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,
@@ -107,8 +203,9 @@ experience of launching one. Scope:
   runnable in the template; task goal → GOAL; dummy-key Model fails
   cleanly with the provider error surfaced in the task log; cleanup
   leaves no containers. No credential needed, nothing left on the node.
-- Explicitly out: session continuation across tasks (needs snapshots or
-  a shared volume — deferred), interactive TTY exec (M4 deferral
+- Explicitly out: session continuation across tasks (deferred —
+  supersedes the snapshot/shared-volume assumption, see M8, which does
+  it with plain capture/restore), interactive TTY exec (M4 deferral
   stands), port exposure (M7 candidate).
 
 ## M5 — API completeness & operational robustness (done)

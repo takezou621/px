@@ -133,6 +133,9 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 		if err := ValidatePorts(s.Ports); err != nil {
 			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
 		}
+		if err := ValidateSession(s.Session); err != nil {
+			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
+		}
 		m.Task = s
 	case KindWorkspace:
 		s := &WorkspaceSpec{}

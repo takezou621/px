@@ -129,3 +129,134 @@ func TestSplitRunArgs(t *testing.T) {
 		})
 	}
 }
+
+// continueSource serves GET /v1/tasks/<name> with the source task and
+// captures the apply body, like captureTask.
+func continueSource(t *testing.T, src *v1alpha1.Task) (get func() *v1alpha1.Task) {
+	t.Helper()
+	var posted *v1alpha1.Task
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(src)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var task v1alpha1.Task
+		if err := yaml.Unmarshal(data, &task); err != nil {
+			http.Error(w, fmt.Sprintf("bad yaml: %v", err), http.StatusBadRequest)
+			return
+		}
+		posted = &task
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string][]string{"results": {"task.px.io/x applied"}})
+	}))
+	t.Cleanup(srv.Close)
+	serverURL = srv.URL
+	return func() *v1alpha1.Task { return posted }
+}
+
+func continueTaskSource() *v1alpha1.Task {
+	return &v1alpha1.Task{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   v1alpha1.ObjectMeta{Name: "src"},
+		Spec: v1alpha1.TaskSpec{
+			Image:                   "px-agent-debian12",
+			Goal:                    "old goal",
+			Runner:                  v1alpha1.RunnerSpec{Command: defaultAgentCommand},
+			Resources:               v1alpha1.Resources{Cores: 4, MemoryMB: 4096},
+			TTLSecondsAfterFinished: 60,
+			Model:                   "m1",
+			Gateway:                 "gw1",
+			Workspaces:              []v1alpha1.TaskWorkspace{{Name: "ws1", Goal: "fix"}},
+			Ports:                   []v1alpha1.PortSpec{{Name: "http", Port: 8080, HostPort: 31000}},
+		},
+	}
+}
+
+func TestCmdRunContinueCopiesSourceSpec(t *testing.T) {
+	get := continueSource(t, continueTaskSource())
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue", "src", "next goal"}); err != nil {
+		t.Fatalf("cmdRun: %v", err)
+	}
+	m := get()
+	if m == nil {
+		t.Fatal("no manifest posted")
+	}
+	if m.Spec.Goal != "next goal" {
+		t.Errorf("goal = %q, want the new positional goal", m.Spec.Goal)
+	}
+	if m.Spec.Image != "px-agent-debian12" || m.Spec.Model != "m1" || m.Spec.Gateway != "gw1" {
+		t.Errorf("copied spec fields: image=%q model=%q gateway=%q", m.Spec.Image, m.Spec.Model, m.Spec.Gateway)
+	}
+	if m.Spec.Resources.Cores != 4 || m.Spec.Resources.MemoryMB != 4096 {
+		t.Errorf("resources not copied: %+v", m.Spec.Resources)
+	}
+	if len(m.Spec.Workspaces) != 1 || m.Spec.Workspaces[0].Name != "ws1" {
+		t.Errorf("workspaces not copied: %+v", m.Spec.Workspaces)
+	}
+	// TTL and ports stay local to the source: a follow-up is a fresh task,
+	// not a re-run of the source's expiry and exposure policy.
+	if m.Spec.TTLSecondsAfterFinished != 0 {
+		t.Errorf("TTL must not survive the copy, got %d", m.Spec.TTLSecondsAfterFinished)
+	}
+	if len(m.Spec.Ports) != 0 {
+		t.Errorf("ports must not survive the copy, got %+v", m.Spec.Ports)
+	}
+	if m.Spec.Session == nil || m.Spec.Session.ContinueFrom != "src" {
+		t.Errorf("session reference missing: %+v", m.Spec.Session)
+	}
+	if !slices.Equal(m.Spec.Runner.Command, continueAgentCommand) {
+		t.Errorf("runner.command = %q, want the --continue variant %q", m.Spec.Runner.Command, continueAgentCommand)
+	}
+}
+
+func TestCmdRunContinueRejectsCopiedFields(t *testing.T) {
+	continueSource(t, continueTaskSource())
+	for _, args := range [][]string{
+		{"-model", "m2"},
+		{"-image", "tmpl"},
+		{"-workspace", "ws2"},
+		{"-gateway", "gw2"},
+		{"-cores", "2"},
+		{"-memory", "512"},
+		// Restating a default is a rejection too: the copy always wins, so
+		// these would silently no-op. flag.Visit sees the flags regardless
+		// of their value.
+		{"-image", "px-agent-debian12"},
+		{"-cores", "0"},
+		{"-memory", "0"},
+		{"-model", ""},
+	} {
+		fs := flag.NewFlagSet("run", flag.ContinueOnError)
+		full := append([]string{"-no-wait", "-continue", "src"}, append(args, "goal")...)
+		if err := cmdRun(fs, full); err == nil {
+			t.Errorf("-continue must reject re-specified %q", args)
+		}
+	}
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue", "src", "goal", "--", "claude", "--version"}); err == nil {
+		t.Error("-continue must reject an explicit runner command")
+	}
+}
+
+func TestCmdRunContinueKeepsNameAndTTL(t *testing.T) {
+	get := continueSource(t, continueTaskSource())
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue", "src", "-name", "cont1", "-ttl", "120", "goal"}); err != nil {
+		t.Fatalf("cmdRun: %v", err)
+	}
+	m := get()
+	if m.Metadata.Name != "cont1" {
+		t.Errorf("name = %q, want cont1", m.Metadata.Name)
+	}
+	if m.Spec.TTLSecondsAfterFinished != 120 {
+		t.Errorf("TTL = %d, want the flag's 120", m.Spec.TTLSecondsAfterFinished)
+	}
+}

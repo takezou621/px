@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/store"
 )
 
 // TaskReader gives the controller read access to persisted tasks.
@@ -35,6 +36,18 @@ type GatewayReader interface {
 	GetGateway(name string) (*v1alpha1.Gateway, error)
 }
 
+// SessionReader resolves continueFrom references against captured sessions.
+type SessionReader interface {
+	GetSession(task string) ([]byte, error)
+}
+
+// SessionWriter persists a captured session archive and drops the row when
+// the task record itself goes.
+type SessionWriter interface {
+	SaveSession(task string, data []byte) error
+	DeleteSession(task string) error
+}
+
 // TaskWriter lets the controller persist status changes. UpsertTask
 // implementations must preserve an already-persisted DeletionTimestamp: the
 // controller works on stale snapshots, and a status write must never erase a
@@ -56,7 +69,9 @@ type Controller struct {
 		WorkspaceReader
 		ModelReader
 		GatewayReader
+		SessionReader
 		TaskWriter
+		SessionWriter
 	}
 	prov Provisioner
 	log  *slog.Logger
@@ -69,7 +84,9 @@ func New(store interface {
 	WorkspaceReader
 	ModelReader
 	GatewayReader
+	SessionReader
 	TaskWriter
+	SessionWriter
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
 		store: store,
@@ -247,6 +264,10 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 	case v1alpha1.TaskResuming:
 		c.reconcileResuming(ctx, t)
 	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed, v1alpha1.TaskProvisionFail:
+		// Capture before the TTL gate: the container is the only source of
+		// the session, and this is the first tick the task is terminal —
+		// capture now and the TTL deadline can never race it.
+		c.captureSession(ctx, t)
 		c.cleanupAfterTTL(ctx, t)
 	}
 }
@@ -286,6 +307,12 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 		if t.Status.Phase == v1alpha1.TaskProvisioning {
 			c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
 		}
+		// The container never existed, so the session row — whose lifetime
+		// is the task record's — can only be absent; DeleteSession is
+		// idempotent, so settle it unconditionally.
+		if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
+			c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
+		}
 		if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 			c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
 		}
@@ -303,6 +330,9 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 			c.log.Warn("destroy: container already gone from cluster", "task", t.Metadata.Name, "vmid", vmid)
 			t.Status.Container = 0
 			c.persist(t)
+			if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
+				c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
+			}
 			if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 				c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
 			}
@@ -337,21 +367,30 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 	// now holds must not be thawed any more than destroyed. DestroyOwned
 	// re-checks, which shrinks (not closes) the window between the two
 	// checks — the same residual race the M3 guards accept.
-	switch owned, oerr := c.prov.Owned(ctx, t.Metadata.Name, node, vmid); {
+	owned := true
+	switch ownedRes, oerr := c.prov.Owned(ctx, t.Metadata.Name, node, vmid); {
 	case oerr != nil:
 		c.log.Error("destroy: check ownership", "task", t.Metadata.Name, "vmid", vmid, "err", oerr)
 		return
-	case !owned:
+	case !ownedRes:
 		c.log.Warn("destroy skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", vmid)
 		t.Status.Container = 0
+		owned = false
 		c.persist(t)
 	default:
 		// A suspended container cannot be stopped or destroyed through pct
 		// while frozen: thaw first. A stopped container fails the PID lookup,
-		// which is fine — only a frozen one needs the thaw.
+		// which is fine — only a frozen one needs the thaw. The thaw also
+		// unblocks this capture: a frozen cgroup blocks pct exec, and the
+		// capture must settle before the destroy below.
 		if err := c.prov.Thaw(ctx, node, vmid); err != nil {
 			c.log.Warn("thaw before destroy (ignored unless destroy also fails)", "task", t.Metadata.Name, "vmid", vmid, "err", err)
 		}
+	}
+	if owned && !c.captureSession(ctx, t) {
+		// Retry next tick: destroying now would drop the container before
+		// its session was settled.
+		return
 	}
 
 	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, node, vmid)
@@ -371,6 +410,9 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 	default:
 		t.Status.Container = 0
 		c.persist(t)
+	}
+	if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
+		c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
 	}
 	if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 		c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
@@ -392,6 +434,11 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	gw, err := c.resolveGateway(t)
+	if err != nil {
+		c.failProvision(t, err)
+		return
+	}
+	session, err := c.resolveSession(t)
 	if err != nil {
 		c.failProvision(t, err)
 		return
@@ -427,7 +474,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
-	if err := c.prov.Create(ctx, t, node, vmid, mounts, model, gw); err != nil {
+	if err := c.prov.Create(ctx, t, node, vmid, mounts, model, gw, session); err != nil {
 		// Create cleans up its own partial work, so the VMID no longer names
 		// a container of ours. Clear it: a later destroy must never target an
 		// id that Create may have lost to another owner (PVE's nextid is a
@@ -493,6 +540,38 @@ func (c *Controller) resolveGateway(t *v1alpha1.Task) (*ResolvedGateway, error) 
 	return &ResolvedGateway{Name: g.Metadata.Name, Egress: g.Spec.Egress}, nil
 }
 
+// resolveSession fetches the session archive a continueFrom reference asks
+// for, before any container work — same pattern as workspaces, model and
+// gateway: an unresolvable reference is a provision failure, not a container
+// that boots without the session it was told to continue. The source must be
+// finished (it can no longer write to the archive the continuing task gets)
+// and still hold its capture — a source with no captured session has nothing
+// to continue from, which is a loud failure rather than a silently fresh
+// session.
+func (c *Controller) resolveSession(t *v1alpha1.Task) ([]byte, error) {
+	if t.Spec.Session == nil {
+		return nil, nil
+	}
+	name := t.Spec.Session.ContinueFrom
+	src, err := c.store.GetTask(name)
+	if err != nil {
+		return nil, fmt.Errorf("resolve session source %q: %w", name, err)
+	}
+	switch src.Status.Phase {
+	case v1alpha1.TaskSucceeded, v1alpha1.TaskFailed:
+	default:
+		return nil, fmt.Errorf("session source %q is %s, not finished", name, src.Status.Phase)
+	}
+	data, err := c.store.GetSession(name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("session source %q has no captured session", name)
+		}
+		return nil, fmt.Errorf("read session %q: %w", name, err)
+	}
+	return data, nil
+}
+
 func (c *Controller) failProvision(t *v1alpha1.Task, err error) {
 	t.Status.Phase = v1alpha1.TaskProvisionFail
 	t.Status.Reason = err.Error()
@@ -516,6 +595,11 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 			t.Status.Reason = "container not running and no exit file: " + err.Error()
 			c.log.Warn("container died", "task", t.Metadata.Name, "vmid", t.Status.Container)
 			c.persist(t)
+			// Settle the capture in the same tick the terminal phase lands:
+			// a px run --continue issued the moment the phase is visible
+			// would otherwise race the next tick's terminal capture and
+			// resolve an empty session.
+			c.captureSession(ctx, t)
 			return
 		}
 		c.log.Warn("poll exit", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
@@ -536,6 +620,9 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 	}
 	c.log.Info("task finished", "task", t.Metadata.Name, "exit", *code, "phase", t.Status.Phase)
 	c.persist(t)
+	// Same-tick capture: see the container-died path above. A failed
+	// capture retries on the following terminal tick, unchanged.
+	c.captureSession(ctx, t)
 }
 
 // reconcileRunning polls the runner, but first adopts any container found
@@ -656,6 +743,79 @@ func (c *Controller) reconcileResuming(ctx context.Context, t *v1alpha1.Task) {
 	c.persist(t)
 }
 
+// captureSession settles a task's session capture before its container may
+// be destroyed: on success either the archive is in the store or the task
+// provably had nothing to capture, and the status flag marks it settled. It
+// returns false when the capture must be retried next tick — destroy paths
+// refuse to proceed then, the same rule RemovePorts follows for forwards.
+// The flag is checked first, so every path after the first costs nothing.
+func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool {
+	if t.Status.SessionSaved {
+		return true
+	}
+	if t.Status.Container == 0 || t.Status.Node == "" {
+		// No container was ever created (ProvisionFailed, or a provision
+		// crash before the VMID persisted): nothing to capture, and waiting
+		// cannot change that — settle so the destroy paths can proceed.
+		t.Status.SessionSaved = true
+		c.persist(t)
+		return true
+	}
+	// The destroy paths' ownership gate applies here too: a VMID that
+	// outlived its record may name a stranger's container, and archiving
+	// its HOME into this task's session row would leak across tasks.
+	owned, err := c.prov.Owned(ctx, t.Metadata.Name, t.Status.Node, t.Status.Container)
+	if err != nil {
+		c.log.Error("capture session ownership check", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		return false
+	}
+	if !owned {
+		c.log.Warn("capture session skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		t.Status.SessionSaved = true
+		c.persist(t)
+		return true
+	}
+	// A container that can no longer answer exec — it died or was stopped
+	// since the terminal phase landed — settles the capture too: there is
+	// nothing left to exec into, and waiting cannot bring the session back.
+	// Without this check the destroy paths would spin forever on a capture
+	// that can no longer succeed.
+	running, err := c.prov.Running(ctx, t.Status.Node, t.Status.Container)
+	if err != nil {
+		c.log.Error("capture session running check", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		return false
+	}
+	if !running {
+		c.log.Warn("capture session skipped: container no longer running", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		t.Status.SessionSaved = true
+		c.persist(t)
+		return true
+	}
+	data, err := c.prov.CaptureSession(ctx, t.Status.Node, t.Status.Container, t.Spec.Runner.User)
+	if errors.Is(err, ErrSessionTooLarge) {
+		// Settled, not retryable: the archive can never fit the cap, so
+		// waiting only pins the container. The log and the zero byte count
+		// record the loss.
+		c.log.Error("capture session over the size cap, storing nothing", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		data = nil
+	} else if err != nil {
+		c.log.Error("capture session", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		return false
+	}
+	if len(data) > 0 {
+		if err := c.store.SaveSession(t.Metadata.Name, data); err != nil {
+			c.log.Error("save session", "task", t.Metadata.Name, "err", err)
+			return false
+		}
+	}
+	t.Status.SessionSaved = true
+	t.Status.SessionBytes = len(data)
+	c.persist(t)
+	return true
+}
+
+// cleanupAfterTTL destroys a terminal task's container once its TTL has
+// passed, leaving the finished record in place.
 func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 	// Same rule as destroyTask: no container may be destroyed while its
 	// forwards still listen — the terminal teardown ran on the previous
@@ -678,6 +838,12 @@ func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	vmid := t.Status.Container
+	// Last gate before the container goes: if the terminal-tick capture is
+	// still unsettled (a failed SSH, a px-server crash between ticks), the
+	// destroy waits for the next tick rather than dropping the session.
+	if !c.captureSession(ctx, t) {
+		return
+	}
 	err := c.prov.DestroyOwned(ctx, t.Metadata.Name, t.Status.Node, vmid)
 	switch {
 	case errors.Is(err, ErrNotOwned):

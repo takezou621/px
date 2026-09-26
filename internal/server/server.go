@@ -90,6 +90,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusConflict, "%s", conflict.msg)
 			return
 		}
+		var invalid *applyInvalidError
+		if errors.As(err, &invalid) {
+			httpError(w, http.StatusBadRequest, "%s", invalid.msg)
+			return
+		}
 		httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
@@ -102,6 +107,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 type applyConflictError struct{ msg string }
 
 func (e *applyConflictError) Error() string { return e.msg }
+
+// applyInvalidError is a 400 apply: a spec defect the manifest parser cannot
+// see because it needs the task's own name — a session continuing from itself
+// can never resolve (the source is this unfinished task, by definition).
+type applyInvalidError struct{ msg string }
+
+func (e *applyInvalidError) Error() string { return e.msg }
 
 // applyObjects persists every manifest in document order. It runs inside the
 // caller's transaction, so the reconcile loop cannot observe the batch
@@ -144,6 +156,13 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 			}
 			results = append(results, fmt.Sprintf("gateway.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
+			// A session continuing from itself can never resolve — the
+			// source is this very task, unfinished by definition. The
+			// parser cannot see the pair, so reject it here at apply.
+			if s := m.Task.Session; s != nil && s.ContinueFrom == m.Metadata.Name {
+				return nil, &applyInvalidError{msg: fmt.Sprintf(
+					"task %q: session.continueFrom cannot reference itself", m.Metadata.Name)}
+			}
 			// An explicit hostPort must not collide with a port another
 			// task already claims (by spec or by assigned status) —
 			// checked inside this transaction, before the insert, so two

@@ -28,22 +28,28 @@ func (nopProv) Schedule(_ context.Context, _ string) (string, error) {
 func (nopProv) NodeOf(_ context.Context, _ int) (string, error) {
 	return "n1", nil
 }
-func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway) error {
+func (nopProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, _ int, _ []controller.ResolvedWorkspace, _ *controller.ResolvedModel, _ *controller.ResolvedGateway, _ []byte) error {
 	return nil
 }
-func (nopProv) Booted(_ context.Context, _ string, _ int) (bool, error) { return false, nil }
-func (nopProv) Exit(_ context.Context, _ string, _ int) (*int, error)   { return nil, nil }
+func (nopProv) CaptureSession(_ context.Context, _ string, _ int, _ string) ([]byte, error) {
+	return nil, nil
+}
+func (nopProv) RestoreSession(_ context.Context, _ string, _ int, _ string, _ []byte) error {
+	return nil
+}
+func (nopProv) Booted(_ context.Context, _ string, _ int) (bool, error)  { return false, nil }
+func (nopProv) Exit(_ context.Context, _ string, _ int) (*int, error)    { return nil, nil }
 func (nopProv) Running(_ context.Context, _ string, _ int) (bool, error) { return true, nil }
 func (nopProv) Logs(_ context.Context, _ string, _ int) (string, error)  { return "", nil }
 func (nopProv) Exec(_ context.Context, _ string, _ int, _ []string) (*controller.ExecResult, error) {
 	return &controller.ExecResult{}, nil
 }
-func (nopProv) Destroy(_ context.Context, _ string, _ int) error                { return nil }
-func (nopProv) DestroyOwned(_ context.Context, _, _ string, _ int) error        { return nil }
-func (nopProv) Owned(_ context.Context, _, _ string, _ int) (bool, error)       { return true, nil }
-func (nopProv) Frozen(_ context.Context, _ string, _ int) (bool, error)         { return false, nil }
-func (nopProv) Freeze(_ context.Context, _ string, _ int) error                 { return nil }
-func (nopProv) Thaw(_ context.Context, _ string, _ int) error                   { return nil }
+func (nopProv) Destroy(_ context.Context, _ string, _ int) error          { return nil }
+func (nopProv) DestroyOwned(_ context.Context, _, _ string, _ int) error  { return nil }
+func (nopProv) Owned(_ context.Context, _, _ string, _ int) (bool, error) { return true, nil }
+func (nopProv) Frozen(_ context.Context, _ string, _ int) (bool, error)   { return false, nil }
+func (nopProv) Freeze(_ context.Context, _ string, _ int) error           { return nil }
+func (nopProv) Thaw(_ context.Context, _ string, _ int) error             { return nil }
 func (nopProv) EnsurePorts(_ context.Context, _ string, _ int, _ []controller.PortForward) (controller.PortForwardResult, error) {
 	return controller.PortForwardResult{}, nil
 }
@@ -189,6 +195,31 @@ spec:
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("conflicting apply: want 409, got %d: %s", resp.StatusCode, body)
+	}
+
+	// A session continuing from itself can never resolve — the source is
+	// this very task, unfinished by definition. The parser cannot see the
+	// name pair, so the API refuses it with 400 before anything is stored.
+	// A different task's name passes the parse (400) stage by construction.
+	resp, err = http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(`
+apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: selfy
+spec:
+  image: px-runner-debian12
+  runner:
+    command: ["true"]
+  session:
+    continueFrom: selfy
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("self-referencing session: want 400, got %d: %s", resp.StatusCode, body)
 	}
 
 	// Auto-assign (hostPort 0) passes the API check; the controller picks
@@ -722,8 +753,8 @@ func TestTaskExecRejectsBadRequests(t *testing.T) {
 	}
 }
 
-// Empty strings are legal argv ("printf '%s\n' ''") and must pass through
-// byte-exact — the quoting layer renders them as ''.
+// Empty strings are legal argv ("printf '%s\n' ”") and must pass through
+// byte-exact — the quoting layer renders them as ”.
 func TestTaskExecAcceptsEmptyArguments(t *testing.T) {
 	prov := &execProv{}
 	srv, st := newExecServer(t, prov)
@@ -804,7 +835,8 @@ func TestTaskLogsRefusedWhileSuspended(t *testing.T) {
 	}
 }
 
-func cmpArgs(got, want []string) string {	if len(got) != len(want) {
+func cmpArgs(got, want []string) string {
+	if len(got) != len(want) {
 		return fmt.Sprintf("len %d != %d (%q vs %q)", len(got), len(want), got, want)
 	}
 	for i := range got {

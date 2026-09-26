@@ -315,6 +315,42 @@ listener from the node (and the port refuses connections afterwards),
 and a task refused at apply was never created. Cleanup deletes all
 tasks and verifies no px-range listeners remain on the node.
 
+## 3i. Session continuation test
+
+With the same server running and the **agent template** built (section
+1, `px-agent-debian12`):
+
+```sh
+./scripts/e2e-session.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level template check)
+```
+
+It exercises the capture/restore transport end to end with a **planted
+fake session** (a JSONL line written under `~/.claude/projects` by the
+runner itself — no credential anywhere): a source task finishes and the
+terminal tick captures its session (the record shows `sessionSaved:
+true` and `sessionBytes > 0`), a continuation applied with
+`spec.session.continueFrom` boots in a fresh container whose
+`~/.claude/projects` carries the source's file (a verifier command
+greps for the planted line and logs `SESSION-RESTORED-OK`), and a new
+continuation after the source record is deleted lands in
+`ProvisionFailed` — the capture dies with its task, so a dangling
+reference can never resolve. `px run --continue` itself is checked
+spec-only (the applied manifest carries `continueFrom` and the
+`--continue` variant of the default agent command) and deleted before
+its runner boots, since a live `claude --continue` would need a key.
+
+A live continuation with a real key is deliberately **not** automated
+(same reasoning as section 3g). To close the loop once, by hand:
+
+```sh
+./px run -model <model> "<first goal>"
+# wait for Succeeded, then:
+./px run --continue <task> "<follow-up that needs the earlier context>"
+./px describe task <new-task>    # continueFrom points at the old task
+```
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it

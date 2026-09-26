@@ -61,6 +61,11 @@ func Open(path string) (*Store, error) {
 			spec TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			task TEXT PRIMARY KEY,
+			data BLOB NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
@@ -178,7 +183,17 @@ func (s *Store) CreateTask(t *v1alpha1.Task) error {
 	if err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed") {
 		return ErrExists
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	// A fresh record invalidates any session row a same-named predecessor
+	// could have left behind (a DeleteSession that failed mid-destroy):
+	// without this, a later continueFrom on that name would silently
+	// restore a dead task's session.
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, t.Metadata.Name); err != nil {
+		return fmt.Errorf("clear stale session row for %s: %w", t.Metadata.Name, err)
+	}
+	return nil
 }
 
 func (s *Store) GetTask(name string) (*v1alpha1.Task, error) {
@@ -343,6 +358,40 @@ func (s *Store) DeleteGateway(name string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SaveSession stores one task's captured session archive. Upsert by
+// design: a capture retried after a partial write replaces the row, and
+// a task owns at most one session — resaving with different content
+// means the first capture was never settled, so last-writer-wins is the
+// safe convergence.
+func (s *Store) SaveSession(task string, data []byte) error {
+	_, err := s.db.Exec(`INSERT INTO sessions (task, data) VALUES (?, ?)
+		ON CONFLICT(task) DO UPDATE SET data=excluded.data`, task, data)
+	return err
+}
+
+// GetSession returns the captured archive for a task, or ErrNotFound
+// when the task never captured one (or its row was dropped with the
+// task).
+func (s *Store) GetSession(task string) ([]byte, error) {
+	var data []byte
+	err := s.db.QueryRow(`SELECT data FROM sessions WHERE task = ?`, task).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// DeleteSession drops a task's session row. Idempotent: deleting an
+// already-absent row succeeds, so the task-destroy path can drop it
+// unconditionally.
+func (s *Store) DeleteSession(task string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, task)
+	return err
 }
 
 type rowScanner interface{ Scan(dest ...any) error }

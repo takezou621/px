@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,36 +21,42 @@ import (
 const fakeNode = "n1"
 
 type fakeProv struct {
-	mu          sync.Mutex
-	allocateErr error        // returned by Allocate as a provision failure
-	createErr   error        // returned by Create as a provision failure
-	scheduleErr error        // returned by Schedule as a provision failure
-	nodeOfErr   error        // returned by NodeOf (wrap ErrGuestGone for a vanished container)
-	exitErr     error        // returned by Exit as a probe failure
-	bootedErr   error        // returned by Booted as a probe failure
-	frozenErr   error        // returned by Frozen as a probe failure
-	freezeErr   error        // returned by Freeze
-	thawErr     error        // returned by Thaw
-	runningErr  error        // returned by Running as a probe failure
-	destroyErr  error        // returned by Destroy until cleared
-	exits       map[int]int  // vmid -> exit code; missing = still running
-	dead        map[int]bool // vmids whose container is not running
-	booted      map[int]bool // vmids whose container reached the runner launch
-	frozen      map[int]bool // vmids whose cgroup is currently frozen
-	created     []int
-	thaws       []int               // vmids passed to Thaw, in call order
-	mounts      []ResolvedWorkspace // mounts passed to the last Create
-	model       *ResolvedModel      // model passed to the last Create
-	gw          *ResolvedGateway    // gateway passed to the last Create
-	destroyed   []int
-	hostnames   map[int]string            // vmid -> hostname; empty or missing = owned
-	forwards    map[int]PortForward       // hostPort -> forward currently "running" on the node
-	ensureErr   error                     // returned by EnsurePorts
-	removeErr   error                     // returned by RemovePorts
-	ensureFails map[int]bool              // hostPorts EnsurePorts reports as failed
-	ctipOf      map[int]string            // vmid -> CTIP EnsurePorts reports (default link-local)
-	removeCalls int                       // number of RemovePorts invocations, success or not
-	removed     []int                     // hostPorts passed to RemovePorts, in call order
+	mu           sync.Mutex
+	allocateErr  error        // returned by Allocate as a provision failure
+	createErr    error        // returned by Create as a provision failure
+	scheduleErr  error        // returned by Schedule as a provision failure
+	nodeOfErr    error        // returned by NodeOf (wrap ErrGuestGone for a vanished container)
+	exitErr      error        // returned by Exit as a probe failure
+	bootedErr    error        // returned by Booted as a probe failure
+	frozenErr    error        // returned by Frozen as a probe failure
+	freezeErr    error        // returned by Freeze
+	thawErr      error        // returned by Thaw
+	runningErr   error        // returned by Running as a probe failure
+	destroyErr   error        // returned by Destroy until cleared
+	exits        map[int]int  // vmid -> exit code; missing = still running
+	dead         map[int]bool // vmids whose container is not running
+	booted       map[int]bool // vmids whose container reached the runner launch
+	frozen       map[int]bool // vmids whose cgroup is currently frozen
+	created      []int
+	thaws        []int               // vmids passed to Thaw, in call order
+	mounts       []ResolvedWorkspace // mounts passed to the last Create
+	model        *ResolvedModel      // model passed to the last Create
+	gw           *ResolvedGateway    // gateway passed to the last Create
+	destroyed    []int
+	hostnames    map[int]string      // vmid -> hostname; empty or missing = owned
+	forwards     map[int]PortForward // hostPort -> forward currently "running" on the node
+	ensureErr    error               // returned by EnsurePorts
+	removeErr    error               // returned by RemovePorts
+	ensureFails  map[int]bool        // hostPorts EnsurePorts reports as failed
+	ctipOf       map[int]string      // vmid -> CTIP EnsurePorts reports (default link-local)
+	removeCalls  int                 // number of RemovePorts invocations, success or not
+	removed      []int               // hostPorts passed to RemovePorts, in call order
+	capturable   map[int][]byte      // vmid -> archive CaptureSession reports (missing = nothing to capture)
+	restored     map[int][]byte      // vmid -> archive RestoreSession last received
+	captureErr   error               // returned by CaptureSession
+	restoreErr   error               // returned by RestoreSession
+	session      []byte              // session archive passed to the last Create
+	captureCalls []int               // vmids passed to CaptureSession, in call order
 }
 
 func (f *fakeProv) Allocate(_ context.Context) (int, error) {
@@ -73,7 +80,7 @@ func (f *fakeProv) NodeOf(_ context.Context, _ int) (string, error) {
 	return fakeNode, nil
 }
 
-func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
+func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway, session []byte) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -82,7 +89,28 @@ func (f *fakeProv) Create(_ context.Context, _ *v1alpha1.Task, _ string, vmid in
 	f.mounts = mounts
 	f.model = model
 	f.gw = gw
+	f.session = session
 	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeProv) CaptureSession(_ context.Context, _ string, vmid int, _ string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.captureCalls = append(f.captureCalls, vmid)
+	if f.captureErr != nil {
+		return nil, f.captureErr
+	}
+	return f.capturable[vmid], nil
+}
+
+func (f *fakeProv) RestoreSession(_ context.Context, _ string, vmid int, _ string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.restoreErr != nil {
+		return f.restoreErr
+	}
+	f.restored[vmid] = data
 	return nil
 }
 
@@ -233,6 +261,7 @@ type memStore struct {
 	workspaces  map[string]*v1alpha1.Workspace
 	models      map[string]*v1alpha1.Model
 	gateways    map[string]*v1alpha1.Gateway
+	sessions    map[string][]byte
 }
 
 func newMemStore() *memStore {
@@ -241,7 +270,32 @@ func newMemStore() *memStore {
 		workspaces: map[string]*v1alpha1.Workspace{},
 		models:     map[string]*v1alpha1.Model{},
 		gateways:   map[string]*v1alpha1.Gateway{},
+		sessions:   map[string][]byte{},
 	}
+}
+
+func (m *memStore) GetSession(task string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.sessions[task]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return data, nil
+}
+
+func (m *memStore) SaveSession(task string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[task] = data
+	return nil
+}
+
+func (m *memStore) DeleteSession(task string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, task)
+	return nil
 }
 
 func (m *memStore) GetGateway(name string) (*v1alpha1.Gateway, error) {
@@ -1428,6 +1482,7 @@ func TestSuspendPhaseFailsOnDeadContainer(t *testing.T) {
 		})
 	}
 }
+
 // A Frozen-probe failure with the container still alive is a transient error
 // (SSH blip): the suspend phase must hold, not fail the task.
 func TestSuspendPhaseSurvivesProbeErrorWithLiveContainer(t *testing.T) {
@@ -1875,5 +1930,315 @@ func TestAllocateHostPortSkipsTaken(t *testing.T) {
 	second := allocateHostPort(claimed, fwds)
 	if second != v1alpha1.HostPortMin+2 {
 		t.Fatalf("want %d, got %d", v1alpha1.HostPortMin+2, second)
+	}
+}
+
+// finishedSessionSource stores a Succeeded source whose capture is settled
+// (the container is gone; SessionSaved explains why no vmid is left). data
+// nil means the capture saved nothing — a source that ran without ever
+// writing .claude/projects.
+func finishedSessionSource(t *testing.T, st *memStore, name string, data []byte) {
+	t.Helper()
+	src := testTask(0)
+	src.Metadata.Name = name
+	src.Status.Phase = v1alpha1.TaskSucceeded
+	src.Status.Container = 0
+	src.Status.SessionSaved = true
+	if err := st.UpsertTask(src); err != nil {
+		t.Fatal(err)
+	}
+	if data != nil {
+		if err := st.SaveSession(name, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The happy continuation: the source archive rides Create into the fresh
+// container and the task reaches Running.
+func TestSessionContinuationHappyPath(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, restored: map[int][]byte{}}
+	archive := []byte("session-jsonl-archive")
+	finishedSessionSource(t, st, "src", archive)
+	cont := testTask(0)
+	cont.Metadata.Name = "cont"
+	cont.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: "src"}
+	_ = st.UpsertTask(cont)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl)
+	task := get(t, st, "cont")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !bytes.Equal(prov.session, archive) {
+		t.Fatalf("Create must receive the source archive, got %q", prov.session)
+	}
+}
+
+// An unresolvable session reference fails at provision, before any
+// container exists — unknown source, unfinished source, or a source whose
+// capture saved nothing — mirroring Gateway's stale-reference behavior.
+func TestSessionResolveFailsToProvisionFailed(t *testing.T) {
+	cases := []struct {
+		name  string
+		mkSrc func(t *testing.T, st *memStore)
+	}{
+		{"unknown source", func(t *testing.T, st *memStore) {}},
+		{"unfinished source", func(t *testing.T, st *memStore) {
+			src := testTask(0)
+			src.Metadata.Name = "src"
+			src.Status.Phase = v1alpha1.TaskRunning
+			src.Status.Container = 100
+			if err := st.UpsertTask(src); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.SaveSession("src", []byte("premature")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"source without capture", func(t *testing.T, st *memStore) {
+			finishedSessionSource(t, st, "src", nil)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newMemStore()
+			prov := &fakeProv{exits: map[int]int{}, restored: map[int][]byte{}}
+			tc.mkSrc(t, st)
+			cont := testTask(0)
+			cont.Metadata.Name = "cont"
+			cont.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: "src"}
+			_ = st.UpsertTask(cont)
+			ctl := New(st, prov, slog.New(slog.DiscardHandler))
+			runOnce(ctl)
+			task := get(t, st, "cont")
+			if task.Status.Phase != v1alpha1.TaskProvisionFail {
+				t.Fatalf("want ProvisionFailed, got %s (%s)", task.Status.Phase, task.Status.Reason)
+			}
+			if len(prov.created) != 0 {
+				t.Fatal("no container may exist for an unresolved session source")
+			}
+		})
+	}
+}
+
+// The tick that lands the terminal phase settles the capture in that same
+// tick — a px run --continue issued the moment the phase is visible would
+// otherwise resolve an empty session — and a later TTL tick destroys the
+// container, leaving record and session row in place for continuations.
+func TestSessionCapturedOnTerminalTickThenTTLDestroys(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, capturable: map[int][]byte{100: []byte("archive")}}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // runner exits; the same tick lands Succeeded AND settles the capture
+	runOnce(ctl) // the settled flag makes later terminal ticks free
+	task := get(t, st, "t1")
+	if !task.Status.SessionSaved {
+		t.Fatal("terminal tick must settle the capture")
+	}
+	if task.Status.SessionBytes != len("archive") {
+		t.Fatalf("want SessionBytes %d, got %d", len("archive"), task.Status.SessionBytes)
+	}
+	if data, ok := st.sessions["t1"]; !ok || string(data) != "archive" {
+		t.Fatalf("capture must be stored, got %q ok=%v", data, ok)
+	}
+	if len(prov.captureCalls) != 1 {
+		t.Fatalf("the settled flag must make later captures free, got %v", prov.captureCalls)
+	}
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Container != 0 || len(prov.destroyed) != 1 {
+		t.Fatalf("TTL must destroy after a settled capture (container=%d destroyed=%v)",
+			task.Status.Container, prov.destroyed)
+	}
+	if data, ok := st.sessions["t1"]; !ok || string(data) != "archive" {
+		t.Fatalf("TTL cleanup keeps the record, so the session row survives with it, got %q ok=%v", data, ok)
+	}
+}
+
+// A VMID whose hostname no longer matches the task (reused after an
+// out-of-band destroy) must never be captured — archiving a stranger's
+// HOME into this task's session row would leak across tasks — and the
+// capture settles so destroy proceeds, without touching the foreign
+// container (the destroy path's ErrNotOwned handling).
+func TestSessionCaptureSettlesForUnownedContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:     map[int]int{},
+		hostnames: map[int]string{100: "px-other-task"},
+	}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded; the same-tick capture settles without touching the container
+	task := get(t, st, "t1")
+	if !task.Status.SessionSaved || task.Status.SessionBytes != 0 {
+		t.Fatalf("capture must settle with nothing stored, got saved=%v bytes=%d",
+			task.Status.SessionSaved, task.Status.SessionBytes)
+	}
+	if _, ok := st.sessions["t1"]; ok {
+		t.Fatal("nothing may be stored for a foreign container")
+	}
+	if len(prov.captureCalls) != 0 {
+		t.Fatalf("CaptureSession must not run against a foreign container, got %v", prov.captureCalls)
+	}
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Container != 0 {
+		t.Fatalf("the settled capture must not hold the TTL cleanup open (container=%d)", task.Status.Container)
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatal("a foreign container must never be destroyed")
+	}
+}
+
+// A container that can no longer answer exec — it died without writing an
+// exit file, or was stopped out-of-band after the phase landed — settles
+// the capture with nothing stored: there is nothing left to exec into, and
+// settling is what keeps delete and TTL from spinning on a capture that can
+// never succeed.
+func TestSessionCaptureSettlesForDeadContainer(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:   map[int]int{},
+		exitErr: errors.New("no exit file"),
+		dead:    map[int]bool{100: true},
+	}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	runOnce(ctl) // poll's Exit probe errors, Running is false -> Failed; the same-tick capture settles
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskFailed {
+		t.Fatalf("want Failed, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !task.Status.SessionSaved || task.Status.SessionBytes != 0 {
+		t.Fatalf("a dead container must settle the capture, got saved=%v bytes=%d",
+			task.Status.SessionSaved, task.Status.SessionBytes)
+	}
+	if len(prov.captureCalls) != 0 {
+		t.Fatalf("CaptureSession must not run against a dead container, got %v", prov.captureCalls)
+	}
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("a settled capture must not hold the delete open")
+	}
+	if len(prov.destroyed) != 1 {
+		t.Fatalf("delete must destroy the task's own dead container, got %v", prov.destroyed)
+	}
+}
+
+// An archive that can never fit the store cap is a settled loss, not a
+// retry: the capture settles (saving nothing) so the destroy paths cannot
+// be pinned by a session that will only ever fail.
+func TestSessionCaptureOverCapSettlesWithoutSaving(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:      map[int]int{},
+		capturable: map[int][]byte{100: []byte("archive")},
+		captureErr: ErrSessionTooLarge,
+	}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded; the same-tick capture settles as a recorded loss
+	task := get(t, st, "t1")
+	if !task.Status.SessionSaved || task.Status.SessionBytes != 0 {
+		t.Fatalf("an over-cap capture must settle with nothing stored, got saved=%v bytes=%d",
+			task.Status.SessionSaved, task.Status.SessionBytes)
+	}
+	if _, ok := st.sessions["t1"]; ok {
+		t.Fatal("an over-cap capture must not be stored")
+	}
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	if len(prov.destroyed) != 1 {
+		t.Fatalf("the settled loss must not hold the TTL destroy open, got %v", prov.destroyed)
+	}
+}
+
+// A capture that cannot complete holds the TTL destroy open — the container
+// is the only source of the session — and the destroy proceeds on the tick
+// after the capture settles (RemovePorts gate pattern).
+func TestTTLCleanupGatesOnSessionCapture(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:      map[int]int{},
+		capturable: map[int][]byte{100: []byte("archive")},
+		captureErr: errors.New("node unreachable"),
+	}
+	_ = st.UpsertTask(testTask(60))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded
+	get(t, st, "t1")
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("TTL must not destroy while the capture is unsettled, got %v", prov.destroyed)
+	}
+	prov.mu.Lock()
+	prov.captureErr = nil
+	prov.mu.Unlock()
+	runOnce(ctl)
+	if len(prov.destroyed) != 1 {
+		t.Fatalf("destroy must proceed once the capture settles, got %v", prov.destroyed)
+	}
+	if data, ok := st.sessions["t1"]; !ok || string(data) != "archive" {
+		t.Fatalf("the settled capture must be stored before the destroy, got %q ok=%v", data, ok)
+	}
+}
+
+// The delete path captures from the (thawed) container before destroy; a
+// capture that cannot complete holds the delete open the same way.
+func TestDeleteCapturesSessionBeforeDestroy(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:      map[int]int{},
+		capturable: map[int][]byte{100: []byte("archive")},
+		captureErr: errors.New("node unreachable"),
+	}
+	_ = st.UpsertTask(testTask(0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; !ok {
+		t.Fatal("record must survive while the capture cannot complete")
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("destroy must wait for the capture, got %v", prov.destroyed)
+	}
+	prov.mu.Lock()
+	prov.captureErr = nil
+	prov.mu.Unlock()
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("record should be deleted once the capture is done")
+	}
+	if _, ok := st.sessions["t1"]; ok {
+		t.Fatal("session row must die with the task record")
 	}
 }

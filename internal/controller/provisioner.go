@@ -25,6 +25,11 @@ import (
 // foreign one.
 var ErrNotOwned = errors.New("container is not owned by the task")
 
+// ErrSessionTooLarge reports that a task's session archive cannot fit the
+// store cap. It is a settled answer — the size cannot shrink by waiting —
+// so the controller records the loss instead of retrying the capture.
+var ErrSessionTooLarge = errors.New("session archive over the size cap")
+
 // ErrGuestGone reports that no guest with a given VMID exists anywhere in
 // the cluster — the container a record still names was removed out of band
 // (manual pct destroy, node reinstall). The controller fails such a task
@@ -61,9 +66,11 @@ type Provisioner interface {
 	// before the runner starts; model, when non-nil, carries provider
 	// credentials the runner gets as environment variables; gw, when non-nil,
 	// puts the container behind an egress allowlist (LXC firewall,
-	// default-deny out). On failure it destroys any partial work, so the vmid
-	// no longer names a container of ours.
-	Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error
+	// default-deny out); session, when non-empty, is a previously captured
+	// session archive unpacked into the runner user's HOME before the runner
+	// boots (session continuation). On failure it destroys any partial work,
+	// so the vmid no longer names a container of ours.
+	Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway, session []byte) error
 	// Booted reports whether the container's boot script reached the runner
 	// spawn step and touched its marker (/run/px/booted) — see runnerScript
 	// for why the marker sits after the spawn. A provision interrupted by a
@@ -80,6 +87,16 @@ type Provisioner interface {
 	// Exec runs one command in the task's container and returns its output
 	// and exit code. A non-zero exit is a result, not an error.
 	Exec(ctx context.Context, node string, vmid int, argv []string) (*ExecResult, error)
+	// CaptureSession tars and gzips the runner user's ~/.claude/projects
+	// and returns the archive, or nil when the container has no session
+	// directory (a non-agent task — nothing to capture). The caller owns
+	// the returned bytes.
+	CaptureSession(ctx context.Context, node string, vmid int, user string) ([]byte, error)
+	// RestoreSession unpacks a captured archive into the runner user's
+	// HOME so the runner starts with the continued session already in
+	// place. A nil/empty archive is a no-op. Runs as the runner user and
+	// stages under that user's own HOME, resolved in-container.
+	RestoreSession(ctx context.Context, node string, vmid int, user string, data []byte) error
 	// Destroy stops and deletes the container.
 	Destroy(ctx context.Context, node string, vmid int) error
 	// DestroyOwned stops and deletes the task container, but only after
@@ -179,6 +196,23 @@ func (p *provisioner) nodeSSH(ctx context.Context, node, cmd string, timeout tim
 		return "", -1, err
 	}
 	return e.Run(ctx, cmd, timeout)
+}
+
+// nodeSSHOnce is nodeSSH without the retry. Scripts with external side
+// effects must not be re-run after a connection drop: the restore stage
+// appends one chunk per call, and a retried append duplicates that chunk,
+// corrupting the archive. It fails loudly instead.
+func (p *provisioner) nodeSSHOnce(ctx context.Context, node, cmd string, timeout time.Duration) (string, int, error) {
+	e, err := p.ssh.Executor(node)
+	if err != nil {
+		return "", -1, err
+	}
+	var out, errb bytes.Buffer
+	code, err := e.RunStreamsOnce(ctx, cmd, timeout, &out, &errb)
+	if errb.Len() > 0 {
+		out.Write(errb.Bytes())
+	}
+	return out.String(), code, err
 }
 
 // cgroupOpTimeout bounds one node-level cgroup probe or write: a single SSH
@@ -601,6 +635,16 @@ func buildGoal(t *v1alpha1.Task) string {
 	return goal
 }
 
+// userArg renders the pct exec --user flag for a runner user; an empty
+// user means the container default (root), so no flag is emitted. Every
+// in-container command px runs shares this convention.
+func userArg(user string) string {
+	if user == "" {
+		return ""
+	}
+	return " --user " + shellQuote(user)
+}
+
 // bootCommand wraps the boot script so it lands inside the container via
 // base64. mkdir runs before the redirect on purpose: /run is tmpfs and the
 // template does not carry /run/px, so the redirect would fail before
@@ -608,12 +652,8 @@ func buildGoal(t *v1alpha1.Task) string {
 // which embeds the model credential base64-encoded — is not left
 // world-readable by the outer shell's default umask.
 func bootCommand(vmid int, user, script string) string {
-	userArg := ""
-	if user != "" {
-		userArg = " --user " + shellQuote(user)
-	}
 	b64 := base64.StdEncoding.EncodeToString([]byte(script))
-	return fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg,
+	return fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg(user),
 		shellQuote("umask 077; mkdir -p /run/px && echo "+b64+" | base64 -d > /run/px/boot.sh && sh /run/px/boot.sh"))
 }
 
@@ -634,7 +674,7 @@ func (p *provisioner) Allocate(ctx context.Context) (int, error) {
 	return p.pve.NextID(ctx)
 }
 
-func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway) error {
+func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, node string, vmid int, mounts []ResolvedWorkspace, model *ResolvedModel, gw *ResolvedGateway, session []byte) error {
 	pve := p.nodePVE(node)
 	templateVMID, err := pve.FindTemplateVMID(ctx, t.Spec.Image)
 	if err != nil {
@@ -686,6 +726,15 @@ func (p *provisioner) Create(ctx context.Context, t *v1alpha1.Task, node string,
 		if err := gate(ctx, node, vmid); err != nil {
 			_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
 			return fmt.Errorf("wait for egress enforcement: %w", err)
+		}
+	}
+	// The continued session lands before the runner boots: the agent then
+	// starts with the prior conversation already in place, which is the
+	// whole point of `claude --continue` against a fresh container.
+	if len(session) > 0 {
+		if err := p.RestoreSession(ctx, node, vmid, t.Spec.Runner.User, session); err != nil {
+			_ = p.Destroy(context.WithoutCancel(ctx), node, vmid)
+			return fmt.Errorf("restore session: %w", err)
 		}
 	}
 	// The DHCP wait (max 20s) plus one retried clone per workspace ride on
@@ -982,6 +1031,128 @@ func (p *provisioner) Exec(ctx context.Context, node string, vmid int, argv []st
 		res.PctReason = fmt.Sprintf("no verdict from the node (ssh exit %d)", code)
 	}
 	return res, nil
+}
+
+// sessionStageFile is where RestoreSession stages the base64 archive inside
+// the runner user's HOME before unpacking it. Hidden, user-owned, and
+// removed by the unpack script itself.
+const sessionStageFile = ".px-sess.b64"
+
+// sessionChunkBytes bounds each base64 chunk written through pct exec. The
+// chunk rides one SSH argv element inside the sh -c script, and the kernel
+// caps a single argument at MAX_ARG_STRLEN (128 KiB) — 96 KiB keeps the
+// whole script line safely under it. Base64 is decoded as a concatenated
+// stream, so chunk boundaries carry no alignment requirement.
+const sessionChunkBytes = 96 << 10
+
+// sessionChunkTimeout bounds one staging write; the unpack adds tar work on
+// top of a single transfer, so it rides the plain execTimeout instead.
+const sessionChunkTimeout = 30 * time.Second
+
+// captureScript tars and gzips the runner user's Claude Code conversation
+// directory and prints it base64. An empty stream with exit 0 means the
+// directory does not exist — a non-agent task has nothing to capture, which
+// is a settled answer, not an error. HOME is resolved in-container (pct exec
+// does not export it for the target user), and a user with no HOME entry
+// fails loudly (exit 3). A directory over twice the decoded cap exits 42 —
+// a settled failure the controller recognizes: waiting cannot shrink it, and
+// the remote guard stops a runaway directory from flowing through base64
+// before the decoded-size check can refuse it. Twice the cap is generous —
+// plain text compresses far better than that — while still keeping the
+// worst-case in-flight buffer bounded.
+func captureScript() string {
+	return fmt.Sprintf(`h=$(getent passwd $(id -u) | cut -d: -f6); [ -n "$h" ] || exit 3; [ -d "$h/.claude/projects" ] || exit 0; cd "$h" || exit 3; [ "$(du -sk .claude/projects | cut -f1)" -le %d ] || exit 42; tar czf - .claude/projects | base64 -w0`, v1alpha1.MaxSessionBytes*2/1024)
+}
+
+func (p *provisioner) CaptureSession(ctx context.Context, node string, vmid int, user string) ([]byte, error) {
+	cmd := fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg(user), shellQuote(captureScript()))
+	out, code, err := p.nodeSSH(ctx, node, cmd, execTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("capture session ct %d: %w", vmid, err)
+	}
+	if code == 42 {
+		return nil, fmt.Errorf("capture session ct %d: %w: out=%q", vmid, ErrSessionTooLarge, strings.TrimSpace(out))
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("capture session ct %d: exit=%d out=%q", vmid, code, strings.TrimSpace(out))
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	data, err := decodeSessionArchive(out)
+	if err != nil {
+		return nil, fmt.Errorf("capture session ct %d: %w", vmid, err)
+	}
+	return data, nil
+}
+
+// decodeSessionArchive turns CaptureSession's base64 output back into the
+// tar.gz archive, refusing anything over the cap: a session that big would
+// be nearly as slow to restore as to capture, and the cap bounds the
+// SQLite blob.
+func decodeSessionArchive(out string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(out)
+	if err != nil {
+		return nil, fmt.Errorf("decode archive: %w", err)
+	}
+	if len(data) > v1alpha1.MaxSessionBytes {
+		return nil, fmt.Errorf("archive is %d bytes, over the %d cap: %w", len(data), v1alpha1.MaxSessionBytes, ErrSessionTooLarge)
+	}
+	return data, nil
+}
+
+// restoreStageScript writes one base64 chunk to the staging file: the first
+// chunk creates it, later ones append. umask 077 keeps the staged archive
+// private while it sits in the user's HOME, like every /run/px staging file.
+func restoreStageScript(first bool, chunk string) string {
+	op := ">"
+	if !first {
+		op = ">>"
+	}
+	return fmt.Sprintf(`h=$(getent passwd $(id -u) | cut -d: -f6); [ -n "$h" ] || exit 3; umask 077; printf %%s %s %s"$h/%s"`,
+		shellQuote(chunk), op, sessionStageFile)
+}
+
+// restoreUnpackScript decodes the staged archive into the user's HOME and
+// removes the staging file either way. base64 -d failure still surfaces:
+// a truncated stream corrupts the gzip, and tar refuses it.
+func restoreUnpackScript() string {
+	return fmt.Sprintf(`h=$(getent passwd $(id -u) | cut -d: -f6); [ -n "$h" ] || exit 3; cd "$h" || exit 3; base64 -d %s | tar xzf -; rc=$?; rm -f %s; exit $rc`,
+		sessionStageFile, sessionStageFile)
+}
+
+func (p *provisioner) RestoreSession(ctx context.Context, node string, vmid int, user string, data []byte) error {
+	b64 := base64.StdEncoding.EncodeToString(data)
+	for i, chunk := range chunkString(b64, sessionChunkBytes) {
+		cmd := fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg(user), shellQuote(restoreStageScript(i == 0, chunk)))
+		// Staged writes are not idempotent (append), so they must not ride
+		// the retrying path — see nodeSSHOnce.
+		out, code, err := p.nodeSSHOnce(ctx, node, cmd, sessionChunkTimeout)
+		if err != nil || code != 0 {
+			return fmt.Errorf("restore session ct %d: staging chunk %d: exit=%d out=%q err=%v",
+				vmid, i, code, strings.TrimSpace(out), err)
+		}
+	}
+	cmd := fmt.Sprintf("pct exec %d%s -- sh -c %s", vmid, userArg(user), shellQuote(restoreUnpackScript()))
+	out, code, err := p.nodeSSH(ctx, node, cmd, execTimeout)
+	if err != nil || code != 0 {
+		return fmt.Errorf("restore session ct %d: unpack: exit=%d out=%q err=%v", vmid, code, strings.TrimSpace(out), err)
+	}
+	return nil
+}
+
+// chunkString splits s into consecutive substrings of at most n bytes.
+func chunkString(s string, n int) []string {
+	var out []string
+	for len(s) > n {
+		out = append(out, s[:n])
+		s = s[n:]
+	}
+	if s != "" || out == nil {
+		out = append(out, s)
+	}
+	return out
 }
 
 // pctAbsentVerdict is what the exec wrapper prints to stderr when the
