@@ -1,0 +1,63 @@
+internal/controller/provisioner_test.go
+  s_7e7dd78210f867::t_14ca9f5ac14781 947-999
+  s_7e7dd78210f867::t_294267c9115b5d 341
+  s_7e7dd78210f867::t_a40852a6eb1f51 861-946
+internal/server/server_test.go
+  s_7e7dd78210f867::t_dea101946f4477 1369-1436
+docs/e2e.md
+  s_7e7dd78210f867::t_388dda9d8fb308 375-397
+scripts/e2e-quotas.sh
+  s_7e7dd78210f867::t_173a15e4bb7b03 1-31,38-159
+  s_7e7dd78210f867::t_480f51511c0ca0 32-37
+internal/controller/controller_test.go
+  s_7e7dd78210f867::t_ffb0950b1a0735 264-270,2212-2213
+  s_7e7dd78210f867::t_167fa085f07b00 2791-2802,2806-2823
+  s_7e7dd78210f867::t_3fad1105e9257c 2803-2805
+  s_7e7dd78210f867::t_91ffde7b68033f 2749-2752,2760,2762,2764-2766,2770-2781
+  s_7e7dd78210f867::t_ec1e4b16782f28 2700,2704-2705
+  s_7e7dd78210f867::t_c3d0827846bb4d 2835-2837
+  s_7e7dd78210f867::t_97c93816bc8681 2684-2699,2701-2703,2706-2748,2753-2759,2761,2763,2767-2769,2782-2790,2824-2834,2838-2843,2846-2856
+  s_7e7dd78210f867::t_48f9ef371dae92 2844-2845
+internal/controller/provisioner.go
+  s_7e7dd78210f867::t_170c0eca407aeb 39-45
+  s_7e7dd78210f867::t_61b35102285a28 199-200
+  s_7e7dd78210f867::t_9b9457b7b35e8e 185-187,189-192
+  s_7e7dd78210f867::t_6d4c65b6b342ae 244-245,253,263-271,280,282,299,305-308,312-314
+  s_7e7dd78210f867::t_bc2dc95089e388 246-251,258-260,272-279,281
+internal/server/metrics.go
+  s_7e7dd78210f867::t_ca0e90d0dcfd1c 110,113-115,122-126
+  s_7e7dd78210f867::t_bd8ba91b1ca2e8 15
+docs/roadmap.md
+  s_7e7dd78210f867::t_cb6742b2c1afb2 5-38,54-65,74-79
+  s_7e7dd78210f867::t_b421bd6db3fe1d 39-49
+  s_7e7dd78210f867::t_f4398000727d07 50-53
+  s_7e7dd78210f867::t_ad159e4af7c0e3 66-73
+internal/controller/controller.go
+  s_7e7dd78210f867::t_20d62054be7d5d 289
+  s_7e7dd78210f867::t_d438dbfc223ecf 239-250,252,258
+  s_7e7dd78210f867::t_28d7aace5657b5 643-648,655
+  s_7e7dd78210f867::t_9288d96ba13b98 125-130
+  s_7e7dd78210f867::t_9608adc3e5869a 541-544,548-557,585-592
+  s_7e7dd78210f867::t_089c4ffc3ff077 578-582,597-600
+  s_7e7dd78210f867::t_9ed5112f1a2aca 641-642,649-654,656-658
+  s_7e7dd78210f867::t_25160656b1128b 101-106
+cmd/px-server/main.go
+  s_7e7dd78210f867::t_babb3b94f3b8a0 40-41
+  s_7e7dd78210f867::t_4c441d6fcf8b9b 107,113-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0e2d4556119fa3ab58620e2ac8e4e85df4c3a93e",
+  "prompts": {},
+  "sessions": {
+    "s_7e7dd78210f867": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d52eed35-0ac1-4ccb-a3a2-9b37a2ae832e",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
