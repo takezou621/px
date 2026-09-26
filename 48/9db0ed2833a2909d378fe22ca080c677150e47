@@ -1,0 +1,27 @@
+docs/onboarding.md
+  s_7e7dd78210f867::t_4468d0a442c4f3 145
+  s_7e7dd78210f867::t_ce77ba509675fa 1-140,142-144,146-174
+  s_7e7dd78210f867::t_4ef3b1c8c26d97 141
+docs/architecture.md
+  s_7e7dd78210f867::t_365f69480cf45a 148-152
+  s_7e7dd78210f867::t_c780cb0ed99c6d 3-5,17-19,24-30,35-55,61-69,72-73,77-90,94-99,104-132,137,141-147,153-154
+  s_7e7dd78210f867::t_7567168c6c09c8 74-76
+README.md
+  s_7e7dd78210f867::t_77e87ef38c484a 128-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "489db0ed2833a2909d378fe22ca080c677150e47",
+  "prompts": {},
+  "sessions": {
+    "s_7e7dd78210f867": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d52eed35-0ac1-4ccb-a3a2-9b37a2ae832e",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
