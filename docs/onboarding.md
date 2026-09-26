@@ -148,7 +148,7 @@ go vet ./...
   pinned by a test, it goes here first.
 - **Real-node E2E** is a milestone-closing step, not optional — several
   bugs (`pct exec` PATH, pve-firewall timing, yaml tag casing) existed
-  only there. Fourteen scripts under `scripts/e2e-*.sh`; the setup,
+  only there. Fifteen scripts under `scripts/e2e-*.sh`; the setup,
   what each pins, and the troubleshooting table are in
   [e2e.md](e2e.md). Read §3 (smoke) even if you never run it — it is
   the fastest tour of what the system actually does.
