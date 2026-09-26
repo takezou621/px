@@ -2,6 +2,8 @@
 
 **Lightweight agent orchestration on Proxmox VE.**
 
+English | [日本語](README.ja.md)
+
 px runs autonomous AI agent workloads (Claude Code, Codex CLI, OpenCode, ...) in
 ephemeral Proxmox LXC sandboxes, declared in plain YAML and driven by a
 `kubectl`-style CLI — with no Kubernetes, no Redis, no external control plane.
@@ -24,8 +26,8 @@ px CLI ──HTTP──▶ px-server (single binary, SQLite) ──PVE API──
    a template: copy-on-write, seconds to boot, kernel-level isolation.
 3. **Declare, don't script.** Workloads are YAML manifests (`px.io/v1alpha1`),
    applied and inspected with `px apply` / `px get` / `px describe`.
-4. **Sandbox by default.** Tasks get resource limits and (eventually) network
-   fences. Agent code is untrusted until proven otherwise.
+4. **Sandbox by default.** Tasks get resource limits and, with a Gateway
+   attached, an egress fence. Agent code is untrusted until proven otherwise.
 
 ## Primitives
 

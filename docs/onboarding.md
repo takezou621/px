@@ -1,5 +1,11 @@
 # px onboarding
 
+English | [日本語](onboarding.ja.md)
+
+> This document is also available in Japanese:
+> [onboarding.ja.md](onboarding.ja.md). The English version is
+> authoritative.
+
 Welcome. This document gets you from clone to first contribution in
 about 30 minutes. It is a map, not the territory: every section names
 the file that owns the detail. Read order: this page → the files it
