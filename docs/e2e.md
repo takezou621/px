@@ -36,8 +36,10 @@ storage (dir/NFS, default `local`); lvmthin pools like `local-lvm`
 reject template files, so keep them separate.
 
 For agent tasks (see `px run`), build the agent template the same way —
-it is the runner template plus the Claude Code CLI, baked in via the
-native installer:
+it is the runner template plus the Claude Code CLI, baked in as the
+native release binary (verified against the release manifest at build
+time — the installer's own download path is bypassed, see the comments
+in the script):
 
 ```sh
 scp template/agent/build.sh root@<PVE_HOST>:/root/

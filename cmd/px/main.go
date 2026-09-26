@@ -114,7 +114,10 @@ func (w *wsList) Set(v string) error {
 // runner's GOAL env. The sandbox is the isolation boundary (LXC + optional
 // Gateway egress allowlist), so the CLI's own permission prompts are
 // skipped — there is no human inside the container to answer them.
-var defaultAgentCommand = []string{"sh", "-c", `claude --dangerously-skip-permissions -p "$GOAL"`}
+// IS_SANDBOX=1 is the CLI's declared escape hatch for exactly that
+// arrangement: runners exec as root, and without it the CLI refuses
+// --dangerously-skip-permissions under root/sudo outright.
+var defaultAgentCommand = []string{"sh", "-c", `IS_SANDBOX=1 claude --dangerously-skip-permissions -p "$GOAL"`}
 
 // splitRunArgs splits args at the first bare "--": everything before it
 // goes to flag parsing, everything after is the explicit runner command.

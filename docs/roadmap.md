@@ -2,7 +2,7 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
-## M6 — First-class agent runtime (current)
+## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,
 observability, user-defined templates): the primitives M3 assembled
@@ -10,29 +10,57 @@ observability, user-defined templates): the primitives M3 assembled
 actual agent runs through them end to end — the missing piece is the
 experience of launching one. Scope:
 
-- [ ] Task-level goal: `spec.goal` joins the per-workspace goals in the
+- [x] Task-level goal: `spec.goal` joins the per-workspace goals in the
   runner's GOAL env (task goal first, then workspace blocks), so a task
   without workspaces can carry an instruction — today goal only exists
-  per workspace, and an agent task is goal-first by nature.
-- [ ] Agent template `px-agent-debian12` (`template/agent/build.sh`):
-  the runner template plus the Claude Code CLI baked in via the native
-  installer (a self-contained binary — no Node runtime in the image).
-  `px run` defaults `spec.image` to it; `--image` overrides.
-- [ ] `px run`: client-side sugar that builds and applies a Task from
+  per workspace, and an agent task is goal-first by nature. Verified
+  live: a task-level goal with no workspaces reaches the runner as GOAL
+  and drives it to Succeeded.
+- [x] Agent template `px-agent-debian12` (`template/agent/build.sh`):
+  the runner template plus the Claude Code CLI baked in as the native
+  release binary (a self-contained executable — no Node runtime in the
+  image), fetched directly from the release CDN and verified against the
+  published manifest's SHA256. `px run` defaults `spec.image` to it;
+  `--image` overrides. Live finding: the installer's own `claude install`
+  step re-downloads the binary through an internal client that delivered
+  a truncated staging file on the lab network ("staged binary no longer
+  matches the verified checksum") — the template build fetches the raw
+  binary and does the same manifest check itself instead. Second live
+  finding: `pct exec`'s PATH is the fixed `/sbin:/bin:/usr/sbin:/usr/bin`
+  (no `/usr/local/bin`), so the CLI is symlinked into `/usr/bin` and the
+  build verifies `claude --version` under that exact PATH before the
+  template is frozen.
+- [x] `px run`: client-side sugar that builds and applies a Task from
   flags (`--model`, `--workspace NAME[=goal]`, `--gateway`, `--ttl`,
   `--name`, `--image`, `--cores`/`--memory`) with the positional goal,
   then polls the task and follows its log to a terminal phase (2s
   polling; new log output echoed as it lands), and exits with the
   task's exit code; `--no-wait` returns after apply, Ctrl-C detaches
   with the task left running. The default runner command is
-  `sh -c 'claude --dangerously-skip-permissions -p "$GOAL"'`: inside an
-  LXC sandbox behind a Gateway allowlist there is no human to answer
-  permission prompts, so the isolation boundary is the container, not
-  the CLI's permission system (documented in the threat model).
-- [ ] E2E on the real node: template builds, an agent task boots, the
+  `sh -c 'IS_SANDBOX=1 claude --dangerously-skip-permissions -p "$GOAL"'`:
+  inside an LXC sandbox behind a Gateway allowlist there is no human to
+  answer permission prompts, so the isolation boundary is the container,
+  not the CLI's permission system (documented in the threat model);
+  IS_SANDBOX=1 is the CLI's declared escape hatch for that arrangement,
+  without which it refuses the flag under root — found live (first E2E
+  run: the CLI exited before reaching the provider with exactly that
+  refusal), fixed, and re-verified. A related live find: `px run` posts
+  `yaml.Marshal` output, and without yaml tags the API types marshaled
+  `apiversion`/`status` (lower-cased Go names) — the server's
+  unknown-field parser rejected every apply with a 400 that unit tests
+  (which decode leniently) could not see. All four kinds now carry yaml
+  tags mirroring the json ones, Task.Status marshals omitempty, and a
+  regression test asserts the posted yaml's `apiVersion:` casing and
+  absent status block.
+- [x] E2E on the real node: template builds, an agent task boots, the
   CLI is present, and a task whose Model holds a non-working key fails
   cleanly with the provider error in the log (no credential needed);
-  a live agent run with a real key is a user-supervised step.
+  a live agent run with a real key is a user-supervised step. Landed
+  2026-09-26: `scripts/e2e-agent.sh` 15/15 (docs/e2e.md §3g) — px run
+  explicit command → Succeeded; default command + spec.goal shape; CLI
+  runnable in the template; task goal → GOAL; dummy-key Model fails
+  cleanly with the provider error surfaced in the task log; cleanup
+  leaves no containers. No credential needed, nothing left on the node.
 - Explicitly out: session continuation across tasks (needs snapshots or
   a shared volume — deferred), interactive TTY exec (M4 deferral
   stands), port exposure (M7 candidate).

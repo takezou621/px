@@ -88,10 +88,13 @@ cannot read another task's, since sandboxes share nothing.
 
 The default runner command (`px run` without `--`, and the
 `px-agent-debian12` template) is
-`claude --dangerously-skip-permissions -p "$GOAL"`. The name of that
-flag reads alarming, and the choice is deliberate: a permission prompt
-needs a human inside the container to answer it, and there is none —
-the task is autonomous by definition. The isolation boundary is the
+`IS_SANDBOX=1 claude --dangerously-skip-permissions -p "$GOAL"`. The
+name of that flag reads alarming, and the choice is deliberate: a
+permission prompt needs a human inside the container to answer it, and
+there is none — the task is autonomous by definition. `IS_SANDBOX=1` is
+the CLI's declared escape hatch for that arrangement (runners exec as
+root, under which the CLI refuses the flag outright) — the environment
+really is isolated here by construction. The isolation boundary is the
 *container*, not the CLI's permission system: the LXC sandbox already
 assumes the task is the untrusted party (see the trust model), and an
 optional Gateway bounds what its egress can reach. Skipping the CLI's

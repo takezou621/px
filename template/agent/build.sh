@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the px agent LXC template on a Proxmox VE node: the runner template
 # (bash, git, curl, build-essential, jq, python3) plus the Claude Code CLI,
-# baked in via the native installer (a self-contained binary — no Node
-# runtime in the image).
+# baked in as the native release binary (a self-contained executable — no
+# Node runtime in the image).
 #
 # Usage (on the PVE node, or via ssh):
 #   ./build.sh <CTID> [bridge] [storage] [tpl-storage]
@@ -53,16 +53,34 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
   >/dev/null
 EOS
 
-echo "==> installing Claude Code (native installer)"
-# The installer puts the binary under /root/.local/bin; the runner executes
-# through a bare `sh` whose PATH stops at /usr/local/bin, so the CLI is
-# linked there. --version proves the binary actually runs before the
+echo "==> installing Claude Code (native binary, manifest checksum)"
+# The native installer's `claude install` step re-downloads through an
+# internal client that can deliver a truncated staging file on lab networks
+# (install dies with "staged binary no longer matches the verified
+# checksum"), so this fetches the raw release binary and verifies it
+# against the published manifest here instead — same SHA256, one download.
+# The runner's PATH is pct exec's default (no /usr/local/bin), hence the
+# /usr/bin symlink; --version proves the binary actually runs before the
 # template is frozen — a template whose agent CLI cannot start fails every
 # task it clones.
-pct exec "$CTID" -- bash -euxc \
-  'curl -fsSL https://claude.ai/install.sh | bash -s stable'
-pct exec "$CTID" -- bash -euxc \
-  'ln -sf /root/.local/bin/claude /usr/local/bin/claude && claude --version'
+pct exec "$CTID" -- bash -eux <<'EOS'
+case $(uname -m) in
+  x86_64|amd64) plat=linux-x64 ;;
+  aarch64|arm64) plat=linux-arm64 ;;
+  *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+esac
+base=https://downloads.claude.ai/claude-code-releases
+ver=$(curl -fsSL "$base/latest")
+expect=$(curl -fsSL "$base/$ver/manifest.json" | jq -r ".platforms[\"$plat\"].checksum")
+dest="/root/.local/share/claude/versions/$ver"
+mkdir -p /root/.local/share/claude/versions /root/.local/bin
+curl -fsSL -o "$dest" "$base/$ver/$plat/claude"
+[ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$expect" ] || { echo "checksum mismatch" >&2; exit 1; }
+chmod +x "$dest"
+ln -sf "$dest" /root/.local/bin/claude
+ln -sf /root/.local/bin/claude /usr/bin/claude
+env PATH=/sbin:/bin:/usr/sbin:/usr/bin claude --version
+EOS
 
 echo "==> stopping and converting to template"
 pct stop "$CTID"

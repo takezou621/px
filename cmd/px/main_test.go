@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
@@ -14,13 +16,21 @@ import (
 )
 
 // captureTask serves /v1/apply, records the YAML body cmdRun posts, and
-// returns a getter for the decoded manifest.
-func captureTask(t *testing.T) (get func() *v1alpha1.Task) {
+// returns a getter for the decoded manifest (and the raw body, for
+// casing-sensitive checks the decode would hide).
+func captureTask(t *testing.T) (get func() *v1alpha1.Task, body func() string) {
 	t.Helper()
 	var m *v1alpha1.Task
+	var raw string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		raw = string(data)
 		var task v1alpha1.Task
-		if err := yaml.NewDecoder(r.Body).Decode(&task); err != nil {
+		if err := yaml.Unmarshal(data, &task); err != nil {
 			http.Error(w, fmt.Sprintf("bad yaml: %v", err), http.StatusBadRequest)
 			return
 		}
@@ -30,11 +40,11 @@ func captureTask(t *testing.T) (get func() *v1alpha1.Task) {
 	}))
 	t.Cleanup(srv.Close)
 	serverURL = srv.URL
-	return func() *v1alpha1.Task { return m }
+	return func() *v1alpha1.Task { return m }, func() string { return raw }
 }
 
 func TestCmdRunDefaultCommandWithoutSeparator(t *testing.T) {
-	get := captureTask(t)
+	get, body := captureTask(t)
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	if err := cmdRun(fs, []string{"-no-wait", "write the tests"}); err != nil {
 		t.Fatalf("cmdRun: %v", err)
@@ -52,10 +62,20 @@ func TestCmdRunDefaultCommandWithoutSeparator(t *testing.T) {
 	if m.Spec.Image != "px-agent-debian12" {
 		t.Errorf("image = %q, want the agent template default", m.Spec.Image)
 	}
+	// The real apply endpoint parses with unknown-field rejection and yaml
+	// tags in their exact case: a lower-cased "apiversion" (yaml.v3's
+	// untagged-field default) or a marshaled "status" block must not slip
+	// through a lenient decode.
+	if !strings.Contains(body(), "apiVersion: "+v1alpha1.APIVersion) {
+		t.Errorf("posted yaml lacks the correctly cased apiVersion line: %q", body())
+	}
+	if strings.Contains(body(), "\nstatus:") {
+		t.Errorf("posted yaml marshals a status block: %q", body())
+	}
 }
 
 func TestCmdRunExplicitCommandAfterSeparator(t *testing.T) {
-	get := captureTask(t)
+	get, _ := captureTask(t)
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	if err := cmdRun(fs, []string{"-no-wait", "sanity check", "--", "claude", "--version"}); err != nil {
 		t.Fatalf("cmdRun: %v", err)
@@ -68,7 +88,7 @@ func TestCmdRunExplicitCommandAfterSeparator(t *testing.T) {
 }
 
 func TestCmdRunFlagsBeforeGoal(t *testing.T) {
-	get := captureTask(t)
+	get, _ := captureTask(t)
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	if err := cmdRun(fs, []string{"-no-wait", "-model", "m1", "-ttl", "60", "goal text"}); err != nil {
 		t.Fatalf("cmdRun: %v", err)
@@ -84,8 +104,7 @@ func TestCmdRunFlagsBeforeGoal(t *testing.T) {
 
 func TestCmdRunRejectsExtraPositional(t *testing.T) {
 	captureTask(t)
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	if err := cmdRun(fs, []string{"-no-wait", "goal", "extra"}); err == nil {
+	if err := cmdRun(flag.NewFlagSet("run", flag.ContinueOnError), []string{"-no-wait", "goal", "extra"}); err == nil {
 		t.Fatal("extra positional arguments accepted silently")
 	}
 }

@@ -106,10 +106,10 @@ const RedactedAPIKey = "<redacted>"
 
 // Model is the API representation of a Model object.
 type Model struct {
-	APIVersion string     `json:"apiVersion"`
-	Kind       string     `json:"kind"`
-	Metadata   ObjectMeta `json:"metadata"`
-	Spec       ModelSpec  `json:"spec"`
+	APIVersion string     `json:"apiVersion" yaml:"apiVersion"`
+	Kind       string     `json:"kind" yaml:"kind"`
+	Metadata   ObjectMeta `json:"metadata" yaml:"metadata"`
+	Spec       ModelSpec  `json:"spec" yaml:"spec"`
 }
 
 // EgressRule allows outbound traffic to one destination. A rule with ports
@@ -134,10 +134,10 @@ type GatewaySpec struct {
 
 // Gateway is the API representation of a Gateway object.
 type Gateway struct {
-	APIVersion string      `json:"apiVersion"`
-	Kind       string      `json:"kind"`
-	Metadata   ObjectMeta  `json:"metadata"`
-	Spec       GatewaySpec `json:"spec"`
+	APIVersion string      `json:"apiVersion" yaml:"apiVersion"`
+	Kind       string      `json:"kind" yaml:"kind"`
+	Metadata   ObjectMeta  `json:"metadata" yaml:"metadata"`
+	Spec       GatewaySpec `json:"spec" yaml:"spec"`
 }
 
 // TaskPhase is the lifecycle phase of a Task.
@@ -156,20 +156,26 @@ const (
 )
 
 // Task is the API representation of a Task object (manifest + status).
+// The yaml tags mirror the json ones: yaml.v3 marshals untagged fields by
+// their lower-cased Go name, and the server-side manifest parser rejects
+// unknown fields — px run posts yaml.Marshal output, so a missing tag would
+// turn apiVersion into "apiversion" and get the apply rejected. status is
+// omitempty because an applied manifest never carries one: the parser has
+// no status field at all.
 type Task struct {
-	APIVersion string     `json:"apiVersion"`
-	Kind       string     `json:"kind"`
-	Metadata   ObjectMeta `json:"metadata"`
-	Spec       TaskSpec   `json:"spec"`
-	Status     TaskStatus `json:"status"`
+	APIVersion string     `json:"apiVersion" yaml:"apiVersion"`
+	Kind       string     `json:"kind" yaml:"kind"`
+	Metadata   ObjectMeta `json:"metadata" yaml:"metadata"`
+	Spec       TaskSpec   `json:"spec" yaml:"spec"`
+	Status     TaskStatus `json:"status" yaml:"status,omitempty"`
 }
 
 // Workspace is the API representation of a Workspace object.
 type Workspace struct {
-	APIVersion string        `json:"apiVersion"`
-	Kind       string        `json:"kind"`
-	Metadata   ObjectMeta    `json:"metadata"`
-	Spec       WorkspaceSpec `json:"spec"`
+	APIVersion string        `json:"apiVersion" yaml:"apiVersion"`
+	Kind       string        `json:"kind" yaml:"kind"`
+	Metadata   ObjectMeta    `json:"metadata" yaml:"metadata"`
+	Spec       WorkspaceSpec `json:"spec" yaml:"spec"`
 }
 
 // TaskStatus is the observed state of a Task.

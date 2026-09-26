@@ -63,7 +63,7 @@ spec:
     # $GOAL is an env var set from the workspaces' goals. Because commands run
     # in exec form (each argv element is passed literally), wrap in a shell to
     # expand variables.
-    command: ["bash", "-lc", "claude -p \"$GOAL\" --dangerously-skip-permissions"]
+    command: ["bash", "-lc", "IS_SANDBOX=1 claude -p \"$GOAL\" --dangerously-skip-permissions"]
   resources:
     cores: 4
     memoryMB: 8192
@@ -104,8 +104,8 @@ $ px run -model my-claude -workspace myapp="Fix bug #123" "make the tests pass"
 It assumes the `px-agent-debian12` template
 (`template/agent/build.sh` — the runner template plus the Claude Code
 CLI). The default runner command is
-`claude --dangerously-skip-permissions -p "$GOAL"`: the sandbox is the
-isolation boundary, not the CLI's permission prompts
+`IS_SANDBOX=1 claude --dangerously-skip-permissions -p "$GOAL"`: the
+sandbox is the isolation boundary, not the CLI's permission prompts
 (see [docs/threat-model.md](docs/threat-model.md)). Pass
 `-- COMMAND...` to run something else.
 
