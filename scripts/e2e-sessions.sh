@@ -20,11 +20,11 @@
 # Checks:
 #   1. a task with spec.session.name writes its capture under the explicit
 #      name (the turn-1 runner finds no session file, plants one)
-#   2. the writer task's record is deleted — the named capture SURVIVES
-#      (px get sessions still lists it, LAST-TASK = the writer)
-#   3. `px run --continue-session` restores the capture into a fresh task
+#   2. `px run --continue-session` restores the capture into a fresh task
 #      (its log says SESSION-RESTORED-OK), and after it finishes the
 #      capture's LAST-TASK has moved to the new writer
+#   3. the first writer's record is deleted — the named capture SURVIVES
+#      (px get sessions still lists it, LAST-TASK still the second writer)
 #   4. `px describe session` lists the referencing task
 #   5. `px delete session` drops the capture; a session:NAME continuation
 #      of the deleted capture then fails at provision
@@ -172,18 +172,7 @@ if wait_phase "$W1" Succeeded; then
   fi
 fi
 
-say "2. the writer's record is deleted; the named capture survives"
-"$PX" delete task "$W1" >/dev/null
-if wait_record_gone "$W1"; then
-  row=$(sess_row "$CONV" || true)
-  if [[ -n $row ]] && grep -q "$W1" <<<"$row"; then
-    ok "capture outlives its writer: $row"
-  else
-    bad "capture did not survive the writer's deletion (row: '$row')"
-  fi
-fi
-
-say "3. px run --continue-session restores the capture and moves LAST-TASK"
+say "2. px run --continue-session restores the capture and moves LAST-TASK"
 "$PX" run -continue-session "$CONV" -name "$W2" -no-wait "advance the conversation" >/dev/null
 if wait_phase "$W2" Succeeded; then
   if grep -q "SESSION-RESTORED-OK" <("$PX" logs "$W2"); then
@@ -196,6 +185,17 @@ if wait_phase "$W2" Succeeded; then
     ok "last writer moved to $W2: $row"
   else
     bad "capture's LAST-TASK did not move to $W2 (row: '$row')"
+  fi
+fi
+
+say "3. the first writer's record is deleted; the named capture survives"
+"$PX" delete task "$W1" >/dev/null
+if wait_record_gone "$W1"; then
+  row=$(sess_row "$CONV" || true)
+  if [[ -n $row ]] && grep -q "$W2" <<<"$row"; then
+    ok "capture outlives its first writer: $row"
+  else
+    bad "capture did not survive the writer's deletion (row: '$row')"
   fi
 fi
 

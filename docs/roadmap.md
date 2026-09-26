@@ -317,7 +317,7 @@ the archive over the API.
 - [x] `px_sessions` gauge; SessionSaved message names the session
 - [x] Unit tests: migration/backfill, named-capture lifetime,
   session:NAME resolution matrix, endpoint surface, CLI sugar rules
-- [ ] E2E on the real node (scripts/e2e-sessions.sh): a named capture
+- [x] E2E on the real node (scripts/e2e-sessions.sh): a named capture
   surviving its task's delete, `--continue-session` twice against the
   same name, describe showing the references, delete session
 
