@@ -1,0 +1,44 @@
+template/agent/build.sh
+  s_e6a860663c7e72::t_4592e834dda11c 4-5
+  s_e6a860663c7e72::t_d413c17fc47f65 56-63,66-83
+docs/threat-model.md
+  s_e6a860663c7e72::t_e9ecf413af1b40 91-97
+README.md
+  s_e6a860663c7e72::t_792438d8093552 107-108
+  s_e6a860663c7e72::t_2ac6678fee501c 66
+docs/e2e.md
+  s_e6a860663c7e72::t_899b4234a5f5b0 39-42
+internal/apis/v1alpha1/types.go
+  s_e6a860663c7e72::t_d6ad98dedc2d44 109-112
+  s_e6a860663c7e72::t_c03ddaa8a002ca 137-140
+  s_e6a860663c7e72::t_31aaf8cd7dd753 162-164,170
+  s_e6a860663c7e72::t_e68c4fc16c702f 159-161,166-169,175-178
+cmd/px/main_test.go
+  s_e6a860663c7e72::t_3bc66dc1198f7b 7,11
+  s_e6a860663c7e72::t_26885ca8d0e1b2 78
+  s_e6a860663c7e72::t_764fa6c9946e41 19-21,24,26-31,33,43
+  s_e6a860663c7e72::t_ffd2864f979ec0 107
+  s_e6a860663c7e72::t_c108834f0751f1 47,65-74
+  s_e6a860663c7e72::t_bdc45159b64d7f 91
+cmd/px/main.go
+  s_e6a860663c7e72::t_242e2ba6734aa1 117-120
+docs/roadmap.md
+  s_e6a860663c7e72::t_07e30f0489240b 5,13,16-33,45-55,58-63
+  s_e6a860663c7e72::t_68c22d7f4962bb 40-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c9851269f6286a05763a96b35029db8b0fb2301a",
+  "prompts": {},
+  "sessions": {
+    "s_e6a860663c7e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09127d2b-fdd9-4f3b-aa47-c9cb9d1842bd",
+        "model": "unknown"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
