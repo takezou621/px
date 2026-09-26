@@ -395,6 +395,42 @@ this script pins the end-to-end waiting behavior of the cluster-wide
 cap, which is the one that turns a runaway M12 cron from node-fill into
 a visible, alarmable queue.
 
+## 3l. Integration test
+
+The scripts above pin one feature each. `e2e-integration.sh` walks the
+user's actual path through the system — a single multi-document apply,
+then the kinds cooperating — so a regression that only shows up in the
+combination is caught here. With a fresh px-server (default caps), same
+as section 2:
+
+```sh
+./scripts/e2e-integration.sh
+# env: PX_SERVER, PX, TIMEOUT as above, plus:
+#   PVE_SSH   ssh target for node-level checks
+#             (default root@192.168.2.100; empty disables them)
+#   ALLOW_DEST  IP the fenced task may reach on tcp/8006
+#               (default 192.168.2.100)
+#   REPO      git repo the workspace clones
+#             (default https://github.com/takezou621/px.git)
+# Takes ~4 minutes.
+```
+
+It exercises, in one flow: one multi-document apply creating Model +
+Gateway + Workspace + Schedule + two Tasks that reference the other
+kinds by name (the read-back task spec carries the model, session and
+workspace references); the main task clones the workspace, sees the
+model env and the goal, survives a suspend/resume mid-flight (cgroup
+actually frozen on the node, exec refused with 409 while frozen), and
+finishes — its capture lands under the session name with the task as
+last writer;
+`px run --continue-session` restores that capture into a fresh container
+(SESSION-RESTORED-OK) and moves the last writer; the fenced task proves
+the gateway verdict `pve=ok ext=blocked dns=ok`; the schedule fires at
+the minute boundary (generated task carries `scheduleOwner`) and
+`suspend schedule` is declarative; metrics agree (`px_tasks` Succeeded,
+`px_quota_waiting` 0); and cleanup deletes everything with no leftover
+`px-` containers on the node (the node's own templates excluded).
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it
@@ -436,3 +472,15 @@ happen once:
   runner output there.
 - Template not found at clone: the `image` field must be the template
   **name** (`px-runner-debian12`), not the CTID.
+- Every PVE API call times out at once: check for an IP collision.
+  Task containers join the LAN by DHCP on vmbr0; if the DHCP pool
+  contains the node's own static IP, a container grabs it and clients'
+  ARP caches start resolving the node's IP to the container's virtual
+  NIC — seen in `arp -a` on a client as the node's IP pointing at a
+  `bc:24:11` MAC (QEMU's virtual NIC OUI, Proxmox's default guest-NIC
+  prefix since PVE 8.2) instead of the node's own bridge MAC
+  (`ip link show vmbr0`). Fix the root cause by
+  excluding the node's IP from the DHCP pool (or reserving it); after
+  destroying the container, clear the stale entry on each client that
+  cached it (`arp -d <node-ip>` on macOS) — the node answers ARP for
+  its own IP again on the next request.

@@ -120,7 +120,9 @@ The template contract (users, packages, `px-runner` identity) is in
 - **Isolation**: every CT is unprivileged — the template is built
   unprivileged and each clone is verified unprivileged before start.
 - **Egress**: Gateway kinds enforce an allowlist via LXC firewall rules
-  on the PVE node; a task without a gateway has no network by default.
+  on the PVE node (guest firewall + egress DROP policy + implicit
+  DNS/DHCP allows + one ACCEPT per rule). The fence is opt-in: a task
+  without a Gateway reference gets no rules at all.
 - **Control plane**: px-server binds loopback by default and expects a
   bearer token (`-token-file`). Model credentials are stored redacted
   and injected as env only inside the sandbox.
