@@ -226,6 +226,19 @@ func (c *Client) ContainerHostname(ctx context.Context, vmid int) (string, error
 	return cfg.Hostname, nil
 }
 
+// ContainerConfig returns the container's unprivileged flag and net0 value
+// from a single config read, so both facts come from the same revision.
+func (c *Client) ContainerConfig(ctx context.Context, vmid int) (unprivileged bool, net0 string, err error) {
+	var cfg struct {
+		Unprivileged int    `json:"unprivileged"`
+		Net0         string `json:"net0"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/lxc/%d/config", c.node, vmid), nil, &cfg); err != nil {
+		return false, "", err
+	}
+	return cfg.Unprivileged == 1, cfg.Net0, nil
+}
+
 // ContainerUnprivileged reports whether the container runs with an
 // unprivileged uid mapping. The clone endpoint cannot set this (the property
 // is absent from clone_vm's parameter schema, so PVE rejects it with 400) —

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -342,7 +343,7 @@ func taskLogs(name string) (out string, blocked bool, err error) {
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates")
 	}
 	switch args[0] {
 	case "tasks":
@@ -425,9 +426,37 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 			fmt.Printf("%-24s %s\n", g.Metadata.Name, strings.Join(rules, ","))
 		}
 		return nil
+	case "templates":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		tmpls, err := fetchTemplates()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%-28s %-8s %-12s %-6s %s\n", "NAME", "VMID", "NODE", "PX-OK", "MISSING")
+		for _, t := range tmpls {
+			missing := "-"
+			if len(t.Missing) > 0 {
+				missing = strings.Join(t.Missing, ",")
+			}
+			fmt.Printf("%-28s %-8d %-12s %-6t %s\n", t.Name, t.VMID, t.Node, t.PxOK, missing)
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates")
 	}
+}
+
+// fetchTemplates backs both `px get templates` and `px describe template`:
+// one endpoint, client-side name filter — the server computes the whole
+// listing anyway and a node holds a handful of templates at most.
+func fetchTemplates() ([]*v1alpha1.Template, error) {
+	var tmpls []*v1alpha1.Template
+	if err := doJSON(http.MethodGet, "/v1/templates", nil, &tmpls); err != nil {
+		return nil, err
+	}
+	return tmpls, nil
 }
 
 // popName finds the first non-flag argument (the object NAME) and returns it
@@ -444,13 +473,13 @@ func popName(args []string) (string, []string, error) {
 
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	kind := "task" // bare NAME is treated as a task
-	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway" || args[0] == "template") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME")
+		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME | describe template NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -480,6 +509,37 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		printJSONIndent(g)
+	case "template":
+		nodeName, vmidPart, hasVMID := strings.Cut(name, "@")
+		var vmid int
+		if hasVMID {
+			var err error
+			if vmid, err = strconv.Atoi(vmidPart); err != nil {
+				return fmt.Errorf("bad template selector %q (want name or name@vmid)", name)
+			}
+		}
+		tmpls, err := fetchTemplates()
+		if err != nil {
+			return err
+		}
+		var matches []*v1alpha1.Template
+		for _, t := range tmpls {
+			if t.Name == nodeName && (!hasVMID || t.VMID == vmid) {
+				matches = append(matches, t)
+			}
+		}
+		switch {
+		case len(matches) == 0:
+			return fmt.Errorf("template %q not found (see px get templates)", name)
+		case len(matches) > 1:
+			var at []string
+			for _, m := range matches {
+				at = append(at, fmt.Sprintf("%s@%d", m.Name, m.VMID))
+			}
+			return fmt.Errorf("template %q exists on several nodes (%s); pick one with px describe template name@vmid",
+				nodeName, strings.Join(at, ", "))
+		}
+		printJSONIndent(matches[0])
 	}
 	return nil
 }
@@ -847,10 +907,13 @@ Usage:
   px get workspaces               List workspaces
   px get models                   List models (API keys redacted)
   px get gateways                 List gateways with their egress rules
+  px get templates                List LXC templates on the node with px's
+                                  compatibility verdict
   px describe task NAME           Show one task as JSON
   px describe workspace NAME      Show one workspace as JSON
   px describe model NAME          Show one model as JSON (API key redacted)
   px describe gateway NAME        Show one gateway as JSON
+  px describe template NAME       Show one template's facts and verdict
   px logs NAME [-f]               Stream runner logs
   px exec NAME -- CMD [ARG...]    Run a command in a running task's container
                                   (exits with the command's exit code)

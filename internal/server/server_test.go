@@ -55,6 +55,10 @@ func (nopProv) EnsurePorts(_ context.Context, _ string, _ int, _ []controller.Po
 }
 func (nopProv) RemovePorts(_ context.Context, _ string, _ []int) error { return nil }
 
+func (nopProv) Templates(_ context.Context) ([]*v1alpha1.Template, error) {
+	return []*v1alpha1.Template{}, nil
+}
+
 const manifest = `
 apiVersion: px.io/v1alpha1
 kind: Task
@@ -564,7 +568,7 @@ func (p *execProv) Owned(_ context.Context, _, _ string, _ int) (bool, error) {
 	return !p.noOwn, p.ownErr
 }
 
-func newExecServer(t *testing.T, prov *execProv) (*httptest.Server, *store.Store) {
+func newExecServer(t *testing.T, prov controller.Provisioner) (*httptest.Server, *store.Store) {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/px.db")
 	if err != nil {
@@ -845,4 +849,72 @@ func cmpArgs(got, want []string) string {
 		}
 	}
 	return ""
+}
+
+// tmplProv serves a fixed template listing (or an error) for the discovery
+// endpoint; everything else falls through to nopProv.
+type tmplProv struct {
+	nopProv
+	tmpls []*v1alpha1.Template
+	err   error
+}
+
+func (p tmplProv) Templates(_ context.Context) ([]*v1alpha1.Template, error) {
+	return p.tmpls, p.err
+}
+
+func TestListTemplates(t *testing.T) {
+	facts := []*v1alpha1.Template{
+		{Name: "px-agent-debian12", VMID: 998, Node: "third", Unprivileged: true, DHCP: true, PxOK: true},
+		{Name: "px-privileged", VMID: 997, Node: "third", Missing: []string{"unprivileged"}},
+	}
+	srv, _ := newExecServer(t, tmplProv{tmpls: facts})
+	resp, err := http.Get(srv.URL + "/v1/templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	var got []*v1alpha1.Template
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(got)
+	if !strings.Contains(string(b), `"pxOk":true`) {
+		t.Errorf("verdict must serialize as pxOk: %s", b)
+	}
+	clear, _ := json.Marshal(got[0])
+	if strings.Contains(string(clear), `"missing"`) {
+		t.Errorf("an all-clear template must omit missing: %s", clear)
+	}
+	if len(got) != 2 || got[1].Missing[0] != "unprivileged" {
+		t.Errorf("listing lost its verdicts: %+v", got)
+	}
+}
+
+func TestListTemplatesEmptyIsArrayNot(t *testing.T) {
+	srv, _ := newExecServer(t, tmplProv{})
+	resp, err := http.Get(srv.URL + "/v1/templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.TrimSpace(string(body)) != "[]" {
+		t.Errorf("a template-less node must serialize as [], got: %s", body)
+	}
+}
+
+func TestListTemplatesPVEUnreachable(t *testing.T) {
+	srv, _ := newExecServer(t, tmplProv{err: fmt.Errorf("cluster resources: connection refused")})
+	resp, err := http.Get(srv.URL + "/v1/templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502 (the PVE side is down, not px)", resp.StatusCode)
+	}
 }

@@ -134,6 +134,14 @@ type Provisioner interface {
 	// ports and verifies each is gone (SIGTERM, a short grace, SIGKILL).
 	// Idempotent: a port with no listener reports success.
 	RemovePorts(ctx context.Context, node string, hostPorts []int) error
+	// Templates discovers the LXC templates px can clone from, each with
+	// its compatibility verdict (spec.image candidates — see
+	// v1alpha1.VerdictTemplate and template/README.md). Single-node mode
+	// lists the fixed node only; cluster mode every online node, matching
+	// what Schedule actually clones from. Every check is API-only: a
+	// template is never exec'd into, and one whose config cannot be read
+	// lists with that fault in Missing instead of failing the listing.
+	Templates(ctx context.Context) ([]*v1alpha1.Template, error)
 }
 
 // PortForward is one desired node-side forwarding rule: the node listens
@@ -265,6 +273,57 @@ func (p *provisioner) Schedule(ctx context.Context, image string) (string, error
 		return scored[i].node < scored[j].node
 	})
 	return scored[0].node, nil
+}
+
+// Templates discovers cloneable LXC templates with a compatibility verdict
+// — see the interface comment.
+func (p *provisioner) Templates(ctx context.Context) ([]*v1alpha1.Template, error) {
+	res, err := p.pve.ClusterResources(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("cluster resources: %w", err)
+	}
+	online := map[string]bool{}
+	type found struct {
+		node string
+		vmid int
+		name string
+	}
+	var tmpls []found
+	for _, r := range res {
+		switch {
+		case r.Type == "node":
+			online[r.Node] = r.Status == "online"
+		case r.Type == "lxc" && r.Template == 1:
+			tmpls = append(tmpls, found{r.Node, r.VMID, r.Name})
+		}
+	}
+	var out []*v1alpha1.Template
+	for _, f := range tmpls {
+		if p.fixedNode != "" && f.node != p.fixedNode {
+			continue
+		}
+		if !online[f.node] {
+			continue
+		}
+		np := p.nodePVE(f.node)
+		unpriv, net0, cerr := np.ContainerConfig(ctx, f.vmid)
+		if cerr != nil {
+			out = append(out, &v1alpha1.Template{Name: f.name, VMID: f.vmid, Node: f.node,
+				Missing: []string{fmt.Sprintf("config unreadable (%v)", cerr)}})
+			continue
+		}
+		out = append(out, v1alpha1.VerdictTemplate(f.name, f.vmid, f.node, unpriv, net0))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Node != out[j].Node {
+			return out[i].Node < out[j].Node
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].VMID < out[j].VMID
+	})
+	return out, nil
 }
 
 // NodeOf reports which node hosts a guest — the repair path for records

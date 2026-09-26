@@ -48,6 +48,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/gateways", s.handleListGateways)
 	mux.HandleFunc("GET /v1/gateways/{name}", s.handleGetGateway)
 	mux.HandleFunc("DELETE /v1/gateways/{name}", s.handleDeleteGateway)
+	mux.HandleFunc("GET /v1/templates", s.handleListTemplates)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -622,6 +623,21 @@ func redacted(m *v1alpha1.Model) *v1alpha1.Model {
 	cp.Spec = m.Spec
 	cp.Spec.APIKey = v1alpha1.RedactedAPIKey
 	return &cp
+}
+
+// handleListTemplates serves template discovery: read-only, PVE-backed
+// (Bad Gateway when the cluster view is unreachable — px itself is fine).
+// The listing is never nil, so a template-less node serializes as [].
+func (s *Server) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	tmpls, err := s.prov.Templates(r.Context())
+	if err != nil {
+		httpError(w, http.StatusBadGateway, "list templates: %v", err)
+		return
+	}
+	if tmpls == nil {
+		tmpls = []*v1alpha1.Template{}
+	}
+	writeJSON(w, http.StatusOK, tmpls)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

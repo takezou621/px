@@ -883,3 +883,104 @@ func TestNodeOfReportsGuestGone(t *testing.T) {
 		t.Fatalf("missing guest must map to ErrGuestGone, got: %v", err)
 	}
 }
+
+// Templates is the discovery half of scheduling: what a spec.image may
+// name. Every check is API-only and offline nodes are invisible (Schedule
+// could never clone from them — probing their templates would also wake a
+// dead node), and a template whose config cannot be read lists as broken
+// instead of failing the whole listing. A running qemu guest with the
+// template flag set, and a plain lxc container, must both be ignored.
+func TestTemplatesListsVerdictsAndSkipsOffline(t *testing.T) {
+	mux := http.NewServeMux()
+	res := []proxmox.ClusterResource{
+		{Type: "node", Node: "n1", Status: "online"},
+		{Type: "node", Node: "n2", Status: "online"},
+		{Type: "node", Node: "n3", Status: "offline"},
+		{Type: "lxc", Node: "n1", VMID: 101, Name: "px-agent-debian12", Template: 1},
+		{Type: "lxc", Node: "n1", VMID: 104, Name: "px-broken", Template: 1},
+		{Type: "lxc", Node: "n2", VMID: 102, Name: "px-privileged", Template: 1},
+		{Type: "lxc", Node: "n3", VMID: 103, Name: "px-on-offline", Template: 1},
+		{Type: "lxc", Node: "n1", VMID: 105, Name: "plain-container"},
+		{Type: "qemu", Node: "n1", VMID: 203, Name: "some-vm", Template: 1},
+	}
+	mux.HandleFunc("/api2/json/cluster/resources", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": res})
+	})
+	config := func(unpriv int, net0 string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"unprivileged": unpriv, "net0": net0},
+			})
+		}
+	}
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/101/config", config(1, "name=eth0,bridge=vmbr0,ip=dhcp,type=veth"))
+	mux.HandleFunc("/api2/json/nodes/n1/lxc/104/config", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no such disk", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/api2/json/nodes/n2/lxc/102/config", config(0, "name=eth0,bridge=vmbr0,ip=dhcp,type=veth"))
+	mux.HandleFunc("/api2/json/nodes/n3/lxc/103/config", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("template on an offline node must not be probed")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
+	// A per-node factory, not one shared client: the n2 row must be read at
+	// /nodes/n2/... or it lands in the "config unreadable" branch and the
+	// test still passes with the real routing broken.
+	p := &provisioner{pve: pve, nodePVE: func(n string) *proxmox.Client {
+		return proxmox.New(srv.URL, n, "root@pam!px=fake", false)
+	}}
+
+	tmpls, err := p.Templates(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []struct {
+		name  string
+		node  string
+		vmid  int
+		ok    bool
+		unpri bool
+		miss  int
+	}{
+		{"px-agent-debian12", "n1", 101, true, true, 0},
+		{"px-broken", "n1", 104, false, false, 1},
+		{"px-privileged", "n2", 102, false, false, 1},
+	}
+	if len(tmpls) != len(want) {
+		t.Fatalf("got %d templates, want %d: %+v", len(tmpls), len(want), tmpls)
+	}
+	for i, w := range want {
+		got := tmpls[i]
+		if got.Name != w.name || got.Node != w.node || got.VMID != w.vmid {
+			t.Errorf("row %d = %s@%s/%d, want %s@%s/%d", i, got.Name, got.Node, got.VMID, w.name, w.node, w.vmid)
+		}
+		if got.PxOK != w.ok {
+			t.Errorf("%s: PxOK = %v, want %v (missing %v)", got.Name, got.PxOK, w.ok, got.Missing)
+		}
+		if got.Unprivileged != w.unpri {
+			t.Errorf("%s: Unprivileged = %v, want %v", got.Name, got.Unprivileged, w.unpri)
+		}
+		if len(got.Missing) != w.miss {
+			t.Errorf("%s: %d missing entries, want %d: %v", got.Name, len(got.Missing), w.miss, got.Missing)
+		}
+	}
+	if tmpls[1].Missing[0] == "" || !strings.Contains(tmpls[1].Missing[0], "config unreadable") {
+		t.Errorf("px-broken must name the fault, got %v", tmpls[1].Missing)
+	}
+	if len(tmpls[2].Missing) != 1 || tmpls[2].Missing[0] != "unprivileged" {
+		t.Errorf("px-privileged must fail exactly the unprivileged requirement, got %v", tmpls[2].Missing)
+	}
+
+	// Single-node mode lists the fixed node only.
+	p.fixedNode = "n1"
+	tmpls, err = p.Templates(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tmpls) != 2 || tmpls[0].Node != "n1" || tmpls[1].Node != "n1" {
+		t.Fatalf("fixed-node mode = %+v, want only n1 rows", tmpls)
+	}
+}

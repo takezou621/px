@@ -144,6 +144,60 @@ same tick to close a delete race, restore-stage writes run un-retried
 (a redialed chunk append would corrupt the archive), and a fresh task
 record clears any session row a same-named predecessor left behind.
 
+## M9 — User-defined templates
+
+Chosen 2026-09-26 after M8 (candidates: user-defined templates,
+observability, named sessions, session capture streaming). M6 made any
+container a first-class agent runtime and M8 lets its work outlive it;
+the next ceiling is generality — a user who builds their own LXC
+template (their CLI, their toolchain) must reverse-engineer px's
+implicit contract, and nothing in px says what templates exist or
+whether one would work: a task naming a missing or incompatible image
+applies cleanly and only dies at provision with "no online node holds
+template". px treats the PVE node as the registry and its template
+requirements as a published contract — scope:
+
+- [x] Template contract, documented (template/README.md): what px
+  requires of any LXC template it clones — unprivileged, net0 with
+  `ip=dhcp` (the provisioner resolves the address via `ip` in-CT and
+  cannot wait for a static config), a writable `/run/px` for the boot
+  marker, `/bin/sh` for the boot script; agent-template extras (the
+  Claude CLI) are optional and only needed by the default agent
+  command. Plus how to author one from template/agent/build.sh.
+- [x] `GET /v1/templates`: cluster-wide discovery through the existing
+  ClusterResources view (lxc rows with the template flag), then one
+  API config read per template — unprivileged flag, net0 — so every
+  check is API-only; a template is never exec'd into (it is not ours
+  and may be stopped). Single-node mode lists the configured node
+  only; cluster mode lists every online node, matching what Schedule
+  can actually clone from.
+- [x] Compatibility verdict, computed server-side and carried on the
+  record: `pxOk` (all requirements met) plus the failing requirement
+  names, so a user sees "why would my template fail" without
+  provisioning anything. Facts (vmid, node, unprivileged, net0) ship
+  alongside; the CLI renders them.
+- [x] CLI: `px get templates` (NAME, VMID, NODE, PX-OK columns) and
+  `px describe template NAME` (facts + the failed requirements).
+- [x] Apply-time: deliberately no PVE check. Apply stays
+  control-plane-only (the kubectl precedent: apply does not verify the
+  image exists, the pull error surfaces later), and Schedule's
+  ProvisionFailed reason already names the template — a PVE round-trip
+  inside apply would make the API unusable whenever the node is down.
+- [x] Explicitly out: px orchestrating template builds (build.sh stays
+  a node-side script — px would need node SSH in the CLI, a second
+  control path), a px-side template registry or storage (PVE storage
+  already is the registry), auth/privilege requirements beyond
+  unprivileged.
+- [x] Unit tests: the verdict logic (all-requirement matrix, missing
+  config keys), the handler against a fake cluster view, CLI table
+  parsing.
+- [x] E2E on the real node (`scripts/e2e-templates.sh`, 12/12 pass
+  2026-09-26): the shipped
+  templates list with PX-OK true, describe shows their facts, a task
+  naming an unknown image reaches ProvisionFailed with the template
+  named in the reason, and a user-authored minimal template built
+  per the contract doc lists as PX-OK.
+
 ## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,

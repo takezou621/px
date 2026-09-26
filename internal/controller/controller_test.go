@@ -235,6 +235,10 @@ func (f *fakeProv) RemovePorts(_ context.Context, _ string, hostPorts []int) err
 	return nil
 }
 
+func (f *fakeProv) Templates(_ context.Context) ([]*v1alpha1.Template, error) {
+	return []*v1alpha1.Template{}, nil
+}
+
 func (f *fakeProv) DestroyOwned(ctx context.Context, taskName, _ string, vmid int) error {
 	f.mu.Lock()
 	host := f.hostnames[vmid]
