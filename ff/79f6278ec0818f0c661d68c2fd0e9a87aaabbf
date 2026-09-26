@@ -1,0 +1,26 @@
+docs/onboarding.ja.md
+  s_7e7dd78210f867::t_9bbd97fc23cea9 1-165
+docs/onboarding.md
+  s_7e7dd78210f867::t_093b20424657e9 3-8
+README.ja.md
+  s_7e7dd78210f867::t_ef611e129658d8 1-164
+README.md
+  s_7e7dd78210f867::t_969f661a36ac6c 29-30
+  s_7e7dd78210f867::t_88f6abfb183fad 5-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ff79f6278ec0818f0c661d68c2fd0e9a87aaabbf",
+  "prompts": {},
+  "sessions": {
+    "s_7e7dd78210f867": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d52eed35-0ac1-4ccb-a3a2-9b37a2ae832e",
+        "model": "unknown"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
