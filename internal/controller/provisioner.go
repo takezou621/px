@@ -36,6 +36,13 @@ var ErrSessionTooLarge = errors.New("session archive over the size cap")
 // instead of wedging on a node it can never determine.
 var ErrGuestGone = errors.New("no guest with that VMID exists in the cluster")
 
+// ErrNoCapacity reports that every candidate node is at the per-node
+// container cap. It is a temporary condition — a task finishing frees a
+// slot — so the controller parks the task in Pending rather than failing
+// it. Distinct from the template/online errors, which never clear by
+// waiting.
+var ErrNoCapacity = errors.New("all candidate nodes are at the per-node container cap")
+
 // Provisioner drives one Task's sandbox through its lifecycle. node is the
 // PVE cluster node the container lives on: single-node deployments always
 // pass their configured node, cluster mode the node Schedule picked. px
@@ -175,16 +182,22 @@ type provisioner struct {
 	// node no task ever lands on is never SSH'd.
 	ssh *sshexec.Pool
 	// fixedNode is set in single-node mode (-pve-node): Schedule returns it
-	// untouched and no cluster discovery runs.
+	// untouched and no cluster discovery runs. A per-node cap set beside it
+	// re-enables the cluster call — counting the fixed node's guests is the
+	// only way to know it is full.
 	fixedNode string
+	// maxPerNode caps the LXC guest count on any node Schedule would pick
+	// (0 = unlimited). Counted from the same ClusterResources read that
+	// discovery already does: every `lxc` row, templates included.
+	maxPerNode int
 	// egressGate runs between start and boot for gateway tasks; nil falls
 	// back to waitForEgressEnforcement. Tests stub it to keep the flow
 	// deterministic without a live node.
 	egressGate func(ctx context.Context, node string, vmid int) error
 }
 
-func NewProvisioner(pve *proxmox.Client, nodePVE func(string) *proxmox.Client, ssh *sshexec.Pool, fixedNode string) Provisioner {
-	p := &provisioner{pve: pve, nodePVE: nodePVE, ssh: ssh, fixedNode: fixedNode}
+func NewProvisioner(pve *proxmox.Client, nodePVE func(string) *proxmox.Client, ssh *sshexec.Pool, fixedNode string, maxPerNode int) Provisioner {
+	p := &provisioner{pve: pve, nodePVE: nodePVE, ssh: ssh, fixedNode: fixedNode, maxPerNode: maxPerNode}
 	p.egressGate = p.waitForEgressEnforcement
 	return p
 }
@@ -228,14 +241,44 @@ func (p *provisioner) nodeSSHOnce(ctx context.Context, node, cmd string, timeout
 const cgroupOpTimeout = 15 * time.Second
 
 // Schedule picks the node a new task's container clones onto — see the
-// interface comment for the scoring.
+// interface comment for the scoring. With a per-node cap set, nodes at the
+// cap drop out of the candidates; when that empties the set entirely the
+// error wraps ErrNoCapacity, which the controller parks the task on. The
+// cap also changes two diagnoses: a failed cluster-view read wraps
+// ErrNoCapacity too — a waiting task re-reads the view every tick, so one
+// transient API error must not kill it — and a fixed node whose view lacks
+// the image reports the missing template up front instead of hiding it
+// behind a wait no slot can ever fix.
 func (p *provisioner) Schedule(ctx context.Context, image string) (string, error) {
-	if p.fixedNode != "" {
+	if p.fixedNode != "" && p.maxPerNode <= 0 {
 		return p.fixedNode, nil
 	}
 	res, err := p.pve.ClusterResources(ctx)
 	if err != nil {
+		if p.maxPerNode > 0 {
+			return "", fmt.Errorf("cluster resources: %w: %w", err, ErrNoCapacity)
+		}
 		return "", fmt.Errorf("cluster resources: %w", err)
+	}
+	perNode := make(map[string]int)
+	if p.maxPerNode > 0 {
+		for _, r := range res {
+			if r.Type == "lxc" {
+				perNode[r.Node]++
+			}
+		}
+	}
+	if p.fixedNode != "" {
+		for _, r := range res {
+			if r.Type == "lxc" && r.Template == 1 && r.Name == image && r.Node == p.fixedNode {
+				if held := perNode[p.fixedNode]; held >= p.maxPerNode {
+					return "", fmt.Errorf("node %s holds %d containers, at the per-node cap %d: %w",
+						p.fixedNode, held, p.maxPerNode, ErrNoCapacity)
+				}
+				return p.fixedNode, nil
+			}
+		}
+		return "", fmt.Errorf("node %s holds no LXC template %q", p.fixedNode, image)
 	}
 	type candidate struct {
 		node string
@@ -253,14 +296,22 @@ func (p *provisioner) Schedule(ctx context.Context, image string) (string, error
 		}
 	}
 	var scored []candidate
+	capped := 0 // template-holding online nodes dropped only by the cap
 	for _, node := range tmplNodes {
 		c, ok := online[node]
 		if !ok {
 			continue
 		}
+		if p.maxPerNode > 0 && perNode[node] >= p.maxPerNode {
+			capped++
+			continue
+		}
 		scored = append(scored, c)
 	}
 	if len(scored) == 0 {
+		if capped > 0 {
+			return "", fmt.Errorf("template %q: %w", image, ErrNoCapacity)
+		}
 		return "", fmt.Errorf("no online node holds template %q (check spec.image and the template's storage)", image)
 	}
 	sort.Slice(scored, func(i, j int) bool {

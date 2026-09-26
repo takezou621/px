@@ -372,6 +372,29 @@ prunes the finished generated task once a second fires, and deleting
 the schedule is definition-only: the definition 404s, its generated
 tasks stay and inspect normally, and no new fire happens afterwards.
 
+## 3k. Quota caps test
+
+This one needs px-server restarted with the cap flag — start it with
+`-max-running-tasks 1` (other flags as usual), then:
+
+```sh
+./scripts/e2e-quotas.sh
+# env: PX_SERVER, PX, TIMEOUT as above
+```
+
+It exercises: a task admits normally under the cap, a second task
+**parks** `Pending` with reason `waiting for capacity` holding no
+container (the k8s-ResourceQuota model — wait, never fail), suspending
+the parked task is refused with `409` (nothing to freeze), ~6 reconcile
+ticks later it is still parked with EXACTLY one `CapacityWait` event,
+`px_quota_waiting` reads 1 while parked, deleting the admitted task
+frees the slot and the parked task advances to `Running`, and
+`px_quota_waiting` returns to 0. The per-node cap
+(`-max-containers-per-node`) is covered by unit tests on the scheduler;
+this script pins the end-to-end waiting behavior of the cluster-wide
+cap, which is the one that turns a runaway M12 cron from node-fill into
+a visible, alarmable queue.
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it

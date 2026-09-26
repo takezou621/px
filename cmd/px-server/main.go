@@ -37,6 +37,8 @@ func main() {
 		sshHostKey      = flag.String("ssh-host-key", os.Getenv("PX_SSH_HOST_KEY"), "file of pinned SSH host public keys, one per line (authorized_keys or ssh-keyscan format; get one with `ssh-keyscan -t ed25519 HOST`). Without it any host key is accepted")
 		sshHostOverride = flag.String("ssh-host-override", os.Getenv("PX_SSH_HOST_OVERRIDE"), "SSH host per PVE node as \"node=host,...\" (PVE node names usually do not resolve in DNS). Ignored for -pve-node: single-node mode always SSHes to the -pve-endpoint host")
 		interval        = flag.Duration("reconcile-interval", 2*time.Second, "controller reconcile interval")
+		maxRunning      = flag.Int("max-running-tasks", 0, "cap on concurrently live tasks cluster-wide (Provisioning+Running; 0 = unlimited)")
+		maxPerNode      = flag.Int("max-containers-per-node", 0, "cap on LXC containers per node (0 = unlimited)")
 	)
 	flag.Parse()
 
@@ -102,12 +104,16 @@ func main() {
 		log.Warn("ssh host key is not pinned: any host key is accepted (set -ssh-host-key)")
 	}
 
-	prov := controller.NewProvisioner(pve, nodePVE, sshPool, *pveNode)
+	prov := controller.NewProvisioner(pve, nodePVE, sshPool, *pveNode, *maxPerNode)
 	met := &metrics.Metrics{}
 	ctl := controller.New(st, prov, log)
 	ctl.Tick = *interval
 	ctl.Metrics = met
 	ctl.Events = st
+	ctl.MaxRunningTasks = *maxRunning
+	if *maxRunning > 0 || *maxPerNode > 0 {
+		log.Info("resource caps", "max-running-tasks", *maxRunning, "max-containers-per-node", *maxPerNode)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

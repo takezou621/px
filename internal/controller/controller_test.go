@@ -261,13 +261,13 @@ func (f *fakeProv) Owned(_ context.Context, taskName, _ string, vmid int) (bool,
 }
 
 type memStore struct {
-	mu          sync.Mutex
-	failUpserts int // fail the next N UpsertTask calls, then succeed
-	failCreates int // fail the next N CreateTask calls, then succeed
-	tasks       map[string]*v1alpha1.Task
-	workspaces  map[string]*v1alpha1.Workspace
-	models      map[string]*v1alpha1.Model
-	gateways    map[string]*v1alpha1.Gateway
+	mu              sync.Mutex
+	failUpserts     int // fail the next N UpsertTask calls, then succeed
+	failCreates     int // fail the next N CreateTask calls, then succeed
+	tasks           map[string]*v1alpha1.Task
+	workspaces      map[string]*v1alpha1.Workspace
+	models          map[string]*v1alpha1.Model
+	gateways        map[string]*v1alpha1.Gateway
 	schedules       map[string]*v1alpha1.Schedule
 	sessions        map[string][]byte
 	sessionLast     map[string]string
@@ -2209,7 +2209,8 @@ func TestBareContinueDoesNotLeakExplicitRow(t *testing.T) {
 // survives its writing task's deletion (that survival is the point of
 // naming). Default captures keep the M8 lifetime — they die with the task
 // record, as pinned by TestDeleteCapturesSessionBeforeDestroy.
-func TestNamedCaptureOutlivesTask(t *testing.T) {	st := newMemStore()
+func TestNamedCaptureOutlivesTask(t *testing.T) {
+	st := newMemStore()
 	prov := &fakeProv{exits: map[int]int{}, capturable: map[int][]byte{100: []byte("conv-archive")}}
 	named := testTask(0)
 	named.Metadata.Name = "w1"
@@ -2678,5 +2679,178 @@ func TestMetricsAndNilWiring(t *testing.T) {
 	runOnce(ctl)
 	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskRunning {
 		t.Fatalf("nil Events must not disturb reconcile, got %s", task.Status.Phase)
+	}
+}
+
+// At the cluster-wide cap the second task parks Pending with
+// CapacityWaitReason — it must not fail and must not claim a container.
+// It fires one CapacityWait event no matter how many ticks pass, and
+// advances as soon as the admitted task frees its slot.
+func TestQuotaWaitsThenAdvances(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	t2 := testTask(0)
+	t2.Metadata.Name = "t2"
+	var log eventLog
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+	ctl.MaxRunningTasks = 1
+
+	runOnce(ctl) // t1 is the only task yet: admitted regardless of map order
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("t1 = %s, want Running (first task admitted)", task.Status.Phase)
+	}
+	_ = st.UpsertTask(t2)
+	runOnce(ctl)
+	wait := get(t, st, "t2")
+	if wait.Status.Phase != v1alpha1.TaskPending || wait.Status.Reason != CapacityWaitReason {
+		t.Fatalf("t2 = (%s, %q), want (Pending, %q)", wait.Status.Phase, wait.Status.Reason, CapacityWaitReason)
+	}
+	if wait.Status.Container != 0 {
+		t.Fatalf("a parked task must hold no container, got %d", wait.Status.Container)
+	}
+
+	for i := 0; i < 3; i++ {
+		runOnce(ctl)
+	}
+	wait = get(t, st, "t2")
+	if wait.Status.Phase != v1alpha1.TaskPending || wait.Status.Reason != CapacityWaitReason {
+		t.Fatalf("t2 = (%s, %q), want still parked", wait.Status.Phase, wait.Status.Reason)
+	}
+	waits := 0
+	for _, r := range log.reasons() {
+		if r == "CapacityWait" {
+			waits++
+		}
+	}
+	if waits != 1 {
+		t.Fatalf("CapacityWait events = %d, want exactly 1 across all ticks: %v", waits, log.reasons())
+	}
+
+	// The runner finishes; the snapshot still counts t1 live within the
+	// freeing pass (one extra tick of waiting is the safe direction), and
+	// the next tick admits t2.
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl)
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskSucceeded {
+		t.Fatalf("t1 = %s, want Succeeded", task.Status.Phase)
+	}
+	runOnce(ctl)
+	if task := get(t, st, "t2"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("t2 = %s, want Running once a slot freed", task.Status.Phase)
+	}
+}
+
+// The provisioner reporting ErrNoCapacity is a wait, never a provision
+// failure: the task parks, and provisioning resumes when capacity returns.
+// Several parked ticks must not drift the record into Provisioning — the
+// park's already-parked guard reads the snapshot's phase — so the wait
+// fires exactly one CapacityWait event however long it lasts, and the
+// parked record never gains a container or a node.
+func TestQuotaScheduleErrNoCapacityWaits(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{
+		exits:       map[int]int{},
+		scheduleErr: fmt.Errorf("template %q: %w", "tmpl", ErrNoCapacity),
+	}
+	_ = st.UpsertTask(testTask(0))
+	var log eventLog
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+
+	for i := 0; i < 3; i++ {
+		runOnce(ctl)
+	}
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskPending || task.Status.Reason != CapacityWaitReason {
+		t.Fatalf("t1 = (%s, %q), want parked at the per-node cap", task.Status.Phase, task.Status.Reason)
+	}
+	if task.Status.Container != 0 || task.Status.Node != "" {
+		t.Fatalf("parked t1 holds container %d on %q, want none", task.Status.Container, task.Status.Node)
+	}
+	waits := 0
+	for _, r := range log.reasons() {
+		if r == "CapacityWait" {
+			waits++
+		}
+	}
+	if waits != 1 {
+		t.Fatalf("CapacityWait events = %d, want exactly 1 across parked ticks: %v", waits, log.reasons())
+	}
+
+	prov.scheduleErr = nil
+	runOnce(ctl)
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("t1 = %s, want Running once the per-node cap eased", task.Status.Phase)
+	}
+}
+
+// A Suspended task holds no live slot: suspending the admitted task opens
+// room for the parked one on the next tick.
+func TestQuotaSuspendedNotLive(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	t2 := testTask(0)
+	t2.Metadata.Name = "t2"
+	_ = st.UpsertTask(t2)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.MaxRunningTasks = 1
+
+	runOnce(ctl) // t1 admitted: it is the only task yet
+	_ = st.UpsertTask(t2)
+	runOnce(ctl) // t2 parks against t1's live slot
+	if task := get(t, st, "t2"); task.Status.Phase != v1alpha1.TaskPending || task.Status.Reason != CapacityWaitReason {
+		t.Fatalf("t2 = (%s, %q), want parked", task.Status.Phase, task.Status.Reason)
+	}
+
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // Suspending: freezes, defers confirmation to the next tick
+	runOnce(ctl) // confirms frozen -> Suspended
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskSuspended {
+		t.Fatalf("t1 = %s, want Suspended", task.Status.Phase)
+	}
+	runOnce(ctl) // t2 admits: a suspended task is not counted live
+	if task := get(t, st, "t2"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("t2 = %s, want Running once t1 suspended", task.Status.Phase)
+	}
+}
+
+// A parked task holds no container, so deleting it just drops the record:
+// no Destroy call, and the admitted task keeps running untouched.
+func TestQuotaDeleteWaitingTask(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	t2 := testTask(0)
+	t2.Metadata.Name = "t2"
+	_ = st.UpsertTask(t2)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.MaxRunningTasks = 1
+	runOnce(ctl) // t1 admitted: it is the only task yet
+	_ = st.UpsertTask(t2)
+	runOnce(ctl) // t2 parks against t1's live slot
+
+	if err := ctl.RequestDestroy("t2"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+
+	if _, err := st.GetTask("t2"); err == nil {
+		t.Fatal("t2 record still present, want gone")
+	}
+	prov.mu.Lock()
+	n := len(prov.destroyed)
+	prov.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("Destroy called %d times, want 0 for a containerless task", n)
+	}
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("t1 = %s, want untouched Running", task.Status.Phase)
 	}
 }

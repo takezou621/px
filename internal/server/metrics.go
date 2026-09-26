@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/controller"
 	"github.com/kawai/px/internal/store"
 )
 
@@ -106,14 +107,23 @@ func (s *Server) metricsText() (string, error) {
 		return "", err
 	}
 	counts := make(map[v1alpha1.TaskPhase]int, len(taskPhases))
+	waiting := 0
 	for _, t := range tasks {
 		counts[t.Status.Phase]++
+		if t.Status.Phase == v1alpha1.TaskPending && t.Status.Reason == controller.CapacityWaitReason {
+			waiting++
+		}
 	}
 	b.WriteString("# HELP px_tasks Tasks by phase.\n")
 	b.WriteString("# TYPE px_tasks gauge\n")
 	for _, p := range taskPhases {
 		fmt.Fprintf(&b, "px_tasks{phase=%q} %d\n", string(p), counts[p])
 	}
+	// Tasks parked at a quota cap. Nonzero is the runaway-cron alarm:
+	// tasks are queueing, not running.
+	b.WriteString("# HELP px_quota_waiting Tasks parked Pending at a quota cap.\n")
+	b.WriteString("# TYPE px_quota_waiting gauge\n")
+	fmt.Fprintf(&b, "px_quota_waiting %d\n", waiting)
 
 	// Tick timing as a quantile-less summary: rate(_sum)/rate(_count) then
 	// computes mean tick cost per scrape interval, which is all a fixed-

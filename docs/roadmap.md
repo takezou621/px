@@ -2,6 +2,81 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
+## M13 — Quota/limits: resource caps & admission control
+
+Chosen 2026-09-26 after M12 (candidates: quota/limits, capture
+streaming). M12 made tasks self-spawning — a schedule with a bad
+expression and no TTL now clones a container every minute, forever,
+until the cluster runs out of memory or VMIDs. Nothing in px bounds
+how many sandboxes may exist at once; the only stop is a human
+watching `px get tasks`. This milestone adds two blunt caps with an
+admission gate in front of them — the k8s ResourceQuota mental model
+(wait, don't fail) rather than a rate limiter.
+
+Design decisions:
+
+- Two server flags, both defaulting to 0 (= unlimited, opt-in):
+  `-max-running-tasks N` caps concurrently live tasks cluster-wide
+  (phases Provisioning + Running only), and
+  `-max-containers-per-node N` caps the LXC container count on any
+  single node. Zero defaults keep every existing deployment's behavior
+  byte-identical; quotas are for people who turned on cron.
+- The cluster-wide gate sits at the head of `provision` — before any
+  resolve or node work. The count comes from the tick's task snapshot
+  plus the number of provisions already started this tick (a serial
+  reconciler means the snapshot alone would let N+1 newly created
+  tasks in per tick). A blocked task stays `Pending` with
+  `reason: "waiting for capacity"` — never ProvisionFailed, because a
+  full cluster is a temporary condition, not a task failure. The
+  CapacityWait event fires only when the reason is first set, so a
+  task waiting for an hour produces one event, not 1800.
+- The per-node gate lives inside `provisioner.Schedule`, which already
+  reads ClusterResources: count the `lxc` rows per node, drop any node
+  at/over the cap from the candidates. When every candidate is capped —
+  including the single-node mode's fixed node, which now pays one
+  ClusterResources call per provision only when the cap is set —
+  Schedule returns a sentinel `ErrNoCapacity`, and the controller
+  converts it to the same Pending wait instead of failing. Schedule
+  runs before the Provisioning persist, so a parked task never spends
+  a tick as Provisioning on the record: the wait fires one
+  CapacityWait event however long it lasts, and restart recovery can
+  never read the wait as an interrupted provision. A cap also changes
+  two diagnoses: a failed cluster-view read wraps ErrNoCapacity too —
+  a waiting task re-reads the view every tick, so one transient API
+  error must not kill it — and a fixed node whose view lacks the image
+  reports the missing template up front instead of parking on a wait
+  no slot can ever fix. Both apply only when the cap is set; without
+  one, cluster mode keeps the old fatal errors.
+- Suspending a capacity-waiting task is refused (409) by the existing
+  suspend handler — it only marks a Running task, and a task with no
+  container has nothing to freeze. Long waits make Pending a durable
+  state, so the E2E pins that 409; no new guard was needed. Resume
+  deliberately bypasses the cluster-wide cap — suspend is an explicit
+  human act and thawing should never queue behind cron fires, so
+  Resuming → Running may exceed the cap (Suspended tasks are not
+  counted).
+- Not counted: Suspending/Suspended/Resuming (frozen containers keep
+  their RAM but are explicit user state, not what runaway cron makes),
+  and everything terminal. No per-workspace/per-user quotas, no FIFO
+  ordering between waiting tasks (first seen per tick wins), no
+  memory/CPU-based admission — the free-memory scheduling score already
+  covers "where", this milestone only bounds "how many".
+
+Tests: controller (waits at the cap, advances when a slot frees, one
+CapacityWait event across many ticks — the cluster gate and the
+per-node ErrNoCapacity paths both, parked records hold no container or
+node, delete of a waiting task just drops the record, suspend of a
+waiting task is refused, Suspended tasks hold no live slot),
+provisioner (per-node filter in both fixed and cluster modes,
+unlimited defaults unchanged, template refusals survive the cap, a
+failed view read parks under a cap), server (409 on suspending a
+Pending task), metrics (`px_quota_waiting` gauge).
+
+E2E: scripts/e2e-quotas.sh — start with `-max-running-tasks 1`, run
+A to Running, apply B and hold Pending/waiting across several ticks,
+confirm B refuses suspend and emits exactly one CapacityWait, delete
+A, watch B provision through, check `px_quota_waiting` moves 1 → 0.
+
 ## M12 — Scheduled tasks (cron)
 
 Chosen 2026-09-26 after M11 (candidates: scheduled tasks, quota/limits,

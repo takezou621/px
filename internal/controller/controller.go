@@ -98,6 +98,12 @@ type EventRecorder interface {
 	RecordEvent(task string, at time.Time, reason, message string) error
 }
 
+// CapacityWaitReason is the status reason of a task parked at a quota cap
+// (cluster-wide MaxRunningTasks, or the provisioner's per-node cap — both
+// report the same condition: try again next tick). The metrics endpoint
+// counts parked tasks as px_quota_waiting.
+const CapacityWaitReason = "waiting for capacity"
+
 type Controller struct {
 	store interface {
 		TaskReader
@@ -115,6 +121,12 @@ type Controller struct {
 	log  *slog.Logger
 	Tick time.Duration // reconcile interval
 	now  func() time.Time
+
+	// MaxRunningTasks caps concurrently live tasks cluster-wide (phases
+	// Provisioning + Running; 0 = unlimited). At the cap a new task parks
+	// Pending with CapacityWaitReason instead of failing — see
+	// reconcileAll and provision.
+	MaxRunningTasks int
 
 	// Events records lifecycle transitions as they happen (nil disables).
 	// A failed record only logs — an event is an observation, never a gate
@@ -224,14 +236,26 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 		c.log.Error("list tasks", "err", err)
 		return
 	}
+	// Live-task count for the cluster-wide admission gate: the snapshot's
+	// Provisioning+Running, plus every provision this pass has started (the
+	// reconciler is serial, so a plain int carried through the loop is
+	// exact). It may over-count within a pass — a Running task whose runner
+	// exits mid-pass is only reflected next tick — which errs on the safe
+	// side: one extra tick of waiting, never an over-admitted task.
+	live := 0
 	for _, t := range tasks {
-		c.reconcile(ctx, t)
+		if t.Status.Phase == v1alpha1.TaskProvisioning || t.Status.Phase == v1alpha1.TaskRunning {
+			live++
+		}
+	}
+	for _, t := range tasks {
+		c.reconcile(ctx, t, &live)
 	}
 	c.reconcileSchedules(ctx, tasks)
 	c.Metrics.ObserveTick(c.now().Sub(start))
 }
 
-func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
+func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task, live *int) {
 	if t.Status.DeletionTimestamp != nil {
 		c.destroyTask(ctx, t)
 		return
@@ -262,7 +286,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 
 	switch t.Status.Phase {
 	case "", v1alpha1.TaskPending:
-		c.provision(ctx, t)
+		c.provision(ctx, t, live)
 	case v1alpha1.TaskProvisioning:
 		// The reconciler is serial, so a Provisioning task in the store is
 		// always a provision interrupted by a px-server restart.
@@ -514,9 +538,22 @@ func (c *Controller) dropTaskSession(t *v1alpha1.Task) {
 	}
 }
 
-func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
+// provision drives a new task from record to running container. live is the
+// reconciler's in-pass live-task count: the admission gate reads it, and an
+// admitted provision takes its slot in it before any work.
+func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task, live *int) {
 	if ctx.Err() != nil {
 		return
+	}
+	if c.MaxRunningTasks > 0 && *live >= c.MaxRunningTasks {
+		c.parkForCapacity(t)
+		return
+	}
+	// Admitted: take the slot before any resolve or node work, so tasks
+	// later in this same pass see it taken even though the snapshot still
+	// shows this task Pending.
+	if c.MaxRunningTasks > 0 {
+		*live++
 	}
 	mounts, err := c.resolveWorkspaces(t)
 	if err != nil {
@@ -538,17 +575,29 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		c.failProvision(t, err)
 		return
 	}
-	t.Status.Phase = v1alpha1.TaskProvisioning
-	t.Status.Reason = "cloning template and starting container"
-	c.eventf(t.Metadata.Name, "Provisioning", "cloning template and starting container")
-	c.persist(t)
-
+	// Schedule before the Provisioning persist: a task the scheduler parks
+	// stays Pending+CapacityWaitReason on the record, so the park's
+	// already-parked guard holds across ticks (one CapacityWait event
+	// however long the wait lasts) and restart recovery can never read a
+	// parked task as an interrupted provision.
 	node, err := c.prov.Schedule(ctx, t.Spec.Image)
 	if err != nil {
+		// The per-node cap filled between the gate above and this cluster
+		// call — the same temporary condition, answered the same way. This
+		// provision has created nothing (Allocate has not run), so parking
+		// loses no work.
+		if errors.Is(err, ErrNoCapacity) {
+			c.parkForCapacity(t)
+			return
+		}
 		c.failProvision(t, fmt.Errorf("schedule: %w", err))
 		return
 	}
 	t.Status.Node = node
+	t.Status.Phase = v1alpha1.TaskProvisioning
+	t.Status.Reason = "cloning template and starting container"
+	c.eventf(t.Metadata.Name, "Provisioning", "cloning template and starting container")
+	c.persist(t)
 	c.eventf(t.Metadata.Name, "Scheduled", "scheduled to node %s", node)
 
 	vmid, err := c.prov.Allocate(ctx)
@@ -586,6 +635,24 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Reason = ""
 	c.log.Info("task running", "task", t.Metadata.Name, "vmid", vmid)
 	c.eventf(t.Metadata.Name, "Running", "runner started in container %d on %s", vmid, node)
+	c.persist(t)
+}
+
+// parkForCapacity keeps a task waiting at a full quota: Pending +
+// CapacityWaitReason, one CapacityWait event, and no further writes while
+// the wait lasts. Schedule runs before the Provisioning persist, so a
+// parked task never spends a tick as Provisioning on the record — the
+// already-parked guard holds, and restart recovery cannot mistake the
+// wait for an interrupted provision. Waiting to admit (the cluster-wide
+// gate) and waiting to schedule (ErrNoCapacity, or a cluster-view read
+// that failed under a cap) both land here.
+func (c *Controller) parkForCapacity(t *v1alpha1.Task) {
+	if t.Status.Phase == v1alpha1.TaskPending && t.Status.Reason == CapacityWaitReason {
+		return
+	}
+	t.Status.Phase = v1alpha1.TaskPending
+	t.Status.Reason = CapacityWaitReason
+	c.eventf(t.Metadata.Name, "CapacityWait", "waiting for capacity: the cap is full or the cluster view is unreadable")
 	c.persist(t)
 }
 

@@ -338,7 +338,7 @@ func TestCreateRefusesPrivilegedClone(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	pve := proxmox.New(srv.URL, "n1", "root@pam!px=fake", false)
-	p := NewProvisioner(pve, fixedNodePVE(pve), sshexec.NewPool(time.Second, sshexec.Config{}, nil), "")
+	p := NewProvisioner(pve, fixedNodePVE(pve), sshexec.NewPool(time.Second, sshexec.Config{}, nil), "", 0)
 
 	err := p.Create(context.Background(), testProvTask(), "n1", 142, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "privileged") {
@@ -855,6 +855,145 @@ func TestScheduleSingleNodeModeSkipsClusterView(t *testing.T) {
 	node, err := p.Schedule(context.Background(), "tmpl")
 	if err != nil || node != "n1" {
 		t.Fatalf("Schedule = (%q, %v), want (n1, nil)", node, err)
+	}
+}
+
+// A per-node cap drops full nodes from the candidates: third holds the
+// template plus one more guest (2 containers at cap 2), so scheduling must
+// land on forth, which holds only the template.
+func TestSchedulePerNodeCapDropsCappedNodes(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "node", Node: "forth", Status: "online", MaxMem: 8e9, Mem: 4e9},
+		{Type: "node", Node: "second", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "lxc", Node: "third", VMID: 999, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "third", VMID: 950, Name: "t-old"},
+		{Type: "lxc", Node: "forth", VMID: 997, Name: "tmpl", Template: 1},
+	})
+	p.maxPerNode = 2
+	node, err := p.Schedule(context.Background(), "tmpl")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if node != "forth" {
+		t.Fatalf("scheduled %q, want forth (third is at the per-node cap)", node)
+	}
+}
+
+// When the cap empties the candidate set entirely the error wraps
+// ErrNoCapacity — the controller parks the task on it instead of failing
+// the provision, because a task finishing frees a slot.
+func TestSchedulePerNodeCapExhaustedWrapsErrNoCapacity(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "node", Node: "forth", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "lxc", Node: "third", VMID: 999, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "third", VMID: 950, Name: "t-old"},
+		{Type: "lxc", Node: "forth", VMID: 997, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "forth", VMID: 951, Name: "t-older"},
+	})
+	p.maxPerNode = 1
+	_, err := p.Schedule(context.Background(), "tmpl")
+	if !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want errors.Is(ErrNoCapacity)", err)
+	}
+}
+
+// The cap must not swallow the template diagnosis: a cap set but no online
+// node holding the image is still the fatal "no online node holds template"
+// error — waiting would never fix it — not ErrNoCapacity.
+func TestSchedulePerNodeCapKeepsTemplatelessRefusal(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "third", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "node", Node: "down", Status: "offline", MaxMem: 8e9, Mem: 0},
+		{Type: "lxc", Node: "third", VMID: 950, Name: "t-old"},
+		{Type: "lxc", Node: "down", VMID: 900, Name: "tmpl", Template: 1},
+	})
+	p.maxPerNode = 1
+	_, err := p.Schedule(context.Background(), "tmpl")
+	if err == nil || errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want the template refusal, not ErrNoCapacity", err)
+	}
+	if !strings.Contains(err.Error(), "no online node holds template") {
+		t.Fatalf("err = %v, want the diagnosable template error", err)
+	}
+}
+
+// With a cap set, fixed-node mode re-reads the cluster view and counts that
+// node's guests (templates included, other nodes' guests excluded) against
+// it — still wrapping ErrNoCapacity when full.
+func TestScheduleFixedNodeCapCountsGuests(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "n1", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "node", Node: "n2", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "lxc", Node: "n1", VMID: 999, Name: "tmpl", Template: 1},
+		{Type: "lxc", Node: "n1", VMID: 100, Name: "t-one"},
+		{Type: "lxc", Node: "n2", VMID: 200, Name: "t-two"},
+	})
+	p.fixedNode = "n1"
+
+	p.maxPerNode = 2
+	if _, err := p.Schedule(context.Background(), "tmpl"); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want ErrNoCapacity at cap 2 (template + one guest)", err)
+	}
+
+	p.maxPerNode = 3
+	node, err := p.Schedule(context.Background(), "tmpl")
+	if err != nil || node != "n1" {
+		t.Fatalf("Schedule = (%q, %v), want (n1, nil) under cap 3", node, err)
+	}
+}
+
+// A fixed node under a cap must not hide a missing template behind the
+// capacity wait: a typo'd image would otherwise park forever on a wait no
+// slot can ever fix — full or not, the diagnosis comes first.
+func TestScheduleFixedNodeCapRefusesMissingTemplate(t *testing.T) {
+	p := scheduleSrv(t, []proxmox.ClusterResource{
+		{Type: "node", Node: "n1", Status: "online", MaxMem: 8e9, Mem: 0},
+		{Type: "lxc", Node: "n1", VMID: 100, Name: "t-one"},
+	})
+	p.fixedNode = "n1"
+
+	p.maxPerNode = 5
+	_, err := p.Schedule(context.Background(), "typo-tmpl")
+	if err == nil || errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want the template refusal, not ErrNoCapacity", err)
+	}
+	if !strings.Contains(err.Error(), "typo-tmpl") {
+		t.Fatalf("err = %v, want a diagnosable error naming the image", err)
+	}
+
+	// Same refusal with the node also at its cap: the wait would never fix
+	// the image, so it must not swallow the diagnosis.
+	p.maxPerNode = 1
+	_, err = p.Schedule(context.Background(), "typo-tmpl")
+	if err == nil || errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want the template refusal even at a full cap", err)
+	}
+}
+
+// While a task waits at a cap it re-reads the cluster view every tick, so
+// one transient API error must not turn the wait into a provision failure:
+// with a cap set, a failed view read answers ErrNoCapacity — park and
+// retry. With no cap, cluster mode keeps the fatal error: nothing will
+// free a slot, so waiting changes nothing.
+func TestScheduleClusterViewErrorParksUnderCap(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/cluster/resources", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	pve := proxmox.New(srv.URL, "third", "root@pam!px=fake", false)
+
+	p := &provisioner{pve: pve, nodePVE: fixedNodePVE(pve), maxPerNode: 2}
+	if _, err := p.Schedule(context.Background(), "tmpl"); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want ErrNoCapacity under a cap (park and retry)", err)
+	}
+
+	p2 := &provisioner{pve: pve, nodePVE: fixedNodePVE(pve)}
+	if _, err := p2.Schedule(context.Background(), "tmpl"); err == nil || errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("err = %v, want a fatal error with no cap set", err)
 	}
 }
 

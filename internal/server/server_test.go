@@ -1366,3 +1366,71 @@ func TestStoreBytes(t *testing.T) {
 		t.Fatalf("storeBytes = %d ok=%v, want %d", n, ok, want)
 	}
 }
+
+// A task parked at a quota cap is still Pending, so suspending it is a 409 —
+// the existing phase guard already covers the new waiting state, and this
+// pins that a future suspend-handler change doesn't start freezing tasks
+// that hold no container.
+func TestSuspendRefusesCapacityWaitTask(t *testing.T) {
+	ts, st, _, _ := newObsServer(t)
+	tk := &v1alpha1.Task{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   v1alpha1.ObjectMeta{Name: "t1"},
+		Spec:       v1alpha1.TaskSpec{Image: "tmpl", Runner: v1alpha1.RunnerSpec{Command: []string{"true"}}},
+		Status:     v1alpha1.TaskStatus{Phase: v1alpha1.TaskPending, Reason: controller.CapacityWaitReason},
+	}
+	if err := st.UpsertTask(tk); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body, err := request(t, ts, http.MethodPost, "/v1/tasks/t1/suspend")
+	if err != nil || code != http.StatusConflict {
+		t.Fatalf("suspend of a parked task: want 409, got %d %s (%v)", code, body, err)
+	}
+}
+
+// The parked-task count is its own gauge: zero while nothing waits, one per
+// task with the CapacityWaitReason — the runaway-cron alarm.
+func TestMetricsQuotaWaiting(t *testing.T) {
+	ts, st, _, _ := newObsServer(t)
+
+	body := getBody(t, ts, "/v1/metrics")
+	if !strings.Contains(body, "px_quota_waiting 0") {
+		t.Fatalf("idle cluster must report px_quota_waiting 0:\n%s", body)
+	}
+
+	for _, name := range []string{"t1", "t2"} {
+		tk := &v1alpha1.Task{
+			APIVersion: v1alpha1.APIVersion,
+			Kind:       v1alpha1.KindTask,
+			Metadata:   v1alpha1.ObjectMeta{Name: name},
+			Spec:       v1alpha1.TaskSpec{Image: "tmpl", Runner: v1alpha1.RunnerSpec{Command: []string{"true"}}},
+			Status:     v1alpha1.TaskStatus{Phase: v1alpha1.TaskPending, Reason: controller.CapacityWaitReason},
+		}
+		if err := st.UpsertTask(tk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body = getBody(t, ts, "/v1/metrics")
+	if !strings.Contains(body, "px_quota_waiting 2") {
+		t.Fatalf("two parked tasks must read px_quota_waiting 2:\n%s", body)
+	}
+
+	// A plain Pending task (no capacity reason) must not inflate the gauge —
+	// it counts only parked tasks, not every task ever queued.
+	tk := &v1alpha1.Task{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   v1alpha1.ObjectMeta{Name: "t3"},
+		Spec:       v1alpha1.TaskSpec{Image: "tmpl", Runner: v1alpha1.RunnerSpec{Command: []string{"true"}}},
+		Status:     v1alpha1.TaskStatus{Phase: v1alpha1.TaskPending, Reason: "cloning template"},
+	}
+	if err := st.UpsertTask(tk); err != nil {
+		t.Fatal(err)
+	}
+	body = getBody(t, ts, "/v1/metrics")
+	if !strings.Contains(body, "px_quota_waiting 2") {
+		t.Fatalf("a plain Pending task must not count as waiting:\n%s", body)
+	}
+}
