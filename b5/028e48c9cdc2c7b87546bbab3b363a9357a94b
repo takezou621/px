@@ -1,0 +1,66 @@
+internal/apis/v1alpha1/manifest_test.go
+  s_e6a860663c7e72::t_a5cca2b188b7b1 114-155
+template/agent/build.sh
+  s_e6a860663c7e72::t_094034c463d490 1-72
+internal/controller/provisioner.go
+  s_e6a860663c7e72::t_13f892a1a3226c 332
+  s_e6a860663c7e72::t_ca4e39bbc5e7da 412-427
+docs/roadmap.md
+  s_e6a860663c7e72::t_542889d27e905b 24-25
+  s_e6a860663c7e72::t_785965f27779f6 5-23,28-39
+  s_e6a860663c7e72::t_d3bb501a4c068f 26-27
+docs/e2e.md
+  s_e6a860663c7e72::t_580f06f579c358 259-264
+  s_e6a860663c7e72::t_afca1e8d52789e 247-258,265-279
+  s_e6a860663c7e72::t_9ca08c0c197343 38-50
+cmd/px/main_test.go
+  s_e6a860663c7e72::t_f3eb6a60e3a712 1-15,18-28,30-112
+  s_e6a860663c7e72::t_b345ae0eb70d68 16-17
+  s_e6a860663c7e72::t_baf5de961379eb 29
+cmd/px/main.go
+  s_e6a860663c7e72::t_db6101e4419b5e 781-784
+  s_e6a860663c7e72::t_40772deb8e21fd 119-131
+  s_e6a860663c7e72::t_70c2e76e7351ea 38-39
+  s_e6a860663c7e72::t_e7e2871cb45840 9,16
+  s_e6a860663c7e72::t_146f7f0c5cad21 207-209,212-215,217,221-222,242-245,258-285,287
+  s_e6a860663c7e72::t_a357955debd58b 147-148,155-157,163
+  s_e6a860663c7e72::t_668f5766b2c4d1 779-780
+  s_e6a860663c7e72::t_531ec12ddff8ff 206,234-239
+  s_e6a860663c7e72::t_17c9d80fd9b9c5 104-118,132-146,149-154,158-162,164-205,210-211,216,218-220,223-233,240-241,246-257,286,288-289
+docs/threat-model.md
+  s_e6a860663c7e72::t_9acb3825580493 208-213
+  s_e6a860663c7e72::t_ad930c29eeaeba 87-114
+scripts/e2e-agent.sh
+  s_e6a860663c7e72::t_dadeea214e7bb4 80-81
+  s_e6a860663c7e72::t_1fa1ab9f4e6bb6 1-18,23-79,82-99,103-111,116-124,138-174,180-208
+  s_e6a860663c7e72::t_cf3760cfbc6ec8 112-115,125-137
+  s_e6a860663c7e72::t_9f478b955c6334 175-179
+  s_e6a860663c7e72::t_49affacd9faff9 100-102
+  s_e6a860663c7e72::t_93ae21c5811f37 19-22
+internal/apis/v1alpha1/types.go
+  s_e6a860663c7e72::t_89b337e836145b 204
+  s_e6a860663c7e72::t_5309ee979da5d7 31-35
+internal/apis/v1alpha1/manifest.go
+  s_e6a860663c7e72::t_16f16c429d61d0 91,114
+internal/controller/provisioner_test.go
+  s_e6a860663c7e72::t_1dd0bbf1e6df11 440-461
+README.md
+  s_e6a860663c7e72::t_b6669b7b249fec 94-111
+  s_e6a860663c7e72::t_108b6ef815a77c 38-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b5028e48c9cdc2c7b87546bbab3b363a9357a94b",
+  "prompts": {},
+  "sessions": {
+    "s_e6a860663c7e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09127d2b-fdd9-4f3b-aa47-c9cb9d1842bd",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
