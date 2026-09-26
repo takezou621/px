@@ -12,6 +12,14 @@ Unit tests run without PVE; this is the manual path that closes M1.
 - SSH from the px-server host to the PVE node as root (`root@pam`),
   either with a key file or a loaded agent. px uses SSH + `pct exec`
   for the runner boot step.
+- Port exposure (`spec.ports`) publishes containers on the node via
+  socat listeners on TCP 30000–32767. A node with pve-firewall enabled
+  (a `/etc/pve/firewall/cluster.fw` with `enable: 1`) drops that range
+  from outside by default — only SSH/API have implicit allows — so add
+  one rule to `cluster.fw` (datacenter → Firewall → Rules in the UI):
+  `IN ACCEPT -p tcp -dport 30000:32767`. Without it, the E2E port test
+  fails its reachability checks from off-node while everything
+  server-side looks healthy.
 - The `px` and `px-server` binaries. Build each package separately —
   `go build` with multiple packages compiles them but writes no
   binaries:
@@ -278,6 +286,34 @@ the loop, e.g.:
 ```sh
 ./px run -model <model> -workspace <name> "<goal>"
 ```
+
+## 3h. Port exposure test
+
+With the same server running (and the cluster.fw allow for
+30000–32767 from the Prerequisites in place, if pve-firewall is
+enabled on the node):
+
+```sh
+./scripts/e2e-ports.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks); NODE_HOST (default: the
+#      host part of PVE_SSH — the address the published ports are dialed
+#      on; the socat listeners bind every node interface, so any LAN
+#      address of the node works)
+```
+
+It exercises: an auto-assigned hostPort (in the 30000–32767 range) and
+an explicit one both serve the container's HTTP server through the
+node (`python3 -m http.server` in the runner), a second apply claiming
+the same explicit hostPort is refused with a conflict before any
+container is created, a live download survives several reconcile
+ticks (socat forks a child per connection — the controller must not
+read that as drift and kill the forward mid-transfer; this is the
+regression tripwire for exactly that bug), a forward killed on the
+node is rebuilt by the next tick, deleting a task removes its socat
+listener from the node (and the port refuses connections afterwards),
+and a task refused at apply was never created. Cleanup deletes all
+tasks and verifies no px-range listeners remain on the node.
 
 ## 4. Restart-recovery check (manual)
 

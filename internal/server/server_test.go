@@ -44,6 +44,10 @@ func (nopProv) Owned(_ context.Context, _, _ string, _ int) (bool, error)       
 func (nopProv) Frozen(_ context.Context, _ string, _ int) (bool, error)         { return false, nil }
 func (nopProv) Freeze(_ context.Context, _ string, _ int) error                 { return nil }
 func (nopProv) Thaw(_ context.Context, _ string, _ int) error                   { return nil }
+func (nopProv) EnsurePorts(_ context.Context, _ string, _ int, _ []controller.PortForward) (controller.PortForwardResult, error) {
+	return controller.PortForwardResult{}, nil
+}
+func (nopProv) RemovePorts(_ context.Context, _ string, _ []int) error { return nil }
 
 const manifest = `
 apiVersion: px.io/v1alpha1
@@ -141,6 +145,62 @@ func TestApplyDuplicate(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Fatalf("apply %d: want %d, got %d: %s", i, want, resp.StatusCode, body)
 		}
+	}
+}
+
+// Explicit spec.ports hostPorts are claimed across tasks: a second apply
+// pointing at a claimed port is refused at the API (409), not left for the
+// controller to thrash over. hostPort 0 (auto) never collides here.
+func TestApplyHostPortConflict(t *testing.T) {
+	srv, _ := newTestServer(t)
+	mk := func(name string, hostPort int) string {
+		port := fmt.Sprintf("  ports:\n    - name: http\n      port: 8080\n")
+		if hostPort != 0 {
+			port += fmt.Sprintf("      hostPort: %d\n", hostPort)
+		}
+		return fmt.Sprintf(`
+apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: %s
+spec:
+  image: px-runner-debian12
+  runner:
+    command: ["true"]
+%s
+`, name, port)
+	}
+
+	resp, err := http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(mk("a", 31234)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first apply: want 201, got %d: %s", resp.StatusCode, body)
+	}
+
+	resp, err = http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(mk("b", 31234)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("conflicting apply: want 409, got %d: %s", resp.StatusCode, body)
+	}
+
+	// Auto-assign (hostPort 0) passes the API check; the controller picks
+	// a free port when the task goes Running.
+	resp, err = http.Post(srv.URL+"/v1/apply", "application/yaml", strings.NewReader(mk("b", 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("auto-assign apply: want 201, got %d: %s", resp.StatusCode, body)
 	}
 }
 

@@ -42,7 +42,14 @@ type fakeProv struct {
 	model       *ResolvedModel      // model passed to the last Create
 	gw          *ResolvedGateway    // gateway passed to the last Create
 	destroyed   []int
-	hostnames   map[int]string // vmid -> hostname; empty or missing = owned
+	hostnames   map[int]string            // vmid -> hostname; empty or missing = owned
+	forwards    map[int]PortForward       // hostPort -> forward currently "running" on the node
+	ensureErr   error                     // returned by EnsurePorts
+	removeErr   error                     // returned by RemovePorts
+	ensureFails map[int]bool              // hostPorts EnsurePorts reports as failed
+	ctipOf      map[int]string            // vmid -> CTIP EnsurePorts reports (default link-local)
+	removeCalls int                       // number of RemovePorts invocations, success or not
+	removed     []int                     // hostPorts passed to RemovePorts, in call order
 }
 
 func (f *fakeProv) Allocate(_ context.Context) (int, error) {
@@ -159,6 +166,44 @@ func (f *fakeProv) Destroy(_ context.Context, _ string, vmid int) error {
 		return f.destroyErr
 	}
 	f.destroyed = append(f.destroyed, vmid)
+	return nil
+}
+
+func (f *fakeProv) EnsurePorts(_ context.Context, _ string, vmid int, fwds []PortForward) (PortForwardResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ensureErr != nil {
+		return PortForwardResult{}, f.ensureErr
+	}
+	ctip := f.ctipOf[vmid]
+	if ctip == "" {
+		ctip = "192.0.2.10"
+	}
+	res := PortForwardResult{CTIP: ctip}
+	if f.forwards == nil {
+		f.forwards = map[int]PortForward{}
+	}
+	for _, fwd := range fwds {
+		if f.ensureFails[fwd.HostPort] {
+			res.Failed = append(res.Failed, fwd.HostPort)
+			continue
+		}
+		f.forwards[fwd.HostPort] = fwd
+	}
+	return res, nil
+}
+
+func (f *fakeProv) RemovePorts(_ context.Context, _ string, hostPorts []int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeCalls++
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	for _, hp := range hostPorts {
+		f.removed = append(f.removed, hp)
+		delete(f.forwards, hp)
+	}
 	return nil
 }
 
@@ -305,6 +350,8 @@ func copyTask(t *v1alpha1.Task) *v1alpha1.Task {
 	cp := *t
 	cp.Spec.Workspaces = append([]v1alpha1.TaskWorkspace(nil), t.Spec.Workspaces...)
 	cp.Spec.Runner.Command = append([]string(nil), t.Spec.Runner.Command...)
+	cp.Spec.Ports = append([]v1alpha1.PortSpec(nil), t.Spec.Ports...)
+	cp.Status.Ports = append([]v1alpha1.PortStatus(nil), t.Status.Ports...)
 	if t.Status.StartedAt != nil {
 		v := *t.Status.StartedAt
 		cp.Status.StartedAt = &v
@@ -1381,7 +1428,6 @@ func TestSuspendPhaseFailsOnDeadContainer(t *testing.T) {
 		})
 	}
 }
-
 // A Frozen-probe failure with the container still alive is a transient error
 // (SSH blip): the suspend phase must hold, not fail the task.
 func TestSuspendPhaseSurvivesProbeErrorWithLiveContainer(t *testing.T) {
@@ -1503,5 +1549,331 @@ func TestRepairNodeGuestGone(t *testing.T) {
 	}
 	if task.Status.EndedAt == nil {
 		t.Fatal("EndedAt should be set")
+	}
+}
+
+// portedTask is a task with one spec.ports entry.
+func portedTask(name string, port, hostPort int) *v1alpha1.Task {
+	t := testTask(0)
+	t.Metadata.Name = name
+	t.Spec.Ports = []v1alpha1.PortSpec{{Name: "http", Port: port, HostPort: hostPort}}
+	return t
+}
+
+// A Running task with an auto-assigned port gets its mapping resolved to the
+// px range floor, persisted in status, and a node-side forward on the fake.
+func TestPortsPublishedOnRunning(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl) // -> Running
+	// Provision promotes Pending to Running in one tick; the port mapping
+	// converges on the *next* running tick. Publishing early would persist
+	// a record the node does not honor yet.
+	task := get(t, st, "t1")
+	if task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s", task.Status.Phase)
+	}
+	if len(task.Status.Ports) != 0 || len(prov.forwards) != 0 {
+		t.Fatalf("first tick must not publish ports yet, got status %v forwards %v",
+			task.Status.Ports, prov.forwards)
+	}
+
+	runOnce(ctl) // port convergence happens on the running tick
+	task = get(t, st, "t1")
+	want := []v1alpha1.PortStatus{{Name: "http", Port: 8000, HostPort: v1alpha1.HostPortMin}}
+	if len(task.Status.Ports) != 1 || task.Status.Ports[0] != want[0] {
+		t.Fatalf("want status ports %v, got %v", want, task.Status.Ports)
+	}
+	if fwd, ok := prov.forwards[v1alpha1.HostPortMin]; !ok || fwd.Port != 8000 {
+		t.Fatalf("want forward %d->8000 on the node, got %v", v1alpha1.HostPortMin, prov.forwards)
+	}
+}
+
+// An explicit hostPort is honored verbatim — allocation never rewrites it.
+func TestExplicitHostPortPassthrough(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 31234))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	runOnce(ctl)
+	task := get(t, st, "t1")
+	if task.Status.Ports[0].HostPort != 31234 {
+		t.Fatalf("want explicit hostPort 31234, got %d", task.Status.Ports[0].HostPort)
+	}
+	if _, ok := prov.forwards[31234]; !ok {
+		t.Fatalf("want forward on 31234, got %v", prov.forwards)
+	}
+}
+
+// Auto-allocation skips hostPorts other tasks claim — an explicit spec entry
+// on another task, even while that task is merely Pending.
+func TestAutoAllocationAvoidsClaimedPorts(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("claimer", 9999, v1alpha1.HostPortMin))
+	_ = st.UpsertTask(portedTask("t1", 8000, 0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	runOnce(ctl)
+	task := get(t, st, "t1")
+	if task.Status.Ports[0].HostPort != v1alpha1.HostPortMin+1 {
+		t.Fatalf("want auto port %d (skipping the claimed floor), got %d",
+			v1alpha1.HostPortMin+1, task.Status.Ports[0].HostPort)
+	}
+}
+
+// An explicit entry later in the same spec also blocks the allocator: two
+// entries of one task must never resolve to the same hostPort, or their
+// socats could not coexist on the node.
+func TestAutoAllocationAvoidsOwnExplicitPorts(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := portedTask("t1", 8000, 0)
+	task.Spec.Ports = append(task.Spec.Ports,
+		v1alpha1.PortSpec{Name: "https", Port: 8443, HostPort: v1alpha1.HostPortMin})
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	runOnce(ctl)
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Ports[0].HostPort != v1alpha1.HostPortMin+1 {
+		t.Fatalf("want auto port %d (skipping the same-spec explicit %d), got %d",
+			v1alpha1.HostPortMin+1, v1alpha1.HostPortMin, task.Status.Ports[0].HostPort)
+	}
+	if task.Status.Ports[1].HostPort != v1alpha1.HostPortMin {
+		t.Fatalf("want explicit port kept at %d, got %d",
+			v1alpha1.HostPortMin, task.Status.Ports[1].HostPort)
+	}
+}
+
+// The spec is the source of truth: a change in spec.ports is re-converged,
+// and status entries never outlive their spec entries.
+func TestPortsReconvergeOnSpecChange(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 30001))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl)
+	runOnce(ctl) // -> Running, forward on 30001
+
+	cur := st.tasks["t1"]
+	cur.Spec.Ports = []v1alpha1.PortSpec{{Name: "http", Port: 9000, HostPort: 30001}}
+
+	runOnce(ctl)
+	task := get(t, st, "t1")
+	if task.Status.Ports[0].Port != 9000 {
+		t.Fatalf("want spec change converged to port 9000, got %d", task.Status.Ports[0].Port)
+	}
+	if fwd, ok := prov.forwards[30001]; !ok || fwd.Port != 9000 {
+		t.Fatalf("want forward 30001->9000, got %v", prov.forwards)
+	}
+}
+
+// Shrinking spec.ports sweeps the removed mapping's node-side listener in
+// the same pass — an entry dropped from the spec must not keep its socat.
+func TestPortsSweptOnSpecShrink(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	task := portedTask("t1", 8000, 30001)
+	task.Spec.Ports = append(task.Spec.Ports, v1alpha1.PortSpec{Name: "https", Port: 8443, HostPort: 30002})
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl)
+	runOnce(ctl) // -> Running, forwards on 30001+30002
+
+	cur := st.tasks["t1"]
+	cur.Spec.Ports = []v1alpha1.PortSpec{{Name: "http", Port: 8000, HostPort: 30001}}
+
+	runOnce(ctl)
+	if fwd, ok := prov.forwards[30002]; ok {
+		t.Fatalf("dropped entry's forward must be removed, got %v", fwd)
+	}
+	task = get(t, st, "t1")
+	if len(task.Status.Ports) != 1 || task.Status.Ports[0].HostPort != 30001 {
+		t.Fatalf("want only the kept entry in status, got %v", task.Status.Ports)
+	}
+}
+
+// Emptying spec.ports while Running tears the forwards down, same as any
+// other path that leaves the record holding ports the spec no longer names.
+func TestPortsTornDownWhenSpecEmptied(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 30001))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl)
+	runOnce(ctl) // -> Running, forward on 30001
+
+	cur := st.tasks["t1"]
+	cur.Spec.Ports = nil
+
+	runOnce(ctl)
+	if len(prov.forwards) != 0 {
+		t.Fatalf("emptied spec must tear forwards down, got %v", prov.forwards)
+	}
+	task := get(t, st, "t1")
+	if len(task.Status.Ports) != 0 {
+		t.Fatalf("status ports must clear, got %v", task.Status.Ports)
+	}
+}
+
+// Finishing a task tears its forwards down and clears status.ports.
+func TestPortsTornDownWhenFinished(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running, forward on 30000
+	runOnce(ctl) // port convergence
+
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded
+	runOnce(ctl) // the teardown hook runs on the pass after the finish
+
+	if len(prov.forwards) != 0 {
+		t.Fatalf("forwards must be removed once the task finishes, got %v", prov.forwards)
+	}
+	task := get(t, st, "t1")
+	if len(task.Status.Ports) != 0 {
+		t.Fatalf("status ports must clear after teardown, got %v", task.Status.Ports)
+	}
+}
+
+// Suspend is not Running: the forwards close while the container is frozen
+// and nothing re-ensures them in the suspended watch.
+func TestPortsCloseWhileSuspended(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(portedTask("t1", 8000, 0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running, forward on 30000
+	runOnce(ctl) // port convergence
+	if len(prov.forwards) != 1 {
+		t.Fatalf("precondition: want a live forward, got %v", prov.forwards)
+	}
+
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // freeze
+	runOnce(ctl) // confirm -> Suspended
+
+	if len(prov.forwards) != 0 {
+		t.Fatalf("suspended container must not keep forwards, got %v", prov.forwards)
+	}
+	task := get(t, st, "t1")
+	if len(task.Status.Ports) != 0 {
+		t.Fatalf("status ports must clear on suspend, got %v", task.Status.Ports)
+	}
+}
+
+// Delete removes the forwards before destroying the container, and a failed
+// RemovePorts blocks both: destroying first would orphan a node-side socat
+// that nothing remembers anymore.
+func TestDeleteGatesOnPortsTeardown(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, removeErr: errors.New("node unreachable")}
+	_ = st.UpsertTask(portedTask("t1", 8000, 0))
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	runOnce(ctl) // port convergence
+
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; !ok {
+		t.Fatal("record must survive while the forwards cannot be removed")
+	}
+	if len(prov.destroyed) != 0 {
+		t.Fatalf("destroy must wait for the ports teardown, got %v", prov.destroyed)
+	}
+	// The reconcile loop's own teardown attempt already failed this tick;
+	// the delete path below it must not dial the unreachable node again
+	// through its duplicate gate.
+	if n := prov.removeCalls; n != 1 {
+		t.Fatalf("failed tick must attempt the teardown once, got %d", n)
+	}
+
+	prov.mu.Lock()
+	prov.removeErr = nil
+	prov.mu.Unlock()
+	runOnce(ctl)
+	if _, ok := st.tasks["t1"]; ok {
+		t.Fatal("record should be deleted once the forwards are gone")
+	}
+	if len(prov.destroyed) != 1 || prov.destroyed[0] != 100 {
+		t.Fatalf("want destroy [100] after teardown, got %v", prov.destroyed)
+	}
+	if n, want := prov.removeCalls, 2; n != want {
+		t.Fatalf("want %d RemovePorts calls in total (failed + successful), got %d", want, n)
+	}
+	if len(prov.removed) != 1 || prov.removed[0] != 30000 {
+		t.Fatalf("want removed [30000], got %v", prov.removed)
+	}
+}
+
+// TTL cleanup has the same gate: a finished task with unremovable forwards
+// keeps its container and its port list until the node answers again.
+func TestTTLCleanupGatesOnPortsTeardown(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, removeErr: errors.New("node unreachable")}
+	task := portedTask("t1", 8000, 0)
+	task.Spec.TTLSecondsAfterFinished = 60
+	_ = st.UpsertTask(task)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	runOnce(ctl) // port convergence
+
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded; teardown already failed once, list kept
+
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Container == 0 {
+		t.Fatal("TTL cleanup must not run while the forwards cannot be removed")
+	}
+	if len(task.Status.Ports) == 0 {
+		t.Fatal("port list must survive to drive the retry")
+	}
+
+	prov.mu.Lock()
+	prov.removeErr = nil
+	prov.mu.Unlock()
+	runOnce(ctl)
+	task = get(t, st, "t1")
+	if task.Status.Container != 0 {
+		t.Fatalf("want container cleaned after teardown succeeded, got %d", task.Status.Container)
+	}
+	if len(prov.forwards) != 0 {
+		t.Fatalf("forwards must be gone, got %v", prov.forwards)
+	}
+}
+
+// The allocator never hands two auto-assigned entries of the same task the
+// same port, and skips whatever the rest of the cluster claims.
+func TestAllocateHostPortSkipsTaken(t *testing.T) {
+	claimed := map[int]string{v1alpha1.HostPortMin: "other"}
+	var fwds []PortForward
+	first := allocateHostPort(claimed, fwds)
+	if first != v1alpha1.HostPortMin+1 {
+		t.Fatalf("want %d, got %d", v1alpha1.HostPortMin+1, first)
+	}
+	fwds = append(fwds, PortForward{HostPort: first})
+	second := allocateHostPort(claimed, fwds)
+	if second != v1alpha1.HostPortMin+2 {
+		t.Fatalf("want %d, got %d", v1alpha1.HostPortMin+2, second)
 	}
 }

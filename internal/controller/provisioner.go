@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +103,37 @@ type Provisioner interface {
 	Freeze(ctx context.Context, node string, vmid int) error
 	// Thaw lifts a Freeze (echo 0).
 	Thaw(ctx context.Context, node string, vmid int) error
+	// EnsurePorts converges the node's published-port state to forwards:
+	// for each rule a socat must listen on HostPort and proxy exactly to
+	// the container's Port — a listener that is missing or drifted (wrong
+	// destination) is killed and started fresh. The container's address is
+	// resolved inside, so a DHCP change re-programs the forward on the
+	// next call. No node-side process is started for an empty forwards
+	// list. The result reports the resolved container address and any
+	// forwards that failed to start (foreign listener on the port, bad
+	// arguments) — those retry on the caller's next tick.
+	EnsurePorts(ctx context.Context, node string, vmid int, forwards []PortForward) (PortForwardResult, error)
+	// RemovePorts kills the socat forwards listening on the given host
+	// ports and verifies each is gone (SIGTERM, a short grace, SIGKILL).
+	// Idempotent: a port with no listener reports success.
+	RemovePorts(ctx context.Context, node string, hostPorts []int) error
+}
+
+// PortForward is one desired node-side forwarding rule: the node listens
+// on HostPort and proxies plain TCP to the container's Port. The container
+// address is deliberately not part of the rule — it is resolved per
+// convergence pass, so DHCP re-addressing self-heals.
+type PortForward struct {
+	HostPort int
+	Port     int
+}
+
+// PortForwardResult reports what one EnsurePorts pass found.
+type PortForwardResult struct {
+	// CTIP is the container's resolved IPv4 address.
+	CTIP string
+	// Failed lists host ports whose socat could not be (re)started.
+	Failed []int
 }
 
 type provisioner struct {
@@ -286,6 +318,150 @@ grep -qx 'frozen 1' "/sys/fs/cgroup$p/cgroup.events" && echo PX_FROZEN=1 || echo
 	default:
 		return false, fmt.Errorf("freeze probe: unexpected output %q", strings.TrimSpace(out))
 	}
+}
+
+// portOpTimeout bounds one node-side port convergence: one SSH round trip
+// carrying a pct exec for the container address plus a handful of socat
+// forks and short verification sleeps — no container work beyond the
+// address probe.
+const portOpTimeout = 30 * time.Second
+
+// socatListenSig is the pgrep/pkill pattern that identifies exactly one
+// forward: a process whose argv[0] is socat listening on hostPort. The
+// caret anchors on the process name (the node-side script's own shell also
+// carries the pattern text in its argv and must not match), and the comma
+// keeps port 3123 from matching a 31234 listener.
+func socatListenSig(hostPort int) string {
+	return fmt.Sprintf(`^socat .*TCP-LISTEN:%d,`, hostPort)
+}
+
+// socatCmd renders the exact command line a forward runs under — the
+// string EnsurePorts starts and matches back. Drift is any listener on
+// the port whose command line differs from this.
+func socatCmd(hostPort, port int, ctIP string) string {
+	return fmt.Sprintf("socat TCP-LISTEN:%d,fork,reuseaddr TCP:%s:%d", hostPort, ctIP, port)
+}
+
+func (p *provisioner) EnsurePorts(ctx context.Context, node string, vmid int, forwards []PortForward) (PortForwardResult, error) {
+	res := PortForwardResult{}
+	if len(forwards) == 0 {
+		return res, nil
+	}
+	var b strings.Builder
+	// One SSH round trip resolves the container address and converges
+	// every forward. The script is POSIX sh; every embedded value is an
+	// int or a shell-generated variable, so nothing user-controlled is
+	// interpolated raw.
+	fmt.Fprintf(&b, `ctip=$(pct exec %d -- sh -c 'ip -4 -o addr show dev eth0' 2>/dev/null | awk '$3=="inet"{split($4,a,"/");print a[1];exit}')
+if [ -z "$ctip" ]; then echo PX_ERR_NOIP; exit 0; fi
+echo "PX_IP $ctip"
+`, vmid)
+	for _, f := range forwards {
+		// The match must tolerate fork children: socat forks one per
+		// active connection, each carrying the parent's command line, so
+		// "exactly one process" would kill every live forward on every
+		// tick. Matching any single exact cmdline is equivalent to the
+		// parent being healthy — children inherit it verbatim, and a
+		// drifted parent never produces a matching child.
+		fmt.Fprintf(&b, `sig=%s
+want=%s
+hit=0
+while IFS= read -r line; do
+  if [ "${line#* }" = "$want" ]; then hit=1; fi
+done <<PXEOF
+$(pgrep -af "$sig" 2>/dev/null)
+PXEOF
+if [ "$hit" = 1 ]; then
+  echo "PX_FWD %d ok"
+else
+  pkill -f "$sig" 2>/dev/null
+  nohup socat "TCP-LISTEN:%d,fork,reuseaddr" "TCP:$ctip:%d" >/dev/null 2>&1 </dev/null &
+  spid=$!
+  sleep 0.3
+  if kill -0 "$spid" 2>/dev/null; then echo "PX_FWD %d started"; else echo "PX_FWD %d failed"; fi
+fi
+`,
+			shellQuote(socatListenSig(f.HostPort)),
+			// want is compared against the live cmdline, so the address
+			// part must expand in the shell — hence double quotes here.
+			`"`+socatCmd(f.HostPort, f.Port, `$ctip`)+`"`,
+			f.HostPort, f.HostPort, f.Port, f.HostPort, f.HostPort)
+	}
+	out, code, err := p.nodeSSH(ctx, node, b.String(), portOpTimeout)
+	if err != nil {
+		return res, fmt.Errorf("ensure ports on node %s: %w", node, err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "PX_IP "):
+			res.CTIP = strings.TrimPrefix(line, "PX_IP ")
+		case strings.HasPrefix(line, "PX_FWD "):
+			f := strings.Fields(line)
+			if len(f) == 3 && f[2] == "failed" {
+				if port, perr := strconv.Atoi(f[1]); perr == nil {
+					res.Failed = append(res.Failed, port)
+				}
+			}
+		case line == "PX_ERR_NOIP":
+			return res, fmt.Errorf("ct %d has no IPv4 address on eth0 yet", vmid)
+		}
+	}
+	if code != 0 {
+		return res, fmt.Errorf("ensure ports on node %s: exit=%d out=%q", node, code, strings.TrimSpace(out))
+	}
+	if res.CTIP == "" {
+		return res, fmt.Errorf("node %s did not report the container address", node)
+	}
+	if net.ParseIP(res.CTIP) == nil {
+		return res, fmt.Errorf("node %s reported a malformed container address %q", node, res.CTIP)
+	}
+	return res, nil
+}
+
+func (p *provisioner) RemovePorts(ctx context.Context, node string, hostPorts []int) error {
+	if len(hostPorts) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	for _, hp := range hostPorts {
+		fmt.Fprintf(&b, `sig=%s
+if pgrep -f "$sig" >/dev/null 2>&1; then
+  pkill -f "$sig" 2>/dev/null
+  i=0
+  while [ $i -lt 10 ] && pgrep -f "$sig" >/dev/null 2>&1; do
+    sleep 0.2
+    i=$((i+1))
+  done
+  if pgrep -f "$sig" >/dev/null 2>&1; then
+    pkill -9 -f "$sig" 2>/dev/null
+    sleep 0.2
+    if pgrep -f "$sig" >/dev/null 2>&1; then echo "PX_KILL %d stuck"; else echo "PX_KILL %d gone"; fi
+  else
+    echo "PX_KILL %d gone"
+  fi
+else
+  echo "PX_KILL %d absent"
+fi
+`, shellQuote(socatListenSig(hp)), hp, hp, hp, hp)
+	}
+	out, code, err := p.nodeSSH(ctx, node, b.String(), portOpTimeout)
+	if err != nil {
+		return fmt.Errorf("remove ports on node %s: %w", node, err)
+	}
+	var stuck []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), "stuck") {
+			stuck = append(stuck, strings.TrimSpace(line))
+		}
+	}
+	if len(stuck) > 0 {
+		return fmt.Errorf("port forwards on node %s survived SIGKILL: %s", node, strings.Join(stuck, ", "))
+	}
+	if code != 0 {
+		return fmt.Errorf("remove ports on node %s: exit=%d out=%q", node, code, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 // ResolvedWorkspace is a task workspace reference resolved against the

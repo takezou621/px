@@ -130,6 +130,9 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 				return nil, fmt.Errorf("task %q: spec.gateway: %w", m.Metadata.Name, err)
 			}
 		}
+		if err := ValidatePorts(s.Ports); err != nil {
+			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
+		}
 		m.Task = s
 	case KindWorkspace:
 		s := &WorkspaceSpec{}

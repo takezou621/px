@@ -150,6 +150,47 @@ attempted; the small residual window stays, and closing it would
 require blocking deletes on in-flight execs for no attacker that the
 token does not already cover.
 
+## Port exposure
+
+`spec.ports` is **opt-in inbound attack surface**, the mirror image of the
+egress section above: a Gateway bounds what a task can reach out to, and
+ports decide who can reach *in*. The node listens on the published
+hostPort with `socat` and forwards to the container — the listener binds
+**every node interface, not loopback**, so on a flat lab LAN anyone on
+the segment reaches the task's service. That is the feature; treat every
+published port as public to the network the node sits on. A task behind
+a default-deny Gateway can still be published to — egress filtering and
+inbound publishing are independent axes, and the inbound path arrives
+over an interface the task never dials out on.
+
+The bounds that keep it contained:
+
+- **hostPorts live in 30000–32767** (the NodePort convention), explicit
+  or auto-assigned. Explicit ports outside the range are rejected at
+  apply; the range keeps forwards clear of node services (sshd, the PVE
+  API) below it, and apply-time conflict checks plus the controller's
+  allocator stop two tasks from claiming the same port.
+- **Forwards exist only while the task is Running.** The controller
+  re-establishes them every tick (a leaked socat from a crash is torn
+  down or rebuilt by the next reconcile) and removes them the moment the
+  phase leaves Running; a delete or TTL cleanup is gated on the removal,
+  so a finished task cannot outlive its forwards. Publishing also
+  requires a Running container, same gate as exec. A corollary: suspend
+  closes a task's forwards, and on resume an auto-assigned hostPort may
+  come back as a **different** port — only explicit hostPorts survive
+  suspend/resume verbatim, so clients must treat the assignment as
+  owned by the controller, re-read after any phase transition.
+- **The forward is a pipe, not an authentication layer.** Whatever
+  connects to the hostPort lands in the container's service with no px
+  token or identity attached — the service itself owns access control.
+  Do not publish a port that trusts its client.
+
+Placement note: the forward is socat rather than an iptables DNAT rule
+because lab LANs are one L2 segment (node and clients on the same
+bridge) — DNAT there sends replies out an asymmetric path that upstream
+stateful filtering drops; a userspace proxy keeps the connection
+stateful and the return path symmetric.
+
 ## Node SSH
 
 px-server holds **root SSH access to the PVE node** — the largest

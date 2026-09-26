@@ -144,6 +144,13 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 			}
 			results = append(results, fmt.Sprintf("gateway.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
+			// An explicit hostPort must not collide with a port another
+			// task already claims (by spec or by assigned status) —
+			// checked inside this transaction, before the insert, so two
+			// racing applies cannot both pass.
+			if err := checkHostPortConflicts(st, m.Metadata.Name, m.Task.Ports); err != nil {
+				return nil, err
+			}
 			t := &v1alpha1.Task{
 				APIVersion: v1alpha1.APIVersion,
 				Kind:       v1alpha1.KindTask,
@@ -162,6 +169,31 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 		}
 	}
 	return results, nil
+}
+
+// checkHostPortConflicts rejects a task whose explicit spec.ports hostPorts
+// overlap ports claimed by other tasks. Auto-assigned entries (hostPort 0)
+// pass here by construction; the controller's allocator avoids claimed
+// ports when it resolves them.
+func checkHostPortConflicts(st *store.Store, name string, ports []v1alpha1.PortSpec) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	tasks, err := st.ListTasks()
+	if err != nil {
+		return fmt.Errorf("list tasks: %w", err)
+	}
+	claimed := v1alpha1.ClaimedHostPorts(tasks, name)
+	for _, p := range ports {
+		if p.HostPort == 0 {
+			continue
+		}
+		if owner, ok := claimed[p.HostPort]; ok {
+			return &applyConflictError{msg: fmt.Sprintf(
+				"task %q: hostPort %d already claimed by task %q", name, p.HostPort, owner)}
+		}
+	}
+	return nil
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, _ *http.Request) {

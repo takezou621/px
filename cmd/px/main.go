@@ -303,14 +303,22 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 		if err := doJSON(http.MethodGet, "/v1/tasks", nil, &tasks); err != nil {
 			return err
 		}
-		fmt.Printf("%-24s %-16s %-12s %-8s %s\n", "NAME", "PHASE", "NODE", "CT", "AGE")
+		fmt.Printf("%-24s %-16s %-12s %-8s %s\n", "NAME", "PHASE", "NODE", "CT", "AGE PORTS")
 		for _, t := range tasks {
 			node := t.Status.Node
 			if node == "" {
 				node = "-"
 			}
-			fmt.Printf("%-24s %-16s %-12s %-8d %s\n",
-				t.Metadata.Name, t.Status.Phase, node, t.Status.Container, age(t.Status.StartedAt))
+			ports := "-"
+			if len(t.Status.Ports) > 0 {
+				var parts []string
+				for _, p := range t.Status.Ports {
+					parts = append(parts, fmt.Sprintf("%s:%d->%d", p.Name, p.HostPort, p.Port))
+				}
+				ports = strings.Join(parts, ",")
+			}
+			fmt.Printf("%-24s %-16s %-12s %-8d %s %s\n",
+				t.Metadata.Name, t.Status.Phase, node, t.Status.Container, age(t.Status.StartedAt), ports)
 		}
 		return nil
 	case "workspaces":

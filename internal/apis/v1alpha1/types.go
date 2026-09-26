@@ -47,6 +47,24 @@ type TaskSpec struct {
 	// Gateway optionally references a Gateway resource by name; the
 	// container then runs behind its egress allowlist (default-deny out).
 	Gateway string `json:"gateway,omitempty" yaml:"gateway,omitempty"`
+	// Ports publishes container ports on the PVE node: the node listens
+	// with socat and forwards to the container's address. Publishing is
+	// opt-in attack surface (see docs/threat-model.md) and requires a
+	// Running container, like exec.
+	Ports []PortSpec `json:"ports,omitempty" yaml:"ports,omitempty"`
+}
+
+// PortSpec publishes one TCP port: the container listens on Port, the node
+// forwards HostPort to it. HostPort 0 (the default) auto-assigns from the
+// px range and the resolved value persists in status.
+type PortSpec struct {
+	// Name labels the mapping; a DNS label, unique within the task.
+	Name string `json:"name" yaml:"name"`
+	// Port is the TCP port the task listens on inside the container.
+	Port int `json:"port" yaml:"port"`
+	// HostPort is the node port the forward listens on. 0 auto-assigns
+	// from HostPortMin..HostPortMax.
+	HostPort int `json:"hostPort,omitempty" yaml:"hostPort,omitempty"`
 }
 
 type TaskWorkspace struct {
@@ -195,6 +213,19 @@ type TaskStatus struct {
 	// then destroys the container and removes the record. Persisted, so a
 	// px-server restart resumes an in-flight delete.
 	DeletionTimestamp *time.Time `json:"deletionTimestamp,omitempty" yaml:"deletionTimestamp,omitempty"`
+	// Ports is the realized port mapping: one entry per spec.ports entry
+	// with the hostPort resolved (0 replaced by the assigned node port).
+	// The controller keeps the node-side forwards alive while the task is
+	// Running and removes them the moment it is not.
+	Ports []PortStatus `json:"ports,omitempty" yaml:"ports,omitempty"`
+}
+
+// PortStatus is the realized form of one spec.ports entry: the resolved
+// node port forwarding to the container's port.
+type PortStatus struct {
+	Name     string `json:"name" yaml:"name"`
+	Port     int    `json:"port" yaml:"port"`
+	HostPort int    `json:"hostPort" yaml:"hostPort"`
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -217,6 +248,14 @@ const (
 	MaxEgressRules  = 32       // per gateway spec.egress
 	MaxCIDRBytes    = 64       // per egress rule cidr
 	MaxPortsBytes   = 64       // per egress rule ports
+	MaxPorts        = 8        // per task spec.ports
+
+	// HostPortMin/HostPortMax bound every published hostPort, explicit or
+	// auto-assigned: the px-reserved node port range (the NodePort
+	// convention), kept high and narrow so forwards stay clear of node
+	// services like sshd or the PVE API below it.
+	HostPortMin = 30000
+	HostPortMax = 32767
 )
 
 // ValidateProvider checks spec.provider is a known provider.
@@ -242,6 +281,71 @@ func ValidateUser(user string) error {
 		return fmt.Errorf("invalid runner.user %q: must be a container user name or numeric uid", user)
 	}
 	return nil
+}
+
+// ValidatePorts checks a task's spec.ports list: bounded count, DNS-label
+// names unique within the task, container ports in 1..65535 and unique
+// within the task (a duplicate would make the mapping ambiguous), and
+// hostPort either 0 (auto-assign) or inside the px range. Port fields are
+// typed ints by the time this runs, so no string parsing is involved.
+func ValidatePorts(ps []PortSpec) error {
+	if len(ps) > MaxPorts {
+		return fmt.Errorf("spec.ports exceeds %d entries", MaxPorts)
+	}
+	names := map[string]bool{}
+	cports := map[int]bool{}
+	hports := map[int]bool{}
+	for i := range ps {
+		p := &ps[i]
+		if err := ValidateName(p.Name); err != nil {
+			return fmt.Errorf("ports[%d].name: %w", i, err)
+		}
+		if names[p.Name] {
+			return fmt.Errorf("ports[%d].name %q is duplicated", i, p.Name)
+		}
+		names[p.Name] = true
+		if p.Port < 1 || p.Port > 65535 {
+			return fmt.Errorf("ports[%d].port %d: must be 1-65535", i, p.Port)
+		}
+		if cports[p.Port] {
+			return fmt.Errorf("ports[%d].port %d is duplicated", i, p.Port)
+		}
+		cports[p.Port] = true
+		if p.HostPort != 0 && (p.HostPort < HostPortMin || p.HostPort > HostPortMax) {
+			return fmt.Errorf("ports[%d].hostPort %d: must be 0 (auto) or %d-%d", i, p.HostPort, HostPortMin, HostPortMax)
+		}
+		if p.HostPort != 0 && hports[p.HostPort] {
+			return fmt.Errorf("ports[%d].hostPort %d is duplicated", i, p.HostPort)
+		}
+		hports[p.HostPort] = true
+	}
+	return nil
+}
+
+// ClaimedHostPorts maps every node port claimed by a task other than
+// exclude to that task's name. A port is claimed twice over: explicitly in
+// a spec.ports entry (desired from apply time on, container or not) and
+// once assigned in status.ports (the controller's auto-allocation record).
+// Apply-time conflict checks and the controller's allocator share this, so
+// a forward never lands on a port another task already owns.
+func ClaimedHostPorts(tasks []*Task, exclude string) map[int]string {
+	claimed := map[int]string{}
+	for _, t := range tasks {
+		if t.Metadata.Name == exclude {
+			continue
+		}
+		for _, p := range t.Spec.Ports {
+			if p.HostPort != 0 {
+				claimed[p.HostPort] = t.Metadata.Name
+			}
+		}
+		for _, p := range t.Status.Ports {
+			if p.HostPort != 0 {
+				claimed[p.HostPort] = t.Metadata.Name
+			}
+		}
+	}
+	return claimed
 }
 
 // ValidateEgress checks an egress rule survives the round-trip into PVE

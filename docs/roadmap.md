@@ -2,6 +2,52 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
+## M7 — Port exposure (done 2026-09-26)
+
+Chosen 2026-09-26 from four candidates (port exposure, session
+continuation, observability, user-defined templates): M6 closed the
+loop from goal to a running agent, but an agent that builds anything
+web-shaped has no way to show it to a human — the missing piece is
+`curl http://<node>:<port>` reaching into the sandbox. Scope:
+
+- [x] `spec.ports`: a list of `{name, port, hostPort?}` — `port` is the
+  TCP port the task listens on inside the container, `hostPort` the
+  port the node listens on for it (omitted: auto-assigned from a px
+  range, store-tracked so two tasks never collide; a colliding explicit
+  `hostPort` is an apply-time rejection). Validation: MaxPorts, name
+  (DNS label), port 1-65535, hostPort in a px-reserved range.
+- [x] Forwarding runs on the node as `socat TCP-LISTEN:<hostPort>,fork
+  TCP:<ctIP>:<port>` — no agent inside the container, nothing in the
+  CT image, no iptables: the lab's LAN is one flat L2 segment
+  (192.168.2.0/24 on vmbr0), so a DNAT would need SNAT too for the
+  return path (asymmetric routing drops the reply), while a TCP proxy
+  has no return-path property to reason about and its lifecycle is a
+  process px can kill. ctIP comes from the existing node SSH + `pct
+  exec ip` path (the container's eth0 address, resolved after boot and
+  re-checked on reconcile so a DHCP change re-programs the forward).
+- [x] Declarative reconciliation, like suspend: Status.Ports is the
+  desired state, the controller re-programs forwards that vanished or
+  drifted every tick (px-server restart included — the record carries
+  everything needed to rebuild), and delete/TTL/provision-failure
+  removes them with the container (kill by the listen-port signature,
+  verified gone). `px get tasks` gains a PORTS column, describe shows
+  the mapping, and a port publish requires a Running container like
+  exec does.
+- [x] Threat model: publishing a port is an opt-in widening of the
+  sandbox's attack surface — the node now accepts connections the
+  Gateway allowlist was built to deny, on the operator's LAN; the
+  section names what a published task can be reached for and that
+  bind-local (loopback-only) exposure is out of scope for M7.
+- [x] E2E on the real node: a task serving an HTTP port is reachable
+  through `node:hostPort` from outside the node, a colliding hostPort
+  is rejected at apply, delete removes both container and forward (no
+  listener left on the node), and a px-server restart rebuilds the
+  forwards from the store. Verified 2026-09-26: `scripts/e2e-ports.sh`
+  17/17 plus a manual restart-rebuild pass; found on the way: the ctIP
+  awk misread `ip -o` field positions, and a pve-firewall-enabled node
+  needs an explicit allow for 30000–32767 in cluster.fw (see
+  docs/e2e.md Prerequisites).
+
 ## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,

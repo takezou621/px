@@ -150,6 +150,20 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 
+	// Published ports exist only while the container runs: any other phase
+	// tears the forwards down — a frozen backend means hanging connections
+	// (suspend), a finished runner serves nothing (terminal). Failure keeps
+	// the record's ports and retries next tick, and stops this tick's
+	// lifecycle flow too: the delete/TTL paths below remove forwards again
+	// on their own, and re-dialing a node that just failed costs another
+	// full SSH timeout.
+	if t.Status.Container != 0 && t.Status.Node != "" &&
+		t.Status.Phase != v1alpha1.TaskRunning && len(t.Status.Ports) > 0 {
+		if !c.teardownPorts(ctx, t) {
+			return
+		}
+	}
+
 	switch t.Status.Phase {
 	case "", v1alpha1.TaskPending:
 		c.provision(ctx, t)
@@ -304,6 +318,20 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 		}
 	}
 	node := t.Status.Node
+
+	// Kill the port forwards before the container: they are node processes
+	// with no tie to the container's lifecycle, so destroying without them
+	// would leave listeners pointing at a dead address, and the record —
+	// the only thing that remembers the ports — is deleted moments later.
+	// A failure here retries the whole destroy on the next tick.
+	if len(t.Status.Ports) > 0 {
+		if err := c.prov.RemovePorts(ctx, node, hostPortsOf(t.Status.Ports)); err != nil {
+			c.log.Error("remove port forwards before destroy", "task", t.Metadata.Name, "err", err)
+			return
+		}
+		t.Status.Ports = nil
+		c.persist(t)
+	}
 
 	// Guard ownership before thawing too: a recorded VMID another container
 	// now holds must not be thawed any more than destroyed. DestroyOwned
@@ -529,6 +557,12 @@ func (c *Controller) reconcileRunning(ctx context.Context, t *v1alpha1.Task) {
 		c.log.Warn("frozen probe", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
 	}
 	c.poll(ctx, t)
+	// poll may have just settled the task terminal; published ports follow
+	// the phase out on the next tick's teardown. Only a still-Running task
+	// gets its forwards converged.
+	if t.Status.Phase == v1alpha1.TaskRunning {
+		c.reconcilePorts(ctx, t)
+	}
 }
 
 // deadDuringSuspend settles a suspend-phase task whose container has
@@ -623,6 +657,18 @@ func (c *Controller) reconcileResuming(ctx context.Context, t *v1alpha1.Task) {
 }
 
 func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
+	// Same rule as destroyTask: no container may be destroyed while its
+	// forwards still listen — the terminal teardown ran on the previous
+	// tick's central pass, but if it failed, this is the last gate before
+	// the record loses the port list.
+	if len(t.Status.Ports) > 0 {
+		if err := c.prov.RemovePorts(ctx, t.Status.Node, hostPortsOf(t.Status.Ports)); err != nil {
+			c.log.Error("remove port forwards before ttl destroy", "task", t.Metadata.Name, "err", err)
+			return
+		}
+		t.Status.Ports = nil
+		c.persist(t)
+	}
 	ttl := t.Spec.TTLSecondsAfterFinished
 	if ttl <= 0 || t.Status.Container == 0 || t.Status.EndedAt == nil {
 		return
@@ -647,6 +693,150 @@ func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Container = 0
 	t.Status.Reason += " (container cleaned up after TTL)"
 	c.persist(t)
+}
+
+// reconcilePorts converges a Running task's published ports to spec.ports:
+// every entry needs a resolved hostPort (explicit, already assigned, or
+// freshly allocated) and a node-side socat matching it. The resolved
+// mapping is persisted before the node is touched — a crash between the
+// two leaves a record that still names its ports, so a px-server restart
+// rebuilds the forwards from the store alone.
+func (c *Controller) reconcilePorts(ctx context.Context, t *v1alpha1.Task) {
+	if len(t.Spec.Ports) == 0 {
+		if len(t.Status.Ports) > 0 {
+			c.teardownPorts(ctx, t)
+		}
+		return
+	}
+	resolved := make(map[string]int, len(t.Status.Ports))
+	for _, st := range t.Status.Ports {
+		resolved[st.Name] = st.HostPort
+	}
+	want := make([]v1alpha1.PortStatus, 0, len(t.Spec.Ports))
+	var fwds []PortForward
+	var claimed map[int]string
+	for _, sp := range t.Spec.Ports {
+		hp := sp.HostPort
+		if hp == 0 {
+			hp = resolved[sp.Name]
+		}
+		if hp == 0 {
+			if claimed == nil {
+				tasks, err := c.store.ListTasks()
+				if err != nil {
+					c.log.Error("port allocation: list tasks", "task", t.Metadata.Name, "err", err)
+					return
+				}
+				claimed = v1alpha1.ClaimedHostPorts(tasks, t.Metadata.Name)
+				// A later explicit entry in this same spec also claims its
+				// hostPort: the walk below has not reached it yet, and an
+				// auto assignment must not land on it.
+				for _, other := range t.Spec.Ports {
+					if other.HostPort != 0 {
+						claimed[other.HostPort] = t.Metadata.Name
+					}
+				}
+			}
+			hp = allocateHostPort(claimed, fwds)
+			if hp == 0 {
+				c.log.Error("port allocation: px host port range exhausted", "task", t.Metadata.Name)
+				return
+			}
+		}
+		want = append(want, v1alpha1.PortStatus{Name: sp.Name, Port: sp.Port, HostPort: hp})
+		fwds = append(fwds, PortForward{HostPort: hp, Port: sp.Port})
+	}
+	// Entries the new mapping no longer names would keep their listeners
+	// alive on the node — sweep them before publishing, and bail on
+	// failure so the next tick retries with the record unchanged.
+	kept := make(map[int]bool, len(want))
+	for _, w := range want {
+		kept[w.HostPort] = true
+	}
+	var stale []int
+	for _, st := range t.Status.Ports {
+		if !kept[st.HostPort] {
+			stale = append(stale, st.HostPort)
+		}
+	}
+	if len(stale) > 0 {
+		if err := c.prov.RemovePorts(ctx, t.Status.Node, stale); err != nil {
+			c.log.Warn("remove stale port forwards", "task", t.Metadata.Name, "hostPorts", stale, "err", err)
+			return
+		}
+	}
+	if !portsEqual(want, t.Status.Ports) {
+		t.Status.Ports = want
+		c.log.Info("ports published", "task", t.Metadata.Name, "vmid", t.Status.Container, "ports", hostPortsOf(t.Status.Ports))
+		// Persist before the node is touched: the record must name its
+		// ports even if this process dies mid-convergence.
+		c.persist(t)
+	}
+	res, err := c.prov.EnsurePorts(ctx, t.Status.Node, t.Status.Container, fwds)
+	if err != nil {
+		c.log.Warn("port forwards", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+		return
+	}
+	for _, hp := range res.Failed {
+		c.log.Warn("port forward failed to start", "task", t.Metadata.Name, "hostPort", hp, "ctIP", res.CTIP)
+	}
+}
+
+// portsEqual compares two resolved port mappings entry by entry. Entries
+// follow spec order on both sides — status lists are only ever written
+// from the spec walk.
+func portsEqual(a, b []v1alpha1.PortStatus) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// teardownPorts removes a task's node-side forwards and drops the record's
+// port list. A failure keeps the list so the next tick retries — the
+// delete/TTL paths gate on it being empty before destroying anything, and
+// the reconcile loop halts a task's lifecycle flow until it returns true.
+func (c *Controller) teardownPorts(ctx context.Context, t *v1alpha1.Task) bool {
+	if len(t.Status.Ports) == 0 {
+		return true
+	}
+	if err := c.prov.RemovePorts(ctx, t.Status.Node, hostPortsOf(t.Status.Ports)); err != nil {
+		c.log.Error("remove port forwards", "task", t.Metadata.Name, "err", err)
+		return false
+	}
+	t.Status.Ports = nil
+	c.persist(t)
+	return true
+}
+
+// allocateHostPort returns the lowest host port in the px range that no
+// other task claims and this task's own working set does not use yet, or
+// 0 when the range is exhausted. The reconciler is serial, so the claimed
+// snapshot cannot race another allocation.
+func allocateHostPort(claimed map[int]string, fwds []PortForward) int {
+	taken := make(map[int]bool, len(fwds))
+	for _, f := range fwds {
+		taken[f.HostPort] = true
+	}
+	for p := v1alpha1.HostPortMin; p <= v1alpha1.HostPortMax; p++ {
+		if claimed[p] == "" && !taken[p] {
+			return p
+		}
+	}
+	return 0
+}
+
+func hostPortsOf(ps []v1alpha1.PortStatus) []int {
+	out := make([]int, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, p.HostPort)
+	}
+	return out
 }
 
 func (c *Controller) persist(t *v1alpha1.Task) {
