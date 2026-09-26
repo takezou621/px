@@ -35,6 +35,19 @@ in Task manifests. Note: the image file must go on a `vztmpl`-capable
 storage (dir/NFS, default `local`); lvmthin pools like `local-lvm`
 reject template files, so keep them separate.
 
+For agent tasks (see `px run`), build the agent template the same way —
+it is the runner template plus the Claude Code CLI, baked in via the
+native installer:
+
+```sh
+scp template/agent/build.sh root@<PVE_HOST>:/root/
+ssh root@<PVE_HOST> /root/build.sh <CTID>          # a different CTID than the runner template
+```
+
+It freezes only after `claude --version` proves the CLI runs inside the
+image; the result is the template `px-agent-debian12`, which `px run`
+uses as its default image.
+
 ## 2. Start px-server
 
 ```sh
@@ -230,6 +243,39 @@ The scheduling order itself (most free memory first) is environment
 dependent and not asserted — pinning it deterministically needs
 control over each node's load, which is what the unit tests cover with
 fake cluster views.
+
+## 3g. Agent runtime test
+
+With the same server running and the **agent template** built (section
+1, `px-agent-debian12`):
+
+```sh
+./scripts/e2e-agent.sh
+# env: PX_SERVER, PX, TIMEOUT as above; PVE_SSH (default root@<node>,
+#      empty disables the node-level checks)
+```
+
+It exercises: `px run` applies a task and follows it to Succeeded in
+one command (explicit `--` command — flags, generated task name, log
+follow, exit code), without `--` the positional goal lands in
+`spec.goal` and the default agent command in `spec.runner.command`
+(checked on the applied spec), the Claude Code CLI is present and
+runnable in the template (`claude --version`, no credential needed),
+the task-level
+goal reaches the runner as `GOAL`, and a Model holding a non-working
+key fails the task cleanly with the provider error visible in the task
+log (that check sends one harmless request to the real Anthropic
+endpoint, which rejects the dummy key with a 401 — no valid credential
+exists anywhere in the suite). Cleanup removes all tasks and the model,
+and verifies no containers are left on the node.
+
+A live agent run with a real key is deliberately **not** automated: it
+burns tokens and should be supervised. Run it yourself once to close
+the loop, e.g.:
+
+```sh
+./px run -model <model> -workspace <name> "<goal>"
+```
 
 ## 4. Restart-recovery check (manual)
 

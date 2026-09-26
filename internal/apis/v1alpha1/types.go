@@ -28,6 +28,11 @@ type ObjectMeta struct {
 type TaskSpec struct {
 	// Image is the name of the LXC template to clone (must exist on the PVE node).
 	Image string `json:"image" yaml:"image"`
+	// Goal is the task-level instruction the runner receives (GOAL env).
+	// It joins any per-workspace goals — the task goal first, then the
+	// workspace blocks — so a task without workspaces can still carry an
+	// instruction (agent tasks are goal-first by nature).
+	Goal string `json:"goal,omitempty" yaml:"goal,omitempty"`
 	// Workspaces to wire into the task; each carries its own goal.
 	Workspaces []TaskWorkspace `json:"workspaces,omitempty" yaml:"workspaces,omitempty"`
 	// Runner is the command executed inside the container.
@@ -196,7 +201,7 @@ var userRe = regexp.MustCompile(`^([a-z_][a-z0-9_-]{0,31}|[0-9]{1,5})$`)
 // whole boot script rides on that single SSH argv element. At the caps below
 // a task's boot command stays well under the limit.
 const (
-	MaxGoalBytes    = 32 << 10 // combined across workspaces
+	MaxGoalBytes    = 32 << 10 // task goal + all workspace goals combined
 	MaxCommandBytes = 16 << 10 // total of spec.runner.command argv
 	MaxRepoBytes    = 2 << 10  // per workspace spec.git.repo
 	MaxBranchBytes  = 256      // per workspace spec.git.branch

@@ -6,12 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -33,6 +35,8 @@ func main() {
 	switch cmd {
 	case "apply":
 		err = cmdApply(fs, args)
+	case "run":
+		err = cmdRun(fs, args)
 	case "get":
 		err = cmdGet(fs, args)
 	case "describe":
@@ -95,6 +99,192 @@ func cmdApply(fs *flag.FlagSet, args []string) error {
 		fmt.Println(r)
 	}
 	return nil
+}
+
+// wsList collects repeated -workspace NAME[=GOAL] flags.
+type wsList []string
+
+func (w *wsList) String() string { return strings.Join(*w, ",") }
+func (w *wsList) Set(v string) error {
+	*w = append(*w, v)
+	return nil
+}
+
+// defaultAgentCommand drives the baked-in Claude Code CLI against the
+// runner's GOAL env. The sandbox is the isolation boundary (LXC + optional
+// Gateway egress allowlist), so the CLI's own permission prompts are
+// skipped — there is no human inside the container to answer them.
+var defaultAgentCommand = []string{"sh", "-c", `claude --dangerously-skip-permissions -p "$GOAL"`}
+
+// splitRunArgs splits args at the first bare "--": everything before it
+// goes to flag parsing, everything after is the explicit runner command.
+// The flag package stops at the first non-flag arg, so flags must precede
+// the goal.
+func splitRunArgs(args []string) (flags, cmd []string) {
+	for i, a := range args {
+		if a == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
+}
+
+// cmdRun is client-side sugar over apply + logs + get task: it builds a
+// Task manifest from flags, applies it, and (unless -no-wait) follows the
+// runner's log to a terminal phase, exiting with the task's exit code.
+// Ctrl-C detaches — the task keeps running server-side.
+func cmdRun(fs *flag.FlagSet, args []string) error {
+	model := fs.String("model", "", "Model resource name (LLM credentials for the runner)")
+	var wss wsList
+	fs.Var(&wss, "workspace", "Workspace reference NAME[=GOAL], repeatable")
+	gateway := fs.String("gateway", "", "Gateway resource name (egress allowlist)")
+	image := fs.String("image", "px-agent-debian12", "LXC template to clone")
+	name := fs.String("name", "", "task name (default agent-<epoch>-<rand>)")
+	ttl := fs.Int("ttl", 0, "TTLSecondsAfterFinished (0 = keep until deleted)")
+	cores := fs.Int("cores", 0, "CPU cores (0 = template default)")
+	memory := fs.Int("memory", 0, "memory MB (0 = template default)")
+	noWait := fs.Bool("no-wait", false, "return immediately after apply")
+	flags, cmd := splitRunArgs(args)
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: px run GOAL [-model NAME] [-workspace NAME[=GOAL]]... [-gateway NAME] [-- COMMAND...]")
+	}
+	if len(rest) > 1 {
+		return fmt.Errorf("unexpected arguments after the goal: %q (quote the goal; flags must precede it)", rest[1:])
+	}
+	goal := rest[0]
+	if len(cmd) == 0 {
+		cmd = defaultAgentCommand
+	}
+	if *name == "" {
+		*name = fmt.Sprintf("agent-%d-%08x", time.Now().Unix(), rand.Intn(0xffffffff))
+	}
+	t := &v1alpha1.Task{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   v1alpha1.ObjectMeta{Name: *name},
+		Spec: v1alpha1.TaskSpec{
+			Image: *image,
+			Goal:  goal,
+			Runner: v1alpha1.RunnerSpec{
+				Command: cmd,
+			},
+			Resources:               v1alpha1.Resources{Cores: *cores, MemoryMB: *memory},
+			TTLSecondsAfterFinished: *ttl,
+			Model:                   *model,
+			Gateway:                 *gateway,
+		},
+	}
+	for _, ref := range wss {
+		n, g, _ := strings.Cut(ref, "=")
+		t.Spec.Workspaces = append(t.Spec.Workspaces, v1alpha1.TaskWorkspace{Name: n, Goal: g})
+	}
+	body, err := yaml.Marshal(t)
+	if err != nil {
+		return err
+	}
+	var out struct {
+		Results []string `json:"results"`
+		Error   string   `json:"error"`
+	}
+	if err := doJSON(http.MethodPost, "/v1/apply", body, &out); err != nil {
+		return err
+	}
+	if out.Error != "" {
+		return fmt.Errorf("%s", out.Error)
+	}
+	fmt.Printf("task.px.io/%s applied\n", *name)
+	if *noWait {
+		return nil
+	}
+	return followRun(*name)
+}
+
+// followRun polls the task status and the runner's log, echoing new log
+// output and phase transitions, and exits with the task's own exit code
+// once it reaches a terminal phase (a Failed task with a zero runner code
+// still exits 1 — the phase is the signal, not the number).
+func followRun(name string) error {
+	var last, phase string
+	printLogs := func() {
+		out, blocked, err := taskLogs(name)
+		if err != nil || blocked {
+			return // best-effort: the status read decides the exit
+		}
+		if out != last {
+			fmt.Print(strings.TrimPrefix(out, last))
+			last = out
+		}
+	}
+	for {
+		var t *v1alpha1.Task
+		if err := doJSON(http.MethodGet, "/v1/tasks/"+name, nil, &t); err != nil {
+			return err
+		}
+		if ph := string(t.Status.Phase); ph != phase {
+			if phase != "" {
+				fmt.Printf("task.px.io/%s %s -> %s\n", name, phase, ph)
+			} else {
+				fmt.Printf("task.px.io/%s %s\n", name, ph)
+			}
+			phase = ph
+		}
+		// The logs endpoint serves a "(container gone...)" placeholder
+		// before the container exists — poll the status first and read
+		// logs only once there is something to read from.
+		if t.Status.Container > 0 {
+			printLogs()
+		}
+		if isTerminal(t.Status.Phase) {
+			// Output written between the log read and this status read
+			// would be lost — the final read usually carries the run's
+			// last words, so read once more before exiting.
+			printLogs()
+			switch t.Status.Phase {
+			case v1alpha1.TaskFailed:
+				if t.Status.ExitCode != 0 {
+					os.Exit(t.Status.ExitCode)
+				}
+				os.Exit(1)
+			case v1alpha1.TaskProvisionFail:
+				os.Exit(1)
+			}
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// taskLogs fetches the runner log. A 409 means the endpoint refuses the
+// read right now — the container is frozen (an external suspend), and
+// reading logs inside a frozen cgroup would hang — which is a skip, not
+// a follow failure: the loop keeps polling the status and resumes log
+// reads after resume.
+func taskLogs(name string) (out string, blocked bool, err error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(serverURL, "/")+"/v1/tasks/"+name+"/logs", nil)
+	if err != nil {
+		return "", false, err
+	}
+	resp, err := do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return "", true, nil
+	}
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(resp.Body)
+		return "", false, fmt.Errorf("%d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", false, err
+	}
+	return string(data), false, nil
 }
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
@@ -586,6 +776,12 @@ func usage() {
 
 Usage:
   px apply -f <file|->            Apply a YAML manifest
+  px run GOAL [-model NAME]       Launch an agent task from flags: the goal is
+      [-workspace NAME[=GOAL]]... the runner's instruction (GOAL env); flags
+      [-gateway NAME] [-image N]  precede the goal; a bare double dash after
+      [-name N] [-ttl S]          it replaces the default Claude Code runner
+      [-cores N] [-memory N]      command; Ctrl-C detaches and the task keeps
+      [-no-wait]                  running
   px get tasks                    List tasks
   px get workspaces               List workspaces
   px get models                   List models (API keys redacted)

@@ -84,6 +84,34 @@ model's key* — from its environment, or as any process running as that
 same uid inside the sandbox; that is the point of giving it one — but
 cannot read another task's, since sandboxes share nothing.
 
+## Agent runtime and skip-permissions
+
+The default runner command (`px run` without `--`, and the
+`px-agent-debian12` template) is
+`claude --dangerously-skip-permissions -p "$GOAL"`. The name of that
+flag reads alarming, and the choice is deliberate: a permission prompt
+needs a human inside the container to answer it, and there is none —
+the task is autonomous by definition. The isolation boundary is the
+*container*, not the CLI's permission system: the LXC sandbox already
+assumes the task is the untrusted party (see the trust model), and an
+optional Gateway bounds what its egress can reach. Skipping the CLI's
+prompts changes nothing about what the task could eventually do; it
+only removes the fiction that someone is watching.
+
+Two corollaries follow. First, the goal text (`spec.goal`, workspace
+goals) is *instructions to the agent*, not a security boundary — a
+prompt-injected goal gets exactly the authority the task already had:
+its sandbox, its model key, its gateway. Second, anything the model
+provider returns to the running agent is untrusted input, same as any
+task output; px does not and cannot vet it. Neither is new attack
+surface — both were already true of any task with a runner command —
+but the first-class agent defaults make them the normal path rather
+than an edge case, so they are named here.
+
+The agent template also bakes in the CLI itself, fetched at build time
+via the native installer from `claude.ai`; that is part of the
+template supply chain entry under Out of scope.
+
 ## px-server exposure
 
 px-server binds loopback and serves plain HTTP by default; the bearer
@@ -177,7 +205,9 @@ cloned, and removes it on destroy).
 - Post-exploit lateral movement *from* a compromised PVE node — that
   node owns every task and every key by definition.
 - Template supply chain beyond "build it yourself with
-  `template/runner/build.sh`": the Debian base image comes from
-  Proxmox's repository, `apt` installs happen at build time, and px
-  pins nothing further — re-verify the template if your threat model
-  includes Proxmox's mirrors.
+  `template/runner/build.sh`" (or `template/agent/build.sh` for the
+  agent image): the Debian base image comes from Proxmox's repository,
+  `apt` installs happen at build time, and the agent image additionally
+  runs the Claude Code native installer fetched from `claude.ai` — px
+  pins nothing further, so re-verify the templates if your threat model
+  includes Proxmox's mirrors or the installer origin.

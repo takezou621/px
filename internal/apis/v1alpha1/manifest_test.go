@@ -111,6 +111,48 @@ spec:
 	}
 }
 
+// spec.goal is the task-level instruction: parsed into the spec and counted
+// toward the same combined cap as the workspace goals, since both land in
+// the same base64-embedded GOAL value on the boot command line.
+func TestParseTaskLevelGoal(t *testing.T) {
+	in := `apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: t1
+spec:
+  image: tmpl
+  goal: "Ship the fix"
+  workspaces:
+    - name: demo
+      goal: use this repo
+  runner:
+    command: ["true"]
+`
+	objs, err := ParseManifests(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if objs[0].Task.Goal != "Ship the fix" {
+		t.Errorf("task goal = %q", objs[0].Task.Goal)
+	}
+	in = fmt.Sprintf(`apiVersion: px.io/v1alpha1
+kind: Task
+metadata:
+  name: t1
+spec:
+  image: tmpl
+  goal: %q
+  workspaces:
+    - name: demo
+      goal: %q
+  runner:
+    command: ["true"]
+`, strings.Repeat("a", MaxGoalBytes), strings.Repeat("b", 1))
+	if _, err := ParseManifests(strings.NewReader(in)); err == nil {
+		t.Fatal("want error when task goal plus workspace goal exceed MaxGoalBytes")
+	}
+}
+
 func TestParseRejectsUnknownKind(t *testing.T) {
 	in := "apiVersion: px.io/v1alpha1\nkind: Pod\nmetadata:\n  name: x\n"
 	if _, err := ParseManifests(strings.NewReader(in)); err == nil {

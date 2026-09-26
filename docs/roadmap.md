@@ -2,6 +2,41 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
+## M6 — First-class agent runtime (current)
+
+Chosen 2026-09-26 from four candidates (agent runtime, port exposure,
+observability, user-defined templates): the primitives M3 assembled
+(Model credentials, Gateway egress, Workspace code) only pay off once an
+actual agent runs through them end to end — the missing piece is the
+experience of launching one. Scope:
+
+- [ ] Task-level goal: `spec.goal` joins the per-workspace goals in the
+  runner's GOAL env (task goal first, then workspace blocks), so a task
+  without workspaces can carry an instruction — today goal only exists
+  per workspace, and an agent task is goal-first by nature.
+- [ ] Agent template `px-agent-debian12` (`template/agent/build.sh`):
+  the runner template plus the Claude Code CLI baked in via the native
+  installer (a self-contained binary — no Node runtime in the image).
+  `px run` defaults `spec.image` to it; `--image` overrides.
+- [ ] `px run`: client-side sugar that builds and applies a Task from
+  flags (`--model`, `--workspace NAME[=goal]`, `--gateway`, `--ttl`,
+  `--name`, `--image`, `--cores`/`--memory`) with the positional goal,
+  then polls the task and follows its log to a terminal phase (2s
+  polling; new log output echoed as it lands), and exits with the
+  task's exit code; `--no-wait` returns after apply, Ctrl-C detaches
+  with the task left running. The default runner command is
+  `sh -c 'claude --dangerously-skip-permissions -p "$GOAL"'`: inside an
+  LXC sandbox behind a Gateway allowlist there is no human to answer
+  permission prompts, so the isolation boundary is the container, not
+  the CLI's permission system (documented in the threat model).
+- [ ] E2E on the real node: template builds, an agent task boots, the
+  CLI is present, and a task whose Model holds a non-working key fails
+  cleanly with the provider error in the log (no credential needed);
+  a live agent run with a real key is a user-supervised step.
+- Explicitly out: session continuation across tasks (needs snapshots or
+  a shared volume — deferred), interactive TTY exec (M4 deferral
+  stands), port exposure (M7 candidate).
+
 ## M5 — API completeness & operational robustness (done)
 
 Pulled up from the backlog after M4: small items that close visible holes

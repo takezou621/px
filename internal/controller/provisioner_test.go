@@ -437,6 +437,28 @@ func TestQuoteCommandExportsGoalAndQuotesArgv(t *testing.T) {
 	}
 }
 
+// GOAL joins the task-level goal and the workspace blocks, task goal first.
+// With no task goal the rendering must stay byte-identical to the form
+// tasks shipped before spec.goal existed, so existing manifests produce
+// the same runner environment.
+func TestBuildGoalJoinsTaskAndWorkspaceGoals(t *testing.T) {
+	task := testProvTask()
+	if got := buildGoal(task); got != "## ws1\nFix bug #123" {
+		t.Errorf("workspace-only goal changed shape: %q", got)
+	}
+	task.Spec.Goal = "Find the root cause"
+	task.Spec.Workspaces = append(task.Spec.Workspaces,
+		v1alpha1.TaskWorkspace{Name: "ws2", Goal: "add a test"})
+	want := "Find the root cause\n\n## ws1\nFix bug #123\n\n## ws2\nadd a test"
+	if got := buildGoal(task); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	task.Spec.Workspaces = nil
+	if got := buildGoal(task); got != "Find the root cause" {
+		t.Errorf("task goal alone got %q", got)
+	}
+}
+
 // The exec command line must quote every argument for both shells it crosses:
 // metacharacters, whitespace and quotes reach pct's argv byte-exact, and the
 // caller's `; rm -rf /` stays an inert argument, never a second command. The

@@ -35,8 +35,8 @@ Same mental model as ax, own API group (`px.io/v1alpha1`):
 |---|---|
 | **Task** | Run agent code in a sandboxed LXC container with CPU/memory limits |
 | **Workspace** | Wire a git repository into the task's container |
-| **Gateway** | Restrict egress traffic to an allowlist *(planned)* |
-| **Model** | Configure the LLM credentials a task may use *(planned)* |
+| **Gateway** | Restrict egress traffic to an allowlist |
+| **Model** | Configure the LLM credentials a task may use |
 
 ## Example
 
@@ -90,6 +90,24 @@ $ px exec fix-bug-123 -- ps aux     # peek into the live sandbox
 $ px suspend fix-bug-123            # freeze the container (cgroup v2)
 $ px resume fix-bug-123             # unfreeze it
 ```
+
+## Running an agent
+
+`px run` is the one-command path: it turns flags into a Task manifest,
+applies it, and follows the logs until the task goes terminal
+(Ctrl-C detaches — the task keeps running):
+
+```console
+$ px run -model my-claude -workspace myapp="Fix bug #123" "make the tests pass"
+```
+
+It assumes the `px-agent-debian12` template
+(`template/agent/build.sh` — the runner template plus the Claude Code
+CLI). The default runner command is
+`claude --dangerously-skip-permissions -p "$GOAL"`: the sandbox is the
+isolation boundary, not the CLI's permission prompts
+(see [docs/threat-model.md](docs/threat-model.md)). Pass
+`-- COMMAND...` to run something else.
 
 ## Quick start (target)
 

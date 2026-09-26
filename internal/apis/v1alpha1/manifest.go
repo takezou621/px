@@ -88,7 +88,7 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 				return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
 			}
 		}
-		var goalBytes int
+		var goalBytes = len(s.Goal)
 		if len(s.Workspaces) > MaxWorkspaces {
 			return nil, fmt.Errorf("task %q: spec.workspaces exceeds %d entries", m.Metadata.Name, MaxWorkspaces)
 		}
@@ -111,7 +111,7 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			goalBytes += len(ws.Goal)
 		}
 		if goalBytes > MaxGoalBytes {
-			return nil, fmt.Errorf("task %q: combined workspaces goal exceeds %d bytes", m.Metadata.Name, MaxGoalBytes)
+			return nil, fmt.Errorf("task %q: combined task and workspace goal exceeds %d bytes", m.Metadata.Name, MaxGoalBytes)
 		}
 		var cmdBytes int
 		for _, a := range s.Runner.Command {

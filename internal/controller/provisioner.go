@@ -329,13 +329,7 @@ func envPrefix(p v1alpha1.ModelProvider) string {
 // pitfalls; the runner's output goes to /run/px/task.log, its exit code
 // to /run/px/exit.
 func runnerScript(t *v1alpha1.Task, mounts []ResolvedWorkspace, model *ResolvedModel) string {
-	goal := ""
-	for i, ws := range t.Spec.Workspaces {
-		if i > 0 {
-			goal += "\n\n"
-		}
-		goal += fmt.Sprintf("## %s\n%s", ws.Name, ws.Goal)
-	}
+	goal := buildGoal(t)
 	cmd := quoteCommand(t.Spec.Runner.Command)
 	var s strings.Builder
 	// umask 077 before any writes: everything under /run/px is this task's
@@ -413,6 +407,22 @@ touch /run/px/booted
 echo PX_BOOT_OK
 `)
 	return s.String()
+}
+
+// buildGoal joins the task-level goal and the per-workspace goal blocks
+// into the runner's GOAL value: the task goal first, then one markdown
+// block per workspace in spec order. With no task goal the result is
+// byte-identical to the pre-spec.goal form, so existing manifests render
+// unchanged.
+func buildGoal(t *v1alpha1.Task) string {
+	goal := t.Spec.Goal
+	for _, ws := range t.Spec.Workspaces {
+		if goal != "" {
+			goal += "\n\n"
+		}
+		goal += fmt.Sprintf("## %s\n%s", ws.Name, ws.Goal)
+	}
+	return goal
 }
 
 // bootCommand wraps the boot script so it lands inside the container via
