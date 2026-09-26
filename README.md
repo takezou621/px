@@ -125,6 +125,18 @@ onto whichever online node holds the image and has the most free
 memory (`--ssh-host-override "node1=10.0.0.1,node2=10.0.0.2"` maps
 PVE node names to SSH hosts, since node names are not DNS names).
 
+## Documentation
+
+- [docs/onboarding.md](docs/onboarding.md) — start here: a 30-minute
+  tour from clone to first contribution.
+- [docs/architecture.md](docs/architecture.md) — how the pieces fit
+  together, as built.
+- [docs/roadmap.md](docs/roadmap.md) — milestone-by-milestone design
+  record: what exists, why, and what was explicitly not done.
+- [docs/e2e.md](docs/e2e.md) — real-node verification, per script.
+- [docs/threat-model.md](docs/threat-model.md) — the sandbox boundary
+  and the trade-offs px accepts.
+
 ## Status
 
 Pre-alpha. The API (`px.io/v1alpha1`) will change. See
