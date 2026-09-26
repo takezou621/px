@@ -294,6 +294,16 @@ func (m *memStore) GetSession(task string) ([]byte, error) {
 	return data, nil
 }
 
+func (m *memStore) GetDefaultSession(task string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.sessions[task]
+	if !ok || m.sessionExplicit[task] {
+		return nil, store.ErrNotFound
+	}
+	return data, nil
+}
+
 func (m *memStore) SaveSession(name, lastTask string, data []byte, explicit bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2096,12 +2106,59 @@ func TestSessionRefReadsNamedCaptureWithoutTaskRecord(t *testing.T) {
 	}
 }
 
+// An explicitly owned row shields the bare-continue path too: when a task
+// that never named its session finishes but its default write was refused
+// (ErrSessionOwned — the name is held by a user-owned capture), a bare
+// continueFrom on that task must NOT resolve to the explicit row it lost
+// to. Serving it would restore a stranger's conversation under the source
+// task's name; the loud "no captured session" is the truth. The session:NAME
+// form keeps reading the explicit row — that is its whole point.
+func TestBareContinueDoesNotLeakExplicitRow(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, restored: map[int][]byte{}}
+	if err := st.SaveSession("conv", "someone", []byte("user-owned"), true); err != nil {
+		t.Fatal(err)
+	}
+	src := testTask(0)
+	src.Metadata.Name = "conv" // default capture name == the explicit row's name
+	src.Status.Phase = v1alpha1.TaskSucceeded
+	_ = st.UpsertTask(src)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+
+	cont := testTask(0)
+	cont.Metadata.Name = "cont"
+	cont.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: "conv"}
+	_ = st.UpsertTask(cont)
+	runOnce(ctl)
+	task := get(t, st, "cont")
+	if task.Status.Phase != v1alpha1.TaskProvisionFail {
+		t.Fatalf("want ProvisionFailed, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !strings.Contains(task.Status.Reason, "no captured session") {
+		t.Fatalf("reason must say the source has no capture, got %q", task.Status.Reason)
+	}
+	if len(prov.created) != 0 {
+		t.Fatal("no container may exist for a refused default capture")
+	}
+
+	cont2 := testTask(0)
+	cont2.Metadata.Name = "cont2"
+	cont2.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: v1alpha1.SessionPrefix + "conv"}
+	_ = st.UpsertTask(cont2)
+	runOnce(ctl)
+	if task := get(t, st, "cont2"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("session:conv must still read the explicit row, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !bytes.Equal(prov.session, []byte("user-owned")) {
+		t.Fatalf("session:conv must restore the explicit capture, got %q", prov.session)
+	}
+}
+
 // A capture written under an explicit spec.session.name is user-owned: it
 // survives its writing task's deletion (that survival is the point of
 // naming). Default captures keep the M8 lifetime — they die with the task
 // record, as pinned by TestDeleteCapturesSessionBeforeDestroy.
-func TestNamedCaptureOutlivesTask(t *testing.T) {
-	st := newMemStore()
+func TestNamedCaptureOutlivesTask(t *testing.T) {	st := newMemStore()
 	prov := &fakeProv{exits: map[int]int{}, capturable: map[int][]byte{100: []byte("conv-archive")}}
 	named := testTask(0)
 	named.Metadata.Name = "w1"

@@ -482,6 +482,25 @@ func (s *Store) GetSession(name string) ([]byte, error) {
 	return data, nil
 }
 
+// GetDefaultSession returns the archive under name only when its row is a
+// default-lifetime capture (explicit=0). A task that never named its
+// session must resolve its bare continueFrom through this: the name may
+// otherwise be held by an explicitly owned row — often the very owner whose
+// presence made the source's own write fail with ErrSessionOwned — and
+// reading it would restore someone else's conversation as if it were the
+// source task's.
+func (s *Store) GetDefaultSession(name string) ([]byte, error) {
+	var data []byte
+	err := s.db.QueryRow(`SELECT data FROM sessions WHERE task = ? AND explicit = 0`, name).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 // DeleteSession drops a capture row by name — whichever lifetime it has.
 // Idempotent, so both the px delete session path and the task-destroy path
 // can call it unconditionally.

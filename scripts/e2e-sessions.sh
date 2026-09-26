@@ -85,6 +85,15 @@ wait_record_gone() { # name
 }
 # sess_row prints a session row from `px get sessions` (or empty).
 sess_row() { "$PX" get sessions 2>/dev/null | awk -v n="$1" '$1==n'; }
+# sess_gone is true only when the CLI succeeded AND the row is absent — a
+# CLI failure must keep the caller waiting, not read as "the row is gone".
+sess_gone() {
+  local out
+  if ! out=$("$PX" get sessions 2>/dev/null); then
+    return 1
+  fi
+  [[ -z $(awk -v n="$1" '$1==n' <<<"$out") ]]
+}
 
 # The turn runner: report whether the capture's file was restored, then
 # plant the turn for the next writer. Every task in the conversation runs
@@ -111,21 +120,29 @@ cleanup() {
   for t in "$W1" "$W2" "$GONE"; do
     "$PX" delete task "$t" >/dev/null 2>&1 || true
   done
-  # Named captures outlive tasks by design — drop ours explicitly.
-  "$PX" delete session "$CONV" >/dev/null 2>&1 || true
   # Delete is async (the controller reconciles on its next tick), so wait
-  # briefly for the records and the capture to actually go: leftovers from
-  # a previous run would corrupt the next one's assertions.
-  local t waited row
+  # for the task records to go BEFORE dropping the capture: a writer still
+  # being destroyed captures on its way down and would re-create the row
+  # behind our back.
+  local t waited p
   for t in "$W1" "$W2" "$GONE"; do
     waited=0
-    while (( waited < 30 )) && { row=$(phase "$t" || true); [[ -n $row ]]; }; do
+    while (( waited < 30 )); do
+      # A CLI failure is not "the record is gone": keep waiting.
+      if p=$(phase "$t") && [[ -z $p ]]; then
+        break
+      fi
       sleep 1
       waited=$((waited+1))
     done
   done
+  # Named captures outlive tasks by design — drop ours explicitly.
+  "$PX" delete session "$CONV" >/dev/null 2>&1 || true
   waited=0
-  while (( waited < 30 )) && { row=$(sess_row "$CONV" || true); [[ -n $row ]]; }; do
+  while (( waited < 30 )); do
+    if sess_gone "$CONV"; then
+      break
+    fi
     sleep 1
     waited=$((waited+1))
   done
@@ -173,7 +190,12 @@ if wait_phase "$W1" Succeeded; then
 fi
 
 say "2. px run --continue-session restores the capture and moves LAST-TASK"
-"$PX" run -continue-session "$CONV" -name "$W2" -no-wait "advance the conversation" >/dev/null
+# Every step must be able to fail without killing the script under set -e:
+# the results line and later checks are diagnostic value even when an
+# earlier step broke.
+if ! "$PX" run -continue-session "$CONV" -name "$W2" -no-wait "advance the conversation" >/dev/null; then
+  bad "px run -continue-session failed"
+fi
 if wait_phase "$W2" Succeeded; then
   if grep -q "SESSION-RESTORED-OK" <("$PX" logs "$W2"); then
     ok "turn 2 restored turn 1's session into a fresh container"
@@ -189,7 +211,9 @@ if wait_phase "$W2" Succeeded; then
 fi
 
 say "3. the first writer's record is deleted; the named capture survives"
-"$PX" delete task "$W1" >/dev/null
+if ! "$PX" delete task "$W1" >/dev/null; then
+  bad "delete task $W1 failed"
+fi
 if wait_record_gone "$W1"; then
   row=$(sess_row "$CONV" || true)
   if [[ -n $row ]] && grep -q "$W2" <<<"$row"; then
@@ -208,7 +232,9 @@ else
 fi
 
 say "5. deleting the session breaks session:NAME continuations loudly"
-"$PX" delete session "$CONV" >/dev/null
+if ! "$PX" delete session "$CONV" >/dev/null; then
+  bad "delete session $CONV failed"
+fi
 waited=0
 while (( waited < TIMEOUT )); do
   [[ -z $(sess_row "$CONV" || true) ]] && break
@@ -220,8 +246,10 @@ if [[ -z $(sess_row "$CONV" || true) ]]; then
 else
   bad "capture still listed after px delete session"
 fi
-apply_task "$GONE" "  session:
-    continueFrom: session:$CONV"
+if ! apply_task "$GONE" "  session:
+    continueFrom: session:$CONV"; then
+  bad "apply of $GONE failed"
+fi
 if wait_phase "$GONE" ProvisionFailed; then
   if grep -q "$CONV" <("$PX" events "$GONE"); then
     ok "continuation of a deleted session failed at provision, naming it"

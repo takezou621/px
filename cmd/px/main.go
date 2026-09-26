@@ -623,7 +623,17 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 		if err := doJSON(http.MethodGet, "/v1/tasks", nil, &tasks); err == nil {
 			var refs []*v1alpha1.Task
 			for _, t := range tasks {
-				if t.Spec.Session != nil && t.Spec.Session.ContinueFrom == v1alpha1.SessionPrefix+name {
+				if t.Spec.Session == nil {
+					continue
+				}
+				ref := t.Spec.Session.ContinueFrom
+				named := ref == v1alpha1.SessionPrefix+name
+				// A bare reference resolves through the source's own
+				// capture name — count it only when it lands on this
+				// session.
+				defaultsToHere := ref != "" && ref != v1alpha1.SessionPrefix+name &&
+					t.Spec.Session.CaptureName(t.Metadata.Name) == name
+				if named || defaultsToHere {
 					refs = append(refs, t)
 				}
 			}

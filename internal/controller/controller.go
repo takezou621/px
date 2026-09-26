@@ -40,6 +40,10 @@ type GatewayReader interface {
 // SessionReader resolves continueFrom references against captured sessions.
 type SessionReader interface {
 	GetSession(task string) ([]byte, error)
+	// GetDefaultSession resolves a default (task-named) capture only: an
+	// explicitly owned row under the same name is somebody else's
+	// conversation, not the source task's.
+	GetDefaultSession(task string) ([]byte, error)
 }
 
 // SessionWriter persists a captured session archive and drops default
@@ -648,7 +652,16 @@ func (c *Controller) resolveSession(t *v1alpha1.Task) ([]byte, error) {
 	// would ProvisionFailed a valid capture whenever the source named
 	// its session.
 	cap := src.Spec.Session.CaptureName(src.Metadata.Name)
-	data, err := c.store.GetSession(cap)
+	// A source that never named its session must read a default-lifetime
+	// row only: the name may also be held by an explicitly owned row —
+	// often the very owner whose presence made this task's own write fail
+	// with ErrSessionOwned — and serving it would restore someone else's
+	// conversation under the source task's name.
+	get := c.store.GetSession
+	if src.Spec.Session == nil || src.Spec.Session.Name == "" {
+		get = c.store.GetDefaultSession
+	}
+	data, err := get(cap)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, fmt.Errorf("session source %q has no captured session under %q", name, cap)

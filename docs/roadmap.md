@@ -307,6 +307,17 @@ history beyond the newest state, a Session kind in the manifest API
 user, so it has no spec and a resource shape would be a lie), serving
 the archive over the API.
 
+Known limits (accepted for M11, revisit if they bite):
+
+- `delete session` drops the row unconditionally: a task still running
+  with that capture name writes it right back on its next destroy. The
+  user's delete wins only until the live writer settles; guarding
+  would need a tombstone the upsert respects.
+- `px run --continue-session` copies the last writer's spec wholesale.
+  If a task name is reused for an unrelated goal after it wrote the
+  capture, the sugar's new task inherits that stale spec; fixing it
+  needs creation time on the task record (an API change).
+
 - [x] `spec.session.name` + validation; capture writes there (default
   = task name); explicit rows survive task delete
 - [x] `continueFrom: session:NAME` resolution (no phase check, missing

@@ -427,6 +427,59 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 }
 
+// GetDefaultSession backs bare continueFrom resolution: a task that never
+// named its session must resolve only through a default-lifetime row
+// (explicit=0) — the name may be held by an explicitly owned row, which is
+// somebody else's conversation, and GetSession must not serve it there.
+func TestGetDefaultSessionSkipsExplicitRows(t *testing.T) {
+	st := openTestStore(t)
+
+	if _, err := st.GetDefaultSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound with no row, got %v", err)
+	}
+
+	if err := st.SaveSession("conv", "someone", []byte("user-owned"), true); err != nil {
+		t.Fatal(err)
+	}
+	// The explicit row is invisible to the default reader...
+	if _, err := st.GetDefaultSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("explicit row must be invisible to GetDefaultSession, got %v", err)
+	}
+	// ...while GetSession keeps serving it (the session:NAME path).
+	got, err := st.GetSession("conv")
+	if err != nil || !bytes.Equal(got, []byte("user-owned")) {
+		t.Fatalf("GetSession must read the explicit row, got %q err=%v", got, err)
+	}
+
+	// An explicit rewrite stays explicit: still invisible to the default
+	// reader, still visible to GetSession.
+	if err := st.SaveSession("conv", "conv", []byte("user-owned-2"), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetDefaultSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("explicit rewrite must stay invisible to GetDefaultSession, got %v", err)
+	}
+
+	// Once the explicit row is gone, a plain (default) capture is readable.
+	if err := st.DeleteSession("conv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSession("conv", "conv", []byte("default"), false); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetDefaultSession("conv")
+	if err != nil || !bytes.Equal(got, []byte("default")) {
+		t.Fatalf("GetDefaultSession must read the default row, got %q err=%v", got, err)
+	}
+
+	if err := st.DeleteSession("conv"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetDefaultSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound after delete, got %v", err)
+	}
+}
+
 // Recreating a task name clears any session row the previous record left
 // behind (a DeleteSession that failed mid-destroy, say): without this, a
 // later continueFrom on that name would silently restore a dead task's
