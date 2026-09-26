@@ -294,3 +294,105 @@ func TestCmdEventsArgParsing(t *testing.T) {
 		})
 	}
 }
+
+// continueSessionSource serves GET /v1/sessions/conv with the capture
+// metadata, GET /v1/tasks/<name> with src (nil = 404: the last writer's
+// record is gone), and /v1/apply like captureTask.
+func continueSessionSource(t *testing.T, info v1alpha1.SessionInfo, src *v1alpha1.Task) (get func() *v1alpha1.Task) {
+	t.Helper()
+	var posted *v1alpha1.Task
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/conv":
+			json.NewEncoder(w).Encode(info)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/"):
+			if src == nil {
+				http.Error(w, "task not found", http.StatusNotFound)
+				return
+			}
+			json.NewEncoder(w).Encode(src)
+		default:
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var task v1alpha1.Task
+			if err := yaml.Unmarshal(data, &task); err != nil {
+				http.Error(w, fmt.Sprintf("bad yaml: %v", err), http.StatusBadRequest)
+				return
+			}
+			posted = &task
+			json.NewEncoder(w).Encode(map[string][]string{"results": {"task.px.io/x applied"}})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	serverURL = srv.URL
+	return func() *v1alpha1.Task { return posted }
+}
+
+// --continue-session resolves through the session's last writer: the spec
+// is copied from that task, the session reference names the capture
+// (continueFrom: session:conv) and redirects the capture back to conv, so
+// one conversation keeps one name across any number of tasks.
+func TestCmdRunContinueSessionCopiesLastWriter(t *testing.T) {
+	info := v1alpha1.SessionInfo{Name: "conv", Bytes: 5, LastTask: "src"}
+	get := continueSessionSource(t, info, continueTaskSource())
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue-session", "conv", "next goal"}); err != nil {
+		t.Fatalf("cmdRun: %v", err)
+	}
+	m := get()
+	if m == nil {
+		t.Fatal("no manifest posted")
+	}
+	if m.Spec.Goal != "next goal" {
+		t.Errorf("goal = %q, want the new positional goal", m.Spec.Goal)
+	}
+	if m.Spec.Image != "px-agent-debian12" || m.Spec.Model != "m1" || m.Spec.Gateway != "gw1" {
+		t.Errorf("copied spec fields: image=%q model=%q gateway=%q", m.Spec.Image, m.Spec.Model, m.Spec.Gateway)
+	}
+	if m.Spec.TTLSecondsAfterFinished != 0 {
+		t.Errorf("TTL must not survive the copy, got %d", m.Spec.TTLSecondsAfterFinished)
+	}
+	if len(m.Spec.Ports) != 0 {
+		t.Errorf("ports must not survive the copy, got %+v", m.Spec.Ports)
+	}
+	if m.Spec.Session == nil ||
+		m.Spec.Session.ContinueFrom != v1alpha1.SessionPrefix+"conv" ||
+		m.Spec.Session.Name != "conv" {
+		t.Errorf("session reference wrong: %+v", m.Spec.Session)
+	}
+	if !slices.Equal(m.Spec.Runner.Command, continueAgentCommand) {
+		t.Errorf("runner.command = %q, want the --continue variant %q", m.Spec.Runner.Command, continueAgentCommand)
+	}
+}
+
+// Both failure shapes must be loud — the alternatives are a silently fresh
+// session (no recorded writer) or an opaque 404 (writer record gone).
+func TestCmdRunContinueSessionRejectsMissingWriter(t *testing.T) {
+	continueSessionSource(t, v1alpha1.SessionInfo{Name: "conv"}, nil)
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue-session", "conv", "goal"}); err == nil {
+		t.Error("a session without a recorded writer must fail loudly")
+	}
+	continueSessionSource(t, v1alpha1.SessionInfo{Name: "conv", LastTask: "src"}, nil)
+	fs = flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue-session", "conv", "goal"}); err == nil {
+		t.Error("a session whose last writer record is gone must fail loudly")
+	}
+}
+
+func TestCmdRunContinueSessionRejectsFlagConflicts(t *testing.T) {
+	continueSessionSource(t, v1alpha1.SessionInfo{Name: "conv", LastTask: "src"}, continueTaskSource())
+
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue", "src", "-continue-session", "conv", "goal"}); err == nil {
+		t.Error("-continue and -continue-session must be exclusive")
+	}
+	fs = flag.NewFlagSet("run", flag.ContinueOnError)
+	if err := cmdRun(fs, []string{"-no-wait", "-continue-session", "conv", "-model", "m2", "goal"}); err == nil {
+		t.Error("-continue-session must reject re-specified copied fields")
+	}
+}

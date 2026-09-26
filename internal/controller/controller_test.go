@@ -267,16 +267,20 @@ type memStore struct {
 	workspaces  map[string]*v1alpha1.Workspace
 	models      map[string]*v1alpha1.Model
 	gateways    map[string]*v1alpha1.Gateway
-	sessions    map[string][]byte
+	sessions        map[string][]byte
+	sessionLast     map[string]string
+	sessionExplicit map[string]bool
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		tasks:      map[string]*v1alpha1.Task{},
-		workspaces: map[string]*v1alpha1.Workspace{},
-		models:     map[string]*v1alpha1.Model{},
-		gateways:   map[string]*v1alpha1.Gateway{},
-		sessions:   map[string][]byte{},
+		tasks:           map[string]*v1alpha1.Task{},
+		workspaces:      map[string]*v1alpha1.Workspace{},
+		models:          map[string]*v1alpha1.Model{},
+		gateways:        map[string]*v1alpha1.Gateway{},
+		sessions:        map[string][]byte{},
+		sessionLast:     map[string]string{},
+		sessionExplicit: map[string]bool{},
 	}
 }
 
@@ -290,10 +294,15 @@ func (m *memStore) GetSession(task string) ([]byte, error) {
 	return data, nil
 }
 
-func (m *memStore) SaveSession(task string, data []byte) error {
+func (m *memStore) SaveSession(name, lastTask string, data []byte, explicit bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sessions[task] = data
+	if m.sessionExplicit[name] && !explicit {
+		return fmt.Errorf("%w: session %q keeps its explicit capture", store.ErrSessionOwned, name)
+	}
+	m.sessions[name] = data
+	m.sessionLast[name] = lastTask
+	m.sessionExplicit[name] = explicit
 	return nil
 }
 
@@ -301,6 +310,17 @@ func (m *memStore) DeleteSession(task string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, task)
+	delete(m.sessionExplicit, task)
+	return nil
+}
+
+func (m *memStore) DeleteDefaultSession(task string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.sessionExplicit[task] {
+		delete(m.sessions, task)
+		delete(m.sessionExplicit, task)
+	}
 	return nil
 }
 
@@ -1954,7 +1974,7 @@ func finishedSessionSource(t *testing.T, st *memStore, name string, data []byte)
 		t.Fatal(err)
 	}
 	if data != nil {
-		if err := st.SaveSession(name, data); err != nil {
+		if err := st.SaveSession(name, name, data, false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1999,7 +2019,7 @@ func TestSessionResolveFailsToProvisionFailed(t *testing.T) {
 			if err := st.UpsertTask(src); err != nil {
 				t.Fatal(err)
 			}
-			if err := st.SaveSession("src", []byte("premature")); err != nil {
+			if err := st.SaveSession("src", "src", []byte("premature"), false); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -2026,6 +2046,153 @@ func TestSessionResolveFailsToProvisionFailed(t *testing.T) {
 				t.Fatal("no container may exist for an unresolved session source")
 			}
 		})
+	}
+}
+
+// The session:NAME form reads the capture directly and consults no task
+// record: a capture is a settled state, so a source task that is still
+// Running — or whose record is long gone — does not block the restore. This
+// is the property that lets a conversation outlive its tasks, which bare
+// task references (checked above) cannot.
+func TestSessionRefReadsNamedCaptureWithoutTaskRecord(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, restored: map[int][]byte{}}
+	// A Running task happens to share the capture's name — it must not be
+	// consulted, let alone its phase checked.
+	src := testTask(0)
+	src.Metadata.Name = "conv"
+	src.Status.Phase = v1alpha1.TaskRunning
+	src.Status.Container = 100
+	_ = st.UpsertTask(src)
+	if err := st.SaveSession("conv", "conv", []byte("conv-archive"), false); err != nil {
+		t.Fatal(err)
+	}
+
+	cont := testTask(0)
+	cont.Metadata.Name = "cont"
+	cont.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: v1alpha1.SessionPrefix + "conv"}
+	_ = st.UpsertTask(cont)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl)
+	if task := get(t, st, "cont"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !bytes.Equal(prov.session, []byte("conv-archive")) {
+		t.Fatalf("Create must receive the named capture, got %q", prov.session)
+	}
+
+	// And the source task's record disappearing changes nothing: the
+	// capture alone answers the reference.
+	if err := st.DeleteTask("conv"); err != nil {
+		t.Fatal(err)
+	}
+	cont2 := testTask(0)
+	cont2.Metadata.Name = "cont2"
+	cont2.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: v1alpha1.SessionPrefix + "conv"}
+	_ = st.UpsertTask(cont2)
+	runOnce(ctl)
+	if task := get(t, st, "cont2"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running after source record's death, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+}
+
+// A capture written under an explicit spec.session.name is user-owned: it
+// survives its writing task's deletion (that survival is the point of
+// naming). Default captures keep the M8 lifetime — they die with the task
+// record, as pinned by TestDeleteCapturesSessionBeforeDestroy.
+func TestNamedCaptureOutlivesTask(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, capturable: map[int][]byte{100: []byte("conv-archive")}}
+	named := testTask(0)
+	named.Metadata.Name = "w1"
+	named.Spec.Session = &v1alpha1.SessionSpec{Name: "conv"}
+	_ = st.UpsertTask(named)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestDestroy("w1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl)
+	if _, ok := st.tasks["w1"]; ok {
+		t.Fatal("task record should be gone after destroy")
+	}
+	if data, ok := st.sessions["conv"]; !ok || string(data) != "conv-archive" {
+		t.Fatalf("named capture must outlive the task record, got %q ok=%v", data, ok)
+	}
+}
+
+// A bare continueFrom:TASK follows the source's capture name — which is
+// spec.session.name, not the task name, when the source names its
+// conversation. The task record is still consulted (its phase gates the
+// restore, as in the M8 path); only the archive lookup must track the
+// capture name, or a named conversation is unreachable over bare refs.
+func TestBareContinueFromReadsNamedCapture(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, restored: map[int][]byte{}, capturable: map[int][]byte{100: []byte("conv-archive")}}
+	src := testTask(0)
+	src.Metadata.Name = "w1"
+	src.Spec.Session = &v1alpha1.SessionSpec{Name: "conv"}
+	_ = st.UpsertTask(src)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // -> Succeeded; the capture lands under "conv"
+	if data, ok := st.sessions["conv"]; !ok || string(data) != "conv-archive" {
+		t.Fatalf("capture must be stored under the named session, got %q ok=%v", data, ok)
+	}
+
+	cont := testTask(0)
+	cont.Metadata.Name = "cont"
+	cont.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: "w1"}
+	_ = st.UpsertTask(cont)
+	runOnce(ctl)
+	if task := get(t, st, "cont"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("want Running, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !bytes.Equal(prov.session, []byte("conv-archive")) {
+		t.Fatalf("bare ref must restore the named capture, got %q", prov.session)
+	}
+}
+
+// A default capture colliding with an explicitly owned session name is
+// dropped loudly instead of wedging the task: the write is refused, the
+// capture settles anyway (destroy and TTL cleanup proceed), the user-owned
+// row keeps its content, and the SessionSaved event names the loss.
+func TestDefaultCaptureYieldsToExplicitOwner(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}, capturable: map[int][]byte{100: []byte("conv-archive")}}
+	if err := st.SaveSession("conv", "someone", []byte("user-owned"), true); err != nil {
+		t.Fatal(err)
+	}
+	tk := testTask(60)
+	tk.Metadata.Name = "conv"
+	_ = st.UpsertTask(tk)
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	runOnce(ctl) // -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // terminal tick: the refused capture settles, nothing stored
+	task := get(t, st, "conv")
+	if task.Status.Phase != v1alpha1.TaskSucceeded {
+		t.Fatalf("want Succeeded, got %s (%s)", task.Status.Phase, task.Status.Reason)
+	}
+	if !task.Status.SessionSaved {
+		t.Fatal("the refused capture must settle, not retry forever")
+	}
+	if data, ok := st.sessions["conv"]; !ok || string(data) != "user-owned" {
+		t.Fatalf("the explicit row must keep its content, got %q ok=%v", data, ok)
+	}
+
+	ctl.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	runOnce(ctl)
+	if task := get(t, st, "conv"); task.Status.Container != 0 {
+		t.Fatalf("the settled capture must not hold the TTL cleanup open (container=%d)", task.Status.Container)
+	}
+	if data, ok := st.sessions["conv"]; !ok || string(data) != "user-owned" {
+		t.Fatalf("the explicit row must outlive its namesake task, got %q ok=%v", data, ok)
 	}
 }
 

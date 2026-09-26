@@ -52,20 +52,44 @@ type TaskSpec struct {
 	// opt-in attack surface (see docs/threat-model.md) and requires a
 	// Running container, like exec.
 	Ports []PortSpec `json:"ports,omitempty" yaml:"ports,omitempty"`
-	// Session optionally continues a previous task's agent session: the
-	// controller captures the source task's ~/.claude/projects at its
-	// container teardown and unpacks it into this task's container before
-	// the runner boots. See the controller for reference validation —
-	// unknown/unfinished/uncaptured sources fail at provision, not here.
+	// Session optionally continues a previous capture's agent session:
+	// the controller unpacks the referenced capture (a ~/.claude/projects
+	// tarball taken at the source's container teardown) into this task's
+	// container before the runner boots, and captures this task's own at
+	// teardown. See the controller for reference validation — unknown
+	// references fail at provision, not here.
 	Session *SessionSpec `json:"session,omitempty" yaml:"session,omitempty"`
 }
 
-// SessionSpec references the task whose agent session this task continues.
+// SessionSpec controls a task's relationship to named session captures:
+// where its own capture goes and which previous capture it restores.
 type SessionSpec struct {
-	// ContinueFrom names the source task: it must exist, be finished
-	// (Succeeded/Failed — ProvisionFailed never had a container), and
-	// still hold its captured session.
+	// ContinueFrom names the capture to restore before the runner boots.
+	// Two forms: a bare task name (that task must exist, be finished,
+	// and still hold its captured session — the M8 rule) or
+	// "session:NAME" for a named capture (no task record consulted; a
+	// capture is a settled state, so there is no phase to check).
 	ContinueFrom string `json:"continueFrom" yaml:"continueFrom"`
+	// Name is the session the task's own capture is stored under.
+	// Defaults to the task name, which keeps the M8 lifetime (the row
+	// dies with the task record). An explicit name is a user-owned
+	// capture: it survives the task's deletion and may be written by
+	// many tasks (last writer wins — each writes a full archive).
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
+}
+
+// SessionPrefix marks a continueFrom reference at a named capture rather
+// than a task. Names are DNS-1123, so the colon makes the two forms
+// unambiguous.
+const SessionPrefix = "session:"
+
+// SplitSessionRef classifies a continueFrom reference: session returns
+// true and name holds the capture name; otherwise name is a task name.
+func SplitSessionRef(ref string) (session bool, name string) {
+	if after, ok := strings.CutPrefix(ref, SessionPrefix); ok {
+		return true, after
+	}
+	return false, ref
 }
 
 // PortSpec publishes one TCP port: the container listens on Port, the node
@@ -368,20 +392,47 @@ func ValidatePorts(ps []PortSpec) error {
 	return nil
 }
 
-// ValidateSession checks spec.session's reference is a plausible task
-// name. Reachability (the source exists, is finished, still holds its
-// capture) is the controller's call at provision time — like Gateway,
-// an unresolvable reference resolves to ProvisionFailed rather than an
-// apply-time error, because a check that is true at apply can go stale
-// while the manifest sits in the store.
+// ValidateSession checks spec.session's reference and capture name are
+// plausible names. Reachability (the source exists, is finished, still
+// holds its capture; a session row exists) is the controller's call at
+// provision time — like Gateway, an unresolvable reference resolves to
+// ProvisionFailed rather than an apply-time error, because a check that
+// is true at apply can go stale while the manifest sits in the store.
 func ValidateSession(s *SessionSpec) error {
 	if s == nil {
 		return nil
 	}
-	if err := ValidateName(s.ContinueFrom); err != nil {
-		return fmt.Errorf("session.continueFrom: %w", err)
+	if s.ContinueFrom != "" {
+		if _, name := SplitSessionRef(s.ContinueFrom); name == "" {
+			return fmt.Errorf("session.continueFrom %q: empty name after %q", s.ContinueFrom, SessionPrefix)
+		} else if err := ValidateName(name); err != nil {
+			return fmt.Errorf("session.continueFrom: %w", err)
+		}
+	}
+	if s.Name != "" {
+		if err := ValidateName(s.Name); err != nil {
+			return fmt.Errorf("session.name: %w", err)
+		}
 	}
 	return nil
+}
+
+// CaptureName returns the session name a task's capture is stored under:
+// its explicit spec.session.name, or the task name (the M8 default).
+func (s *SessionSpec) CaptureName(task string) string {
+	if s != nil && s.Name != "" {
+		return s.Name
+	}
+	return task
+}
+
+// SessionInfo is the metadata form of a named capture. The archive
+// itself is never served over the API; this is all a listing needs.
+type SessionInfo struct {
+	Name     string    `json:"name" yaml:"name"`
+	Bytes    int       `json:"bytes" yaml:"bytes"`
+	LastTask string    `json:"lastTask,omitempty" yaml:"lastTask,omitempty"`
+	WrittenAt time.Time `json:"writtenAt,omitempty" yaml:"writtenAt,omitempty"`
 }
 
 // ClaimedHostPorts maps every node port claimed by a task other than

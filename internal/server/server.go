@@ -59,6 +59,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/gateways/{name}", s.handleGetGateway)
 	mux.HandleFunc("DELETE /v1/gateways/{name}", s.handleDeleteGateway)
 	mux.HandleFunc("GET /v1/templates", s.handleListTemplates)
+	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
+	mux.HandleFunc("GET /v1/sessions/{name}", s.handleGetSession)
+	mux.HandleFunc("DELETE /v1/sessions/{name}", s.handleDeleteSession)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -543,6 +546,54 @@ func (s *Server) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// Sessions are capture metadata only — the archive itself is never served
+// (it is runner-internal tarred JSONL, and the API's largest payload for no
+// caller). Deleting a session drops only the row; tasks that restored it
+// keep their unpacked copy, and future references to the name fail to
+// resolve at provision time.
+func (s *Server) handleListSessions(w http.ResponseWriter, _ *http.Request) {
+	sessions, err := s.store.ListSessions()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if sessions == nil {
+		sessions = []v1alpha1.SessionInfo{}
+	}
+	writeJSON(w, http.StatusOK, sessions)
+}
+
+func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	info, err := s.store.GetSessionInfo(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	// DeleteSession is idempotent by contract (the task-destroy path drops
+	// rows unconditionally), so the 404 check happens here.
+	if _, err := s.store.GetSessionInfo(name); errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "session not found")
+		return
+	} else if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if err := s.store.DeleteSession(name); err != nil {
 		httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}

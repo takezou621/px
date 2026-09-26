@@ -144,6 +144,14 @@ func (s *Server) metricsText() (string, error) {
 	b.WriteString("# TYPE px_events gauge\n")
 	fmt.Fprintf(&b, "px_events %d\n", n)
 
+	ns, err := s.store.CountSessions()
+	if err != nil {
+		return "", err
+	}
+	b.WriteString("# HELP px_sessions Stored session captures (named or task-scoped).\n")
+	b.WriteString("# TYPE px_sessions gauge\n")
+	fmt.Fprintf(&b, "px_sessions %d\n", ns)
+
 	nb, err := s.store.SessionBytesTotal()
 	if err != nil {
 		return "", err

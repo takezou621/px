@@ -96,3 +96,56 @@ func TestClaimedHostPorts(t *testing.T) {
 		t.Error("unrelated claim dropped by exclude")
 	}
 }
+
+func TestSplitSessionRef(t *testing.T) {
+	if session, name := SplitSessionRef("task-a"); session || name != "task-a" {
+		t.Errorf("bare task ref: got (%v, %q)", session, name)
+	}
+	if session, name := SplitSessionRef("session:conv"); !session || name != "conv" {
+		t.Errorf("session ref: got (%v, %q)", session, name)
+	}
+	// The prefix only reads as a prefix at the front: a task named
+	// "session-conv" is a task, not a session.
+	if session, name := SplitSessionRef("session-conv"); session || name != "session-conv" {
+		t.Errorf("hyphenated task name: got (%v, %q)", session, name)
+	}
+}
+
+func TestValidateSession(t *testing.T) {
+	ok := []*SessionSpec{
+		nil,
+		{},
+		{ContinueFrom: "task-a"},
+		{ContinueFrom: "session:conv"},
+		{Name: "conv"},
+		{Name: "conv", ContinueFrom: "session:conv"},
+	}
+	for i, s := range ok {
+		if err := ValidateSession(s); err != nil {
+			t.Errorf("case %d (%+v): unexpected error: %v", i, s, err)
+		}
+	}
+	bad := []*SessionSpec{
+		{ContinueFrom: "session:"},
+		{ContinueFrom: "session:Bad_Name"},
+		{ContinueFrom: "Bad"},
+		{Name: "Bad Name"},
+	}
+	for i, s := range bad {
+		if err := ValidateSession(s); err == nil {
+			t.Errorf("case %d (%+v): want error, got nil", i, s)
+		}
+	}
+}
+
+func TestCaptureName(t *testing.T) {
+	if got := (*SessionSpec)(nil).CaptureName("t1"); got != "t1" {
+		t.Errorf("nil spec: got %q, want task name", got)
+	}
+	if got := (&SessionSpec{}).CaptureName("t1"); got != "t1" {
+		t.Errorf("empty spec: got %q, want task name", got)
+	}
+	if got := (&SessionSpec{Name: "conv"}).CaptureName("t1"); got != "conv" {
+		t.Errorf("explicit name: got %q, want %q", got, "conv")
+	}
+}

@@ -233,6 +233,94 @@ node, when the session was captured. Scope:
 Explicitly out: distributed tracing, log aggregation, events in `px
 watch`, a Prometheus client dependency.
 
+## M11 — Named sessions
+
+Chosen 2026-09-26 after M10 (candidates: named sessions, scheduled
+tasks, quota/limits, capture streaming). M8 explicitly out'd Session
+resources with "revisit if divergence matters" — divergence does matter
+in one real place: a `--continue` chain dies with its newest task's
+record. The capture lives in the sessions table under the source task's
+name and delete drops the row, so no old task can be cleaned while its
+conversation still matters, and a weeks-long workflow leaves behind a
+trail of chain-link tasks that must all stay. The fix decided here is
+NOT a Session resource: the four primitives stay (ax compatibility is a
+design axis), and the sessions table grows into a namespace of named
+captures instead.
+
+Design decisions:
+
+- `spec.session.name` (new, optional): the capture destination.
+  Default is the task's own name — exactly today's behavior. A default
+  row keeps its current lifetime (dies with the task record); an
+  explicitly named row survives task deletion, because its lifetime is
+  the user's. Rows carry an `explicit` flag, and the user-owned rows
+  are shielded from an unlucky task name: the task-lifetime cleanups
+  only ever touch explicit=0 rows, and a default capture colliding with
+  an explicitly named one is refused (ErrSessionOwned) — the controller
+  drops the write loudly (a SessionSaved event names the loss) instead
+  of clobbering the user's row, and the task still finishes. Many tasks
+  may write the same explicit name; the upsert converges
+  last-writer-wins, which for sessions means "the newest full state of
+  the conversation". No merge is attempted.
+- `continueFrom` gains the `session:NAME` form: restore directly from
+  a named capture, with no task record consulted. A capture is a
+  settled state, unlike a task, so there is no phase to check; a
+  missing row is a ProvisionFailed, like today's uncaptured source.
+  The `session:` prefix cannot collide with task names (DNS-1123), and
+  a bare `continueFrom` stays task-scoped (phase-checked, resolved
+  under the source's capture name — spec.session.name when it names
+  one), so M8 manifests keep meaning exactly what they meant.
+- The sessions table grows `last_task` (who wrote the capture last —
+  feeds `describe` and the CLI sugar below; nothing resolves through it
+  at provision time) and `explicit` (the user-owned flag above). Both
+  are ALTER TABLE'd in with a backfill that keeps pre-existing rows
+  exactly where they were (`last_task = task`, `explicit = 0`), and the
+  backfill runs idempotently on every open, so a crash between ALTER
+  and backfill heals instead of skipping. The pre-existing `created_at`
+  (SQLite `datetime('now')`, UTC) is the written-at shown to users, so
+  a resave moves it — the last writer's time, not the first capture's.
+- API: `GET /v1/sessions` (metadata only — name, bytes, last task,
+  written-at), `GET /v1/sessions/{name}`, `DELETE /v1/sessions/{name}`.
+  The archive itself is never served: it is a tar of runner-internal
+  JSONL, not a user-facing artifact, and it would be the largest
+  payload the API can return for no caller. Deleting a session drops
+  only the row.
+- CLI: `px get sessions`, `px describe session NAME` (plus the tasks
+  that reference it, resolved against the live task list), `px delete
+  session NAME`, and `px run --continue-session NAME "goal"` — the
+  counterpart of `--continue` for a conversation outliving its tasks:
+  it copies the last writer's spec (the copy is the point, same flag
+  rules), sets `continueFrom: session:NAME`, and sets
+  `spec.session.name: NAME` so the capture returns to the same name —
+  one conversation, one name. If the last writer's record is gone the
+  sugar fails loudly; a hand-written manifest with `spec.session` is
+  the fallback.
+- Validation: `spec.session.name` is a validated name; it may equal the
+  task's own name (same row either way).
+- Metrics/events: a `px_sessions` gauge (row count) joins
+  `px_sessions_bytes`; SessionSaved event messages name the
+  destination session.
+
+Explicitly out: merge or diff between captures, versioned session
+history beyond the newest state, a Session kind in the manifest API
+(rejected — a capture is produced by a task and never applied by a
+user, so it has no spec and a resource shape would be a lie), serving
+the archive over the API.
+
+- [x] `spec.session.name` + validation; capture writes there (default
+  = task name); explicit rows survive task delete
+- [x] `continueFrom: session:NAME` resolution (no phase check, missing
+  row is ProvisionFailed)
+- [x] store: `last_task` migration + backfill, ListSessions
+- [x] sessions API endpoints; `px get/describe/delete session`
+- [x] `px run --continue-session`
+- [x] `px_sessions` gauge; SessionSaved message names the session
+- [x] Unit tests: migration/backfill, named-capture lifetime,
+  session:NAME resolution matrix, endpoint surface, CLI sugar rules
+- [ ] E2E on the real node (scripts/e2e-sessions.sh): a named capture
+  surviving its task's delete, `--continue-session` twice against the
+  same name, describe showing the references, delete session
+
 ## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,

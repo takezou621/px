@@ -159,26 +159,38 @@ func cmdRun(fs *flag.FlagSet, args []string) error {
 	memory := fs.Int("memory", 0, "memory MB (0 = template default)")
 	noWait := fs.Bool("no-wait", false, "return immediately after apply")
 	continueFrom := fs.String("continue", "", "continue the finished task NAME's agent session, copying its spec")
+	continueSession := fs.String("continue-session", "", "continue named session NAME's conversation, copying the last writer's spec; the capture returns to NAME")
 	flags, cmd := splitRunArgs(args)
 	if err := fs.Parse(flags); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return fmt.Errorf("usage: px run GOAL [-model NAME] [-workspace NAME[=GOAL]]... [-gateway NAME] [-continue TASK] [-- COMMAND...]")
+		return fmt.Errorf("usage: px run GOAL [-model NAME] [-workspace NAME[=GOAL]]... [-gateway NAME] [-continue TASK] [-continue-session NAME] [-- COMMAND...]")
 	}
 	if len(rest) > 1 {
 		return fmt.Errorf("unexpected arguments after the goal: %q (quote the goal; flags must precede it)", rest[1:])
 	}
 	goal := rest[0]
+	if *continueFrom != "" && *continueSession != "" {
+		return fmt.Errorf("-continue and -continue-session are exclusive")
+	}
 
-	// -continue copies these from the source spec, so re-specifying one is
-	// a contradiction rather than an override. Detection uses flag.Visit —
-	// only flags the user actually set — so "-cores 0" is a rejection too,
-	// not a silent no-op the copy would clobber. Name and TTL stay local by
-	// design (a new task may well want a different TTL).
+	// Both -continue forms copy these from the source spec, so
+	// re-specifying one is a contradiction rather than an override.
+	// Detection uses flag.Visit — only flags the user actually set — so
+	// "-cores 0" is a rejection too, not a silent no-op the copy would
+	// clobber. Name and TTL stay local by design (a new task may well
+	// want a different TTL).
+	contTask, contSession := "", ""
+	switch {
+	case *continueFrom != "":
+		contTask = *continueFrom
+	case *continueSession != "":
+		contSession = *continueSession
+	}
 	var src *v1alpha1.Task
-	if *continueFrom != "" {
+	if contTask != "" || contSession != "" {
 		copied := map[string]bool{"image": true, "model": true, "workspace": true, "gateway": true, "cores": true, "memory": true}
 		overridden := make([]string, 0, 7)
 		fs.Visit(func(f *flag.Flag) {
@@ -190,11 +202,25 @@ func cmdRun(fs *flag.FlagSet, args []string) error {
 			overridden = append(overridden, "-- COMMAND")
 		}
 		if len(overridden) > 0 {
-			return fmt.Errorf("-continue already copies image, model, gateway, workspaces and resources from task %s; drop %s",
-				*continueFrom, strings.Join(overridden, ", "))
+			return fmt.Errorf("-continue already copies image, model, gateway, workspaces and resources from the source; drop %s",
+				strings.Join(overridden, ", "))
 		}
-		if err := doJSON(http.MethodGet, "/v1/tasks/"+*continueFrom, nil, &src); err != nil {
-			return fmt.Errorf("read task %s to continue: %w", *continueFrom, err)
+		if contTask != "" {
+			if err := doJSON(http.MethodGet, "/v1/tasks/"+contTask, nil, &src); err != nil {
+				return fmt.Errorf("read task %s to continue: %w", contTask, err)
+			}
+		} else {
+			var info v1alpha1.SessionInfo
+			if err := doJSON(http.MethodGet, "/v1/sessions/"+contSession, nil, &info); err != nil {
+				return fmt.Errorf("read session %s to continue: %w", contSession, err)
+			}
+			if info.LastTask == "" {
+				return fmt.Errorf("session %s has no recorded writer; apply a manifest with spec.session {continueFrom: session:%s, name: %s} to continue it", contSession, contSession, contSession)
+			}
+			if err := doJSON(http.MethodGet, "/v1/tasks/"+info.LastTask, nil, &src); err != nil {
+				return fmt.Errorf("session %s was last written by task %s, whose record is gone; apply a manifest with spec.session {continueFrom: session:%s, name: %s} to continue it",
+					contSession, info.LastTask, contSession, contSession)
+			}
 		}
 	}
 
@@ -235,7 +261,14 @@ func cmdRun(fs *flag.FlagSet, args []string) error {
 		t.Spec.Goal = goal
 		t.Spec.TTLSecondsAfterFinished = ttl
 		t.Spec.Ports = nil
-		t.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: *continueFrom}
+		if contTask != "" {
+			t.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: contTask}
+		} else {
+			// Continue the named capture and write the next one back under
+			// the same name: the conversation keeps one name for its life,
+			// independent of how many tasks take turns writing it.
+			t.Spec.Session = &v1alpha1.SessionSpec{ContinueFrom: v1alpha1.SessionPrefix + contSession, Name: contSession}
+		}
 		if slices.Equal(t.Spec.Runner.Command, defaultAgentCommand) {
 			t.Spec.Runner.Command = continueAgentCommand
 		}
@@ -347,7 +380,7 @@ func taskLogs(name string) (out string, blocked bool, err error) {
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions")
 	}
 	switch args[0] {
 	case "tasks":
@@ -447,8 +480,29 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 			fmt.Printf("%-28s %-8d %-12s %-6t %s\n", t.Name, t.VMID, t.Node, t.PxOK, missing)
 		}
 		return nil
+	case "sessions":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		var sessions []v1alpha1.SessionInfo
+		if err := doJSON(http.MethodGet, "/v1/sessions", nil, &sessions); err != nil {
+			return err
+		}
+		fmt.Printf("%-24s %-12s %-24s %s\n", "NAME", "BYTES", "LAST-TASK", "WRITTEN")
+		for _, s := range sessions {
+			lt := s.LastTask
+			if lt == "" {
+				lt = "-"
+			}
+			written := "-"
+			if !s.WrittenAt.IsZero() {
+				written = age(&s.WrittenAt)
+			}
+			fmt.Printf("%-24s %-12d %-24s %s\n", s.Name, s.Bytes, lt, written)
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions")
 	}
 }
 
@@ -477,13 +531,13 @@ func popName(args []string) (string, []string, error) {
 
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	kind := "task" // bare NAME is treated as a task
-	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway" || args[0] == "template") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway" || args[0] == "template" || args[0] == "session") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME | describe template NAME")
+		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME | describe template NAME | describe session NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -556,6 +610,30 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 				nodeName, strings.Join(at, ", "))
 		}
 		printJSONIndent(matches[0])
+	case "session":
+		var info v1alpha1.SessionInfo
+		if err := doJSON(http.MethodGet, "/v1/sessions/"+name, nil, &info); err != nil {
+			return err
+		}
+		printJSONIndent(info)
+		// Which live tasks would restore this capture — the naming
+		// half of "one conversation, many tasks". Best-effort like the
+		// task describe's Events section.
+		var tasks []*v1alpha1.Task
+		if err := doJSON(http.MethodGet, "/v1/tasks", nil, &tasks); err == nil {
+			var refs []*v1alpha1.Task
+			for _, t := range tasks {
+				if t.Spec.Session != nil && t.Spec.Session.ContinueFrom == v1alpha1.SessionPrefix+name {
+					refs = append(refs, t)
+				}
+			}
+			if len(refs) > 0 {
+				fmt.Println("\nReferenced by:")
+				for _, t := range refs {
+					fmt.Printf("  %-24s %-16s\n", t.Metadata.Name, t.Status.Phase)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -681,13 +759,13 @@ func cmdExec(fs *flag.FlagSet, args []string) error {
 
 func cmdDelete(fs *flag.FlagSet, args []string) error {
 	kind := "task"
-	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway" || args[0] == "workspace") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway" || args[0] == "workspace" || args[0] == "session") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME | delete workspace NAME")
+		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME | delete workspace NAME | delete session NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -717,6 +795,12 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		fmt.Printf("workspace.px.io/%s deleted\n", name)
+	case "session":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/sessions/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("session.px.io/%s deleted\n", name)
 	}
 	return nil
 }

@@ -1035,6 +1035,58 @@ func TestEventsFeedLimit(t *testing.T) {
 	}
 }
 
+// The sessions endpoints serve capture metadata only — the archive itself
+// has no caller and would be the payload king. DELETE's idempotence lives
+// in the store, so the endpoint front-checks 404 rather than reporting a
+// fake success.
+func TestSessionsEndpoints(t *testing.T) {
+	ts, st, _, _ := newObsServer(t)
+
+	// An empty registry must read as [], not null.
+	body := getBody(t, ts, "/v1/sessions")
+	if strings.TrimSpace(body) != "[]" {
+		t.Fatalf("want [], got %s", body)
+	}
+	if code, _ := getStatus(t, ts, "/v1/sessions/nope"); code != http.StatusNotFound {
+		t.Fatalf("unknown session get: want 404, got %d", code)
+	}
+	delCode, _, err := request(t, ts, http.MethodDelete, "/v1/sessions/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delCode != http.StatusNotFound {
+		t.Fatalf("unknown session delete: want 404, got %d", delCode)
+	}
+
+	if err := st.SaveSession("conv", "w1", []byte("0123456789"), false); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := getStatus(t, ts, "/v1/sessions/conv"); code != http.StatusOK {
+		t.Fatalf("known session: want 200, got %d", code)
+	}
+	var info v1alpha1.SessionInfo
+	if err := json.Unmarshal([]byte(getBody(t, ts, "/v1/sessions/conv")), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "conv" || info.LastTask != "w1" || info.Bytes != 10 {
+		t.Fatalf("info wrong: %+v", info)
+	}
+
+	delCode, delBody, err := request(t, ts, http.MethodDelete, "/v1/sessions/conv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delCode != http.StatusOK || !strings.Contains(delBody, "deleted") {
+		t.Fatalf("delete: got %d %s", delCode, delBody)
+	}
+	if code, _ := getStatus(t, ts, "/v1/sessions/conv"); code != http.StatusNotFound {
+		t.Fatalf("after delete: want 404, got %d", code)
+	}
+	if code, _ := getStatus(t, ts, "/v1/sessions"); code != http.StatusOK {
+		t.Fatalf("list after delete: want 200, got %d", code)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	ts, _, _, ctl := newObsServer(t)
 
@@ -1089,6 +1141,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(out, "px_events ") {
 		t.Fatalf("px_events gauge missing:\n%s", out)
 	}
+	if !strings.Contains(out, "px_sessions ") || !strings.Contains(out, "px_sessions_bytes ") {
+		t.Fatalf("session gauges missing:\n%s", out)
+	}
 }
 
 // A server built without a Metrics (px-server wires it, but nothing in New
@@ -1141,6 +1196,21 @@ func getStatus(t *testing.T, ts *httptest.Server, path string) (int, string) {
 	defer res.Body.Close()
 	data, _ := io.ReadAll(res.Body)
 	return res.StatusCode, string(data)
+}
+
+// request is getStatus for non-GET methods.
+func request(t *testing.T, ts *httptest.Server, method, path string) (int, string, error) {
+	req, err := http.NewRequest(method, ts.URL+path, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(data), nil
 }
 
 // storeBytes backs px_store_bytes: empty path or no database file on disk

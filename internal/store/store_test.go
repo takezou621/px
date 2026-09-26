@@ -2,10 +2,13 @@ package store
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"os"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 )
@@ -377,7 +380,7 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("want ErrNotFound before save, got %v", err)
 	}
 	archive := []byte("tar.gz-archive-bytes")
-	if err := st.SaveSession("t1", archive); err != nil {
+	if err := st.SaveSession("t1", "t1", archive, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetSession("t1")
@@ -390,7 +393,7 @@ func TestSessionLifecycle(t *testing.T) {
 
 	// Resaving replaces the blob (a retried capture overwrites nothing).
 	replaced := []byte("second-capture")
-	if err := st.SaveSession("t1", replaced); err != nil {
+	if err := st.SaveSession("t1", "t1", replaced, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err = st.GetSession("t1")
@@ -415,7 +418,7 @@ func TestSessionLifecycle(t *testing.T) {
 	// "the source ran, there was nothing to capture" — distinct from a
 	// missing row. (The controller only saves non-empty captures today, so
 	// this pins the store contract, not a path it drives.)
-	if err := st.SaveSession("empty", []byte{}); err != nil {
+	if err := st.SaveSession("empty", "empty", []byte{}, false); err != nil {
 		t.Fatal(err)
 	}
 	got, err = st.GetSession("empty")
@@ -434,7 +437,7 @@ func TestCreateTaskClearsStaleSessionRow(t *testing.T) {
 	if err := st.CreateTask(testTask("t1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveSession("t1", []byte("stale")); err != nil {
+	if err := st.SaveSession("t1", "t1", []byte("stale"), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.DeleteTask("t1"); err != nil {
@@ -445,6 +448,71 @@ func TestCreateTaskClearsStaleSessionRow(t *testing.T) {
 	}
 	if _, err := st.GetSession("t1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a fresh record must clear the stale session row, got %v", err)
+	}
+}
+
+// A capture under an explicit spec.session.name is user-owned. A default
+// (task-named) capture colliding with that name — from a task that happens
+// to share it — must not overwrite or delete the row: the write is refused
+// (ErrSessionOwned), the task-lifetime cleanups skip it, and only
+// DeleteSession drops it. Without this, `px run -name conv` could silently
+// clobber a user's named conversation.
+func TestExplicitSessionOwnership(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.SaveSession("conv", "w1", []byte("named-capture"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// The writer's deletion (DeleteDefaultSession) must not touch it.
+	if err := st.DeleteDefaultSession("conv"); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := st.GetSession("conv"); err != nil || string(data) != "named-capture" {
+		t.Fatalf("explicit capture must survive the default cleanup, got %q err=%v", data, err)
+	}
+
+	// A same-named task's stale clear (CreateTask) must not touch it either.
+	if err := st.CreateTask(testTask("conv")); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := st.GetSession("conv"); err != nil || string(data) != "named-capture" {
+		t.Fatalf("explicit capture must survive a same-named task's creation, got %q err=%v", data, err)
+	}
+
+	// And that task's own default capture must not overwrite the row.
+	err := st.SaveSession("conv", "conv", []byte("default-capture"), false)
+	if !errors.Is(err, ErrSessionOwned) {
+		t.Fatalf("default write onto an explicit capture: want ErrSessionOwned, got %v", err)
+	}
+	if data, err := st.GetSession("conv"); err != nil || string(data) != "named-capture" {
+		t.Fatalf("refused write must not touch the row, got %q err=%v", data, err)
+	}
+
+	// An explicit writer may still update the row (several tasks may write
+	// one named conversation), and DeleteSession drops it on request.
+	if err := st.SaveSession("conv", "w2", []byte("named-capture-v2"), true); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := st.GetSession("conv"); err != nil || string(data) != "named-capture-v2" {
+		t.Fatalf("explicit resave must replace, got %q err=%v", data, err)
+	}
+	if err := st.DeleteSession("conv"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteSession must drop the explicit row, got %v", err)
+	}
+
+	// Sanity: the default path still works for rows that are not explicit.
+	if err := st.SaveSession("conv", "conv", []byte("default-now"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteDefaultSession("conv"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession("conv"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteDefaultSession must clear default rows, got %v", err)
 	}
 }
 
@@ -557,13 +625,181 @@ func TestSessionBytesTotal(t *testing.T) {
 	if n, err := st.SessionBytesTotal(); err != nil || n != 0 {
 		t.Fatalf("empty store: got %d err=%v, want 0", n, err)
 	}
-	if err := st.SaveSession("t1", []byte("12345")); err != nil {
+	if err := st.SaveSession("t1", "t1", []byte("12345"), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveSession("t2", []byte("abc")); err != nil {
+	if err := st.SaveSession("t2", "t2", []byte("abc"), false); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := st.SessionBytesTotal(); err != nil || n != 8 {
 		t.Fatalf("got %d err=%v, want 8", n, err)
+	}
+}
+
+// Sessions grew a last_task column in M11. An M8-era database file has the
+// old three-column sessions table, so reopening it must add the columns and
+// backfill the rows — those captures were keyed by their writing task's
+// name, so last_task reads back as that name, and they stay default
+// captures (explicit=0), dying with their tasks as they always did.
+func TestSessionsMigrationBackfillsLastTask(t *testing.T) {
+	path := t.TempDir() + "/px.db"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE sessions (
+		task TEXT PRIMARY KEY,
+		data BLOB NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (task, data) VALUES ('m8task', ?)`, []byte("old-capture")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	info, err := st.GetSessionInfo("m8task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "m8task" || info.LastTask != "m8task" || info.Bytes != len("old-capture") {
+		t.Fatalf("backfill wrong: %+v", info)
+	}
+
+	var explicit int
+	if err := st.db.QueryRow(`SELECT explicit FROM sessions WHERE task = 'm8task'`).Scan(&explicit); err != nil {
+		t.Fatal(err)
+	}
+	if explicit != 0 {
+		t.Fatalf("migrated rows must be default captures, explicit=%d", explicit)
+	}
+	if err := st.DeleteDefaultSession("m8task"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSession("m8task"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("migrated rows must clear with the task lifetime, got %v", err)
+	}
+
+	// And the migrated schema still writes.
+	if err := st.SaveSession("m8task", "newer", []byte("again"), false); err != nil {
+		t.Fatal(err)
+	}
+	info, err = st.GetSessionInfo("m8task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LastTask != "newer" {
+		t.Fatalf("post-migration write lost lastTask: %+v", info)
+	}
+}
+
+// GetSessionInfo and ListSessions back the sessions API and the CLI: the
+// metadata rows must carry the writing task, and a second writer under the
+// same name must move lastTask (last-writer-wins is the contract).
+func TestSessionInfoListAndCount(t *testing.T) {
+	st := openTestStore(t)
+
+	sessions, err := st.ListSessions()
+	if err != nil || len(sessions) != 0 {
+		t.Fatalf("empty store: got %+v err=%v", sessions, err)
+	}
+	if _, err := st.GetSessionInfo("nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown session: want ErrNotFound, got %v", err)
+	}
+
+	if err := st.SaveSession("one", "writer-a", []byte("aaaa"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSession("two", "writer-b", []byte("bb"), false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := st.GetSessionInfo("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "one" || info.LastTask != "writer-a" || info.Bytes != 4 {
+		t.Fatalf("info wrong: %+v", info)
+	}
+	if info.WrittenAt.IsZero() {
+		t.Fatalf("WrittenAt must be set, got %+v", info)
+	}
+
+	sessions, err = st.ListSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 || sessions[0].Name != "one" || sessions[1].Name != "two" {
+		t.Fatalf("list wrong: %+v", sessions)
+	}
+
+	// The same-named capture rewritten by a different task: bytes move and
+	// lastTask follows the writer, the row itself is not duplicated.
+	if err := st.SaveSession("one", "writer-c", []byte("cccccc"), false); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err = st.ListSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("a named rewrite must upsert, got %+v", sessions)
+	}
+	info, err = st.GetSessionInfo("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LastTask != "writer-c" || info.Bytes != 6 {
+		t.Fatalf("last writer must win: %+v", info)
+	}
+
+	if n, err := st.CountSessions(); err != nil || n != 2 {
+		t.Fatalf("count: got %d err=%v, want 2", n, err)
+	}
+}
+
+// The CLI shows a capture's written-at as the last writer's time, so a
+// resave must move the timestamp — an upsert that kept the first capture's
+// time would show a stale conversation as fresh.
+func TestSessionResaveMovesWrittenAt(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.SaveSession("t1", "w1", []byte("first"), false); err != nil {
+		t.Fatal(err)
+	}
+	// Rewind the stored time to prove the next save moves it forward
+	// (datetime('now') keeps second precision, so an immediate resave
+	// would otherwise land on the same second).
+	if _, err := st.db.Exec(`UPDATE sessions SET created_at = '2000-01-01 00:00:00' WHERE task = 't1'`); err != nil {
+		t.Fatal(err)
+	}
+	info, err := st.GetSessionInfo("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.WrittenAt.Equal(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("rewind failed, got %v", info.WrittenAt)
+	}
+
+	if err := st.SaveSession("t1", "w2", []byte("second"), false); err != nil {
+		t.Fatal(err)
+	}
+	info, err = st.GetSessionInfo("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LastTask != "w2" {
+		t.Fatalf("resave lost lastTask: %+v", info)
+	}
+	if !info.WrittenAt.After(time.Now().Add(-time.Minute)) {
+		t.Fatalf("resave must move written-at forward, got %v", info.WrittenAt)
 	}
 }

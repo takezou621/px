@@ -20,6 +20,7 @@ var (
 	ErrNotFound      = errors.New("not found")
 	ErrExists        = errors.New("already exists")
 	ErrPhaseConflict = errors.New("task phase changed since it was read")
+	ErrSessionOwned  = errors.New("session is owned by an explicitly named capture")
 )
 
 // executor is the subset of *sql.DB and *sql.Tx the store needs, so InTx can
@@ -65,6 +66,8 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS sessions (
 			task TEXT PRIMARY KEY,
 			data BLOB NOT NULL,
+			last_task TEXT NOT NULL DEFAULT '',
+			explicit INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS events (
@@ -79,6 +82,55 @@ func Open(path string) (*Store, error) {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
+	}
+	// M11: sessions grew two columns. last_task records who wrote the
+	// capture last (feeds --continue-session's spec lookup); explicit
+	// marks captures saved under a user-named spec.session.name — those
+	// are user-owned and survive both their writing task's deletion and
+	// the stale-row cleanup below. CREATE TABLE above only covers fresh
+	// databases, so an older file gets the columns added here. Each
+	// backfill is re-run on every open (empty last_task only ever means
+	// a pre-M11 row): a crash between ALTER and backfill then repairs
+	// itself on the next start instead of shipping blank metadata.
+	rows, err := db.Query(`PRAGMA table_info(sessions)`)
+	if err != nil {
+		return nil, fmt.Errorf("migrate: inspect sessions: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("migrate: scan sessions schema: %w", err)
+		}
+		have[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("migrate: inspect sessions: %w", err)
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"last_task", `ALTER TABLE sessions ADD COLUMN last_task TEXT NOT NULL DEFAULT ''`},
+		{"explicit", `ALTER TABLE sessions ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if have[col.name] {
+			continue
+		}
+		if _, err := db.Exec(col.ddl); err != nil {
+			// Another opener of the same file can have raced us past the
+			// PRAGMA check — SQLite serializes the ALTER, so "duplicate
+			// column" means the work is already done, not a failure.
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return nil, fmt.Errorf("migrate: add sessions.%s: %w", col.name, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE sessions SET last_task = task WHERE last_task = ''`); err != nil {
+		return nil, fmt.Errorf("migrate: backfill sessions.last_task: %w", err)
 	}
 	// The database holds Model API keys in plaintext, so it is a credential
 	// store: enforce 0600 regardless of the umask that created it. The WAL
@@ -195,11 +247,12 @@ func (s *Store) CreateTask(t *v1alpha1.Task) error {
 	if err != nil {
 		return err
 	}
-	// A fresh record invalidates any session row a same-named predecessor
-	// could have left behind (a DeleteSession that failed mid-destroy):
-	// without this, a later continueFrom on that name would silently
-	// restore a dead task's session.
-	if _, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, t.Metadata.Name); err != nil {
+	// A fresh record invalidates any default-lifetime session row a
+	// same-named predecessor could have left behind (a DeleteSession that
+	// failed mid-destroy): without this, a later continueFrom on that name
+	// would silently restore a dead task's session. Explicitly named rows
+	// are user-owned and outlive tasks, so they are left alone.
+	if _, err := s.db.Exec(`DELETE FROM sessions WHERE task = ? AND explicit = 0`, t.Metadata.Name); err != nil {
 		return fmt.Errorf("clear stale session row for %s: %w", t.Metadata.Name, err)
 	}
 	// Same shape as the session row above: a predecessor's orphaned events
@@ -384,23 +437,42 @@ func (s *Store) DeleteGateway(name string) error {
 	return nil
 }
 
-// SaveSession stores one task's captured session archive. Upsert by
-// design: a capture retried after a partial write replaces the row, and
-// a task owns at most one session — resaving with different content
-// means the first capture was never settled, so last-writer-wins is the
-// safe convergence.
-func (s *Store) SaveSession(task string, data []byte) error {
-	_, err := s.db.Exec(`INSERT INTO sessions (task, data) VALUES (?, ?)
-		ON CONFLICT(task) DO UPDATE SET data=excluded.data`, task, data)
-	return err
+// SaveSession stores one captured session archive. Upsert by design: a
+// capture retried after a partial write replaces the row, and a capture is
+// a full snapshot — resaving with different content means the first capture
+// was never settled, so last-writer-wins is the safe convergence.
+// lastTask records the writer — the CLI's --continue-session sugar copies
+// its spec. explicit marks a capture saved under a user-named
+// spec.session.name: the row is user-owned, so a default (task-named)
+// capture colliding with that name neither overwrites nor deletes it —
+// such a write returns ErrSessionOwned instead — while only DeleteSession
+// drops the row, never the task-lifetime cleanups (which target
+// explicit=0 rows). The row key is the capture name (the task's
+// spec.session.name, defaulting to the task name), so the parameter reads
+// name even though the column is still "task" from the M8 schema. On an
+// update the timestamp moves forward so the CLI shows the last writer's
+// time, not the first capture's.
+func (s *Store) SaveSession(name, lastTask string, data []byte, explicit bool) error {
+	res, err := s.db.Exec(`INSERT INTO sessions (task, data, last_task, explicit) VALUES (?, ?, ?, ?)
+		ON CONFLICT(task) DO UPDATE SET data=excluded.data, last_task=excluded.last_task, explicit=excluded.explicit, created_at=datetime('now')
+		WHERE sessions.explicit = 0 OR excluded.explicit = 1`,
+		name, data, lastTask, explicit)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: session %q keeps its explicit capture", ErrSessionOwned, name)
+	}
+	return nil
 }
 
-// GetSession returns the captured archive for a task, or ErrNotFound
-// when the task never captured one (or its row was dropped with the
-// task).
-func (s *Store) GetSession(task string) ([]byte, error) {
+// GetSession returns the named capture's archive, or ErrNotFound when no
+// row carries that name. The name is the capture's key: for the M8
+// default it is the writing task's name, for an explicit
+// spec.session.name it is that name.
+func (s *Store) GetSession(name string) ([]byte, error) {
 	var data []byte
-	err := s.db.QueryRow(`SELECT data FROM sessions WHERE task = ?`, task).Scan(&data)
+	err := s.db.QueryRow(`SELECT data FROM sessions WHERE task = ?`, name).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -410,12 +482,76 @@ func (s *Store) GetSession(task string) ([]byte, error) {
 	return data, nil
 }
 
-// DeleteSession drops a task's session row. Idempotent: deleting an
-// already-absent row succeeds, so the task-destroy path can drop it
-// unconditionally.
-func (s *Store) DeleteSession(task string) error {
-	_, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, task)
+// DeleteSession drops a capture row by name — whichever lifetime it has.
+// Idempotent, so both the px delete session path and the task-destroy path
+// can call it unconditionally.
+func (s *Store) DeleteSession(name string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, name)
 	return err
+}
+
+// DeleteDefaultSession drops the capture row a task's own name keys — the
+// M8 default lifetime, where the row dies with the task record. Explicitly
+// named rows (explicit=1) survive, and so does an explicit row that happens
+// to share the task's name: the name collision must not turn one task's
+// creation or deletion into another conversation's data loss.
+func (s *Store) DeleteDefaultSession(name string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE task = ? AND explicit = 0`, name)
+	return err
+}
+
+// ListSessions returns every capture's metadata, oldest first. WrittenAt
+// comes from the schema's created_at default (SQLite datetime('now') is
+// UTC "YYYY-MM-DD HH:MM:SS"); a row it cannot parse keeps its zero time
+// rather than failing the listing.
+func (s *Store) ListSessions() ([]v1alpha1.SessionInfo, error) {
+	rows, err := s.db.Query(`SELECT task, LENGTH(data), last_task, created_at
+		FROM sessions ORDER BY created_at ASC, task ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []v1alpha1.SessionInfo
+	for rows.Next() {
+		var info v1alpha1.SessionInfo
+		var created string
+		if err := rows.Scan(&info.Name, &info.Bytes, &info.LastTask, &created); err != nil {
+			return nil, err
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
+			info.WrittenAt = t.UTC()
+		}
+		out = append(out, info)
+	}
+	return out, rows.Err()
+}
+
+// GetSessionInfo returns one capture's metadata, or ErrNotFound. Same
+// shape as ListSessions' rows; the archive itself is not served.
+func (s *Store) GetSessionInfo(name string) (v1alpha1.SessionInfo, error) {
+	var info v1alpha1.SessionInfo
+	var created string
+	err := s.db.QueryRow(`SELECT task, LENGTH(data), last_task, created_at
+		FROM sessions WHERE task = ?`, name).
+		Scan(&info.Name, &info.Bytes, &info.LastTask, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v1alpha1.SessionInfo{}, ErrNotFound
+	}
+	if err != nil {
+		return v1alpha1.SessionInfo{}, err
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
+		info.WrittenAt = t.UTC()
+	}
+	return info, nil
+}
+
+// CountSessions returns the number of capture rows for the px_sessions
+// gauge.
+func (s *Store) CountSessions() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&n)
+	return n, err
 }
 
 // maxEventMessageBytes caps one event's message: a message is a summary

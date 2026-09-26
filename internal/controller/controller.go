@@ -42,11 +42,16 @@ type SessionReader interface {
 	GetSession(task string) ([]byte, error)
 }
 
-// SessionWriter persists a captured session archive and drops the row when
-// the task record itself goes.
+// SessionWriter persists a captured session archive and drops default
+// rows when the task record itself goes. The first argument is the capture
+// name — the task's name for default captures, or the explicit
+// spec.session.name. lastTask records which task wrote the capture, for
+// session-continuation spec lookups; explicit marks user-owned rows, which
+// outlive their writing task.
 type SessionWriter interface {
-	SaveSession(task string, data []byte) error
-	DeleteSession(task string) error
+	SaveSession(name, lastTask string, data []byte, explicit bool) error
+	DeleteSession(name string) error
+	DeleteDefaultSession(name string) error
 }
 
 // TaskWriter lets the controller persist status changes. UpsertTask
@@ -359,11 +364,9 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 			c.log.Warn("deleting task that was still provisioning with no container recorded", "task", t.Metadata.Name)
 		}
 		// The container never existed, so the session row — whose lifetime
-		// is the task record's — can only be absent; DeleteSession is
+		// is the task record's — can only be absent; dropTaskSession is
 		// idempotent, so settle it unconditionally.
-		if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
-			c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
-		}
+		c.dropTaskSession(t)
 		if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 			c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
 		}
@@ -381,9 +384,7 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 			c.log.Warn("destroy: container already gone from cluster", "task", t.Metadata.Name, "vmid", vmid)
 			t.Status.Container = 0
 			c.persist(t)
-			if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
-				c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
-			}
+			c.dropTaskSession(t)
 			if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 				c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
 			}
@@ -462,11 +463,25 @@ func (c *Controller) destroyTask(ctx context.Context, t *v1alpha1.Task) {
 		t.Status.Container = 0
 		c.persist(t)
 	}
-	if err := c.store.DeleteSession(t.Metadata.Name); err != nil {
-		c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
-	}
+	c.dropTaskSession(t)
 	if err := c.store.DeleteTask(t.Metadata.Name); err != nil {
 		c.log.Error("delete task", "task", t.Metadata.Name, "err", err)
+	}
+}
+
+// dropTaskSession drops a task's default-named session row, before the task
+// record goes — if the order were reversed, a crash in between would leave
+// an orphan row that no record ever reconciles again. A row under an
+// explicit spec.session.name is user-owned — its lifetime is the user's,
+// and other tasks may still restore from it — so it survives the task's
+// deletion; the store only clears explicit=0 rows, which also keeps a
+// same-named task's lifetime from touching an explicitly named capture.
+func (c *Controller) dropTaskSession(t *v1alpha1.Task) {
+	if t.Spec.Session != nil && t.Spec.Session.Name != "" {
+		return
+	}
+	if err := c.store.DeleteDefaultSession(t.Metadata.Name); err != nil {
+		c.log.Error("delete session", "task", t.Metadata.Name, "err", err)
 	}
 }
 
@@ -597,16 +612,27 @@ func (c *Controller) resolveGateway(t *v1alpha1.Task) (*ResolvedGateway, error) 
 // resolveSession fetches the session archive a continueFrom reference asks
 // for, before any container work — same pattern as workspaces, model and
 // gateway: an unresolvable reference is a provision failure, not a container
-// that boots without the session it was told to continue. The source must be
-// finished (it can no longer write to the archive the continuing task gets)
-// and still hold its capture — a source with no captured session has nothing
-// to continue from, which is a loud failure rather than a silently fresh
-// session.
+// that boots without the session it was told to continue. A bare task name
+// must reference a finished task that still holds its capture (a source with
+// no captured session has nothing to continue from, a loud failure rather
+// than a silently fresh session). The "session:NAME" form reads a named
+// capture directly: a capture is a settled state, so no task record is
+// consulted and no phase checked.
 func (c *Controller) resolveSession(t *v1alpha1.Task) ([]byte, error) {
-	if t.Spec.Session == nil {
+	if t.Spec.Session == nil || t.Spec.Session.ContinueFrom == "" {
 		return nil, nil
 	}
-	name := t.Spec.Session.ContinueFrom
+	sessionRef, name := v1alpha1.SplitSessionRef(t.Spec.Session.ContinueFrom)
+	if sessionRef {
+		data, err := c.store.GetSession(name)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, fmt.Errorf("session %q has no captured session", name)
+			}
+			return nil, fmt.Errorf("read session %q: %w", name, err)
+		}
+		return data, nil
+	}
 	src, err := c.store.GetTask(name)
 	if err != nil {
 		return nil, fmt.Errorf("resolve session source %q: %w", name, err)
@@ -616,12 +642,18 @@ func (c *Controller) resolveSession(t *v1alpha1.Task) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("session source %q is %s, not finished", name, src.Status.Phase)
 	}
-	data, err := c.store.GetSession(name)
+	// A bare reference names a task, but the capture lives under the
+	// source's capture name — its explicit spec.session.name, or the
+	// task name itself (the M8 default). Reading the bare name directly
+	// would ProvisionFailed a valid capture whenever the source named
+	// its session.
+	cap := src.Spec.Session.CaptureName(src.Metadata.Name)
+	data, err := c.store.GetSession(cap)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, fmt.Errorf("session source %q has no captured session", name)
+			return nil, fmt.Errorf("session source %q has no captured session under %q", name, cap)
 		}
-		return nil, fmt.Errorf("read session %q: %w", name, err)
+		return nil, fmt.Errorf("read session %q: %w", cap, err)
 	}
 	return data, nil
 }
@@ -869,8 +901,23 @@ func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool 
 		return false
 	}
 	if len(data) > 0 {
-		if err := c.store.SaveSession(t.Metadata.Name, data); err != nil {
-			c.log.Error("save session", "task", t.Metadata.Name, "err", err)
+		cap := t.Spec.Session.CaptureName(t.Metadata.Name)
+		// An explicitly named capture is user-owned: its row must outlive
+		// the writing task, so the store records it as explicit.
+		explicit := t.Spec.Session != nil && t.Spec.Session.Name != ""
+		if err := c.store.SaveSession(cap, t.Metadata.Name, data, explicit); err != nil {
+			if errors.Is(err, store.ErrSessionOwned) {
+				// Settled, not retryable: the name is held by a user-owned
+				// capture this default write must not touch. Retrying would
+				// pin the container forever, so the capture is dropped and
+				// the event keeps the loss visible.
+				c.log.Error("capture dropped for an explicitly owned session name", "task", t.Metadata.Name, "session", cap, "err", err)
+				t.Status.SessionSaved = true
+				c.persist(t)
+				c.eventf(t.Metadata.Name, "SessionSaved", "capture dropped: session %s is owned by an explicitly named capture (%d bytes discarded)", cap, len(data))
+				return true
+			}
+			c.log.Error("save session", "task", t.Metadata.Name, "session", cap, "err", err)
 			return false
 		}
 	}
@@ -881,7 +928,7 @@ func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool 
 	case tooLarge:
 		c.eventf(t.Metadata.Name, "SessionSaved", "capture skipped: session exceeds the %d byte cap", v1alpha1.MaxSessionBytes)
 	case len(data) > 0:
-		c.eventf(t.Metadata.Name, "SessionSaved", "captured %d bytes of session", len(data))
+		c.eventf(t.Metadata.Name, "SessionSaved", "captured %d bytes into session %s", len(data), t.Spec.Session.CaptureName(t.Metadata.Name))
 	default:
 		c.eventf(t.Metadata.Name, "SessionSaved", "nothing to capture")
 	}
