@@ -1,0 +1,66 @@
+template/README.md
+  s_e6a860663c7e72::t_789a76e7114589 1-66
+docs/roadmap.md
+  s_e6a860663c7e72::t_cb0a0d39f211bd 160,167,174,179,181,186,191
+  s_e6a860663c7e72::t_b45006dfead8a8 147-159,161-166,168-173,175-178,180,182-185,187-190,192-193,196-200
+  s_e6a860663c7e72::t_3ec50066a47729 194-195
+internal/apis/v1alpha1/templates_test.go
+  s_e6a860663c7e72::t_b32b4ba2ac36bb 1-41
+internal/proxmox/client.go
+  s_e6a860663c7e72::t_b7c4a7d4aae878 229-241
+scripts/e2e-templates.sh
+  s_e6a860663c7e72::t_de1aae8d6b4e11 129
+  s_e6a860663c7e72::t_ecde72036f1072 116
+  s_e6a860663c7e72::t_05c41fc61d9c08 1-78,84-115,117-127,131-132,134-154,156-159,161-163,166-172,185-195
+  s_e6a860663c7e72::t_6596b20c0ee248 79-83
+  s_e6a860663c7e72::t_1686c6d8c912f8 155
+  s_e6a860663c7e72::t_9145b96eb7457e 173-184
+  s_e6a860663c7e72::t_9d673830d4231f 128,130,133
+  s_e6a860663c7e72::t_0eb69fd233fc20 160,164-165
+internal/controller/provisioner.go
+  s_e6a860663c7e72::t_2440bac277a2e0 137-144
+  s_e6a860663c7e72::t_09d792f79d1139 309-313,315
+  s_e6a860663c7e72::t_66098b2f2ac5f1 278-308,314,316-328
+cmd/px/main.go
+  s_e6a860663c7e72::t_fceb65dfafa240 346
+  s_e6a860663c7e72::t_396f8017e4f5f4 513-520,525,527-537,539-540,542
+  s_e6a860663c7e72::t_dbe952699b4e19 13
+  s_e6a860663c7e72::t_f1ab48232f87d9 476,482,512,521-524,526,538,541
+  s_e6a860663c7e72::t_54690316c2382f 910-911,916
+  s_e6a860663c7e72::t_cbdc5e7114ec75 429-445,447,451-459
+  s_e6a860663c7e72::t_886727af778dac 460-461
+internal/controller/provisioner_test.go
+  s_e6a860663c7e72::t_856e3d86b20f89 886-928,935-972,976-986
+  s_e6a860663c7e72::t_da867e094dec27 929-934
+  s_e6a860663c7e72::t_af2d4005d010f8 973-975
+internal/server/server.go
+  s_e6a860663c7e72::t_5830c7cafbc34c 628-642
+  s_e6a860663c7e72::t_57f60d02ad8c6f 51
+internal/server/server_test.go
+  s_e6a860663c7e72::t_1d11563b9fb4eb 885
+  s_e6a860663c7e72::t_e1fc883593a3cf 888-890
+  s_e6a860663c7e72::t_4e80aa6ad8e37d 571
+  s_e6a860663c7e72::t_c26c3d7033721e 58-61
+  s_e6a860663c7e72::t_f145623c32c574 853-884,886-887,891-920
+internal/controller/controller_test.go
+  s_e6a860663c7e72::t_08645b4ea1541a 238-241
+internal/apis/v1alpha1/templates.go
+  s_e6a860663c7e72::t_ba59309a279182 11-16
+  s_e6a860663c7e72::t_b3a511ef356012 1-10,17-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "adcc6ca215725e92139b4878391738723c529a3d",
+  "prompts": {},
+  "sessions": {
+    "s_e6a860663c7e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09127d2b-fdd9-4f3b-aa47-c9cb9d1842bd",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
