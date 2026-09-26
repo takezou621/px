@@ -1,0 +1,40 @@
+internal/controller/controller.go
+  s_e6a860663c7e72::t_12404b5f044211 43-46
+  s_e6a860663c7e72::t_a1b23153500d6f 655-664
+internal/store/store.go
+  s_e6a860663c7e72::t_fa508f8ebf5fb8 485-503
+docs/roadmap.md
+  s_e6a860663c7e72::t_2e9d944564cb29 310-320
+internal/store/store_test.go
+  s_e6a860663c7e72::t_e4ac6e171e0ec1 454-460,462-467
+  s_e6a860663c7e72::t_d832fcfef2dfde 430-453,461,468-482
+scripts/e2e-sessions.sh
+  s_e6a860663c7e72::t_87e83f0a1d0d1d 235-237
+  s_e6a860663c7e72::t_006a86a0fb1c2c 124-127,130-134,139-140,142-145
+  s_e6a860663c7e72::t_b50ee4a8ef697b 193-198
+  s_e6a860663c7e72::t_6c2a91c85e6540 88-96
+  s_e6a860663c7e72::t_2fd2481d62aa38 249-252
+  s_e6a860663c7e72::t_afada5018177a1 214-216
+internal/controller/controller_test.go
+  s_e6a860663c7e72::t_899897a3d0d4ef 2161
+  s_e6a860663c7e72::t_46132259e2887f 297-306
+  s_e6a860663c7e72::t_5d5f139411355f 2109-2156
+cmd/px/main.go
+  s_e6a860663c7e72::t_af1bacdf216ee3 626-636
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a625777dd5391039e0458f727458d6a5679821ab",
+  "prompts": {},
+  "sessions": {
+    "s_e6a860663c7e72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09127d2b-fdd9-4f3b-aa47-c9cb9d1842bd",
+        "model": "glm-5.3-flash"
+      },
+      "human_author": "takezou621 <takezou621@gmail.com>"
+    }
+  }
+}
