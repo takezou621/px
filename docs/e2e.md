@@ -351,6 +351,27 @@ A live continuation with a real key is deliberately **not** automated
 ./px describe task <new-task>    # continueFrom points at the old task
 ```
 
+## 3j. Schedules test
+
+With the same server running:
+
+```sh
+./scripts/e2e-schedules.sh
+# env: PX_SERVER, PX as above. Takes ~10 minutes of real wall clock:
+# the fire cadence is minute-boundary and the suspend/prune checks must
+# cross whole minute boundaries to mean anything.
+```
+
+It exercises: an applied Schedule fires at the next minute boundary
+and the stamped task reaches a real `Succeeded` (with `Scheduled` as
+its first event and `status.scheduleOwner` set), `px suspend schedule`
+holds fire across a whole minute boundary, `px resume schedule` fires
+EXACTLY once for the whole suspended window (missed-fire compression —
+the boundary missed while suspended must not replay), `historyLimit: 1`
+prunes the finished generated task once a second fires, and deleting
+the schedule is definition-only: the definition 404s, its generated
+tasks stay and inspect normally, and no new fire happens afterwards.
+
 ## 4. Restart-recovery check (manual)
 
 Crash safety is the part unit tests can only simulate, so watch it
@@ -373,6 +394,14 @@ happen once:
    container's cgroup (not in px-server's memory), so the task stays
    frozen, and the controller re-verifies it on its next ticks —
    `Suspended` stays `Suspended`, `px resume` brings it back.
+4. **Schedule-across-restart**: `./scripts/e2e-schedules.sh` leaves
+   `e2e-sched-win` behind, suspended with its fire clock held. Restart
+   px-server, then `./px resume schedule e2e-sched-win` and expect
+   exactly ONE new `e2e-sched-win-*` task within ~65s — the
+   persisted `lastScheduleTime` must suppress a duplicate fire for the
+   same boundary (and the missed window must still compress to one).
+   Afterwards delete the schedule and its tasks (the script's closing
+   hint prints the exact commands).
 
 ## Troubleshooting
 

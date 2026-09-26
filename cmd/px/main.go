@@ -380,7 +380,7 @@ func taskLogs(name string) (out string, blocked bool, err error) {
 
 func cmdGet(fs *flag.FlagSet, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions|schedules")
 	}
 	switch args[0] {
 	case "tasks":
@@ -501,8 +501,26 @@ func cmdGet(fs *flag.FlagSet, args []string) error {
 			fmt.Printf("%-24s %-12d %-24s %s\n", s.Name, s.Bytes, lt, written)
 		}
 		return nil
+	case "schedules":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		var scheds []*v1alpha1.Schedule
+		if err := doJSON(http.MethodGet, "/v1/schedules", nil, &scheds); err != nil {
+			return err
+		}
+		fmt.Printf("%-24s %-20s %-8s %-22s %s\n", "NAME", "SCHEDULE", "SUSPEND", "LAST", "AGE")
+		for _, s := range scheds {
+			last := "-"
+			if s.Status.LastScheduleTime != nil {
+				last = s.Status.LastScheduleTime.Local().Format("2006-01-02 15:04")
+			}
+			fmt.Printf("%-24s %-20s %-8t %-22s %s\n", s.Metadata.Name, s.Spec.Schedule,
+				s.Spec.Suspend, last, age(&s.Metadata.CreationTimestamp))
+		}
+		return nil
 	default:
-		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions")
+		return fmt.Errorf("usage: px get tasks|workspaces|models|gateways|templates|sessions|schedules")
 	}
 }
 
@@ -531,13 +549,13 @@ func popName(args []string) (string, []string, error) {
 
 func cmdDescribe(fs *flag.FlagSet, args []string) error {
 	kind := "task" // bare NAME is treated as a task
-	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway" || args[0] == "template" || args[0] == "session") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "workspace" || args[0] == "model" || args[0] == "gateway" || args[0] == "template" || args[0] == "session" || args[0] == "schedule") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME | describe template NAME | describe session NAME")
+		return fmt.Errorf("usage: px describe task NAME | describe workspace NAME | describe model NAME | describe gateway NAME | describe template NAME | describe session NAME | describe schedule NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -640,6 +658,29 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 			if len(refs) > 0 {
 				fmt.Println("\nReferenced by:")
 				for _, t := range refs {
+					fmt.Printf("  %-24s %-16s\n", t.Metadata.Name, t.Status.Phase)
+				}
+			}
+		}
+	case "schedule":
+		var s *v1alpha1.Schedule
+		if err := doJSON(http.MethodGet, "/v1/schedules/"+name, nil, &s); err != nil {
+			return err
+		}
+		printJSONIndent(s)
+		// Which tasks this schedule stamped — the history half of a
+		// schedule. Best-effort like the task describe's Events section.
+		var tasks []*v1alpha1.Task
+		if err := doJSON(http.MethodGet, "/v1/tasks", nil, &tasks); err == nil {
+			var stamped []*v1alpha1.Task
+			for _, t := range tasks {
+				if t.Status.ScheduleOwner == name {
+					stamped = append(stamped, t)
+				}
+			}
+			if len(stamped) > 0 {
+				fmt.Println("\nFired tasks:")
+				for _, t := range stamped {
 					fmt.Printf("  %-24s %-16s\n", t.Metadata.Name, t.Status.Phase)
 				}
 			}
@@ -769,13 +810,13 @@ func cmdExec(fs *flag.FlagSet, args []string) error {
 
 func cmdDelete(fs *flag.FlagSet, args []string) error {
 	kind := "task"
-	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway" || args[0] == "workspace" || args[0] == "session") {
+	if len(args) > 0 && (args[0] == "task" || args[0] == "model" || args[0] == "gateway" || args[0] == "workspace" || args[0] == "session" || args[0] == "schedule") {
 		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME | delete workspace NAME | delete session NAME")
+		return fmt.Errorf("usage: px delete task NAME | delete model NAME | delete gateway NAME | delete workspace NAME | delete session NAME | delete schedule NAME")
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -811,29 +852,39 @@ func cmdDelete(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		fmt.Printf("session.px.io/%s deleted\n", name)
+	case "schedule":
+		var out map[string]string
+		if err := doJSON(http.MethodDelete, "/v1/schedules/"+name, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("schedule.px.io/%s deleted\n", name)
 	}
 	return nil
 }
 
 // cmdSuspendResume posts the phase-flip request; the server gates on the
 // current phase (409 for the wrong one), so the CLI is a thin pass-through.
-// Accepts both `px suspend task NAME` and `px suspend NAME`.
+// For a Schedule the request flips the suspend flag instead and always
+// succeeds on an existing schedule. Accepts `px suspend task NAME`,
+// `px suspend schedule NAME`, and bare `px suspend NAME` (a task).
 func cmdSuspendResume(fs *flag.FlagSet, args []string, op string) error {
-	if len(args) > 0 && args[0] == "task" {
+	kind := "task"
+	if len(args) > 0 && (args[0] == "task" || args[0] == "schedule") {
+		kind = args[0]
 		args = args[1:]
 	}
 	name, rest, err := popName(args)
 	if err != nil {
-		return fmt.Errorf("usage: px %s task NAME", op)
+		return fmt.Errorf("usage: px %s task NAME | px %s schedule NAME", op, op)
 	}
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
 	var out map[string]string
-	if err := doJSON(http.MethodPost, "/v1/tasks/"+name+"/"+op, nil, &out); err != nil {
+	if err := doJSON(http.MethodPost, "/v1/"+kind+"s/"+name+"/"+op, nil, &out); err != nil {
 		return err
 	}
-	fmt.Printf("task.px.io/%s %s\n", name, out["status"])
+	fmt.Printf("%s.px.io/%s %s\n", kind, name, out["status"])
 	return nil
 }
 

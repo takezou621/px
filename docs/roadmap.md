@@ -2,6 +2,123 @@
 
 Status: 2026-09-26. Owner: Claude (acting PO).
 
+## M12 — Scheduled tasks (cron)
+
+Chosen 2026-09-26 after M11 (candidates: scheduled tasks, quota/limits,
+capture streaming). M6–M11 assembled the full one-shot story — an agent
+runs, its ports reach out, its conversation outlives the container, its
+failure is visible — but every run starts by hand. The next ceiling is
+repetition: a daily report, a nightly review, an hourly check are
+agent-shaped work that should not need a human to type `px run` each
+time. Named as a fifth resource kind, `Schedule` — the M11 rule ("the
+four primitives stay") rejected a Session resource because a capture has
+no spec and is never applied; a Schedule is exactly what a Session is
+not: declarative config the user applies, same shape as
+Workspace/Model/Gateway (upsert, no lifecycle of its own beyond firing).
+The model is Kubernetes CronJob: a Schedule holds a cron expression and
+a Task template; the controller stamps out a Task each time the
+expression fires, and the stamped Task runs through everything px
+already has — scheduling, gateways, models, sessions, ports, events,
+metrics — untouched. Timezone: UTC, always (px-server's store already
+speaks UTC; local-time schedules can be revisited if someone actually
+runs one across a wall-clock jump).
+
+Design decisions:
+
+- `spec.schedule` is a standard 5-field cron expression (minute hour
+  day-of-month month day-of-week), parsed by a hand-written parser in
+  v1alpha1 (`cron.go`) — stdlib only, per the dependency axis. Syntax:
+  `*`, single values, ranges (`a-b`), steps (`*/n`, `a-b/n`), comma
+  lists; dow accepts 0–7 with 7 normalized to Sunday. No month names,
+  no `@` macros, no seconds. POSIX/K8s semantics: when BOTH dom and dow
+  are restricted, a day fires when EITHER matches; a single restricted
+  field is a plain AND.
+- Fire semantics: the controller computes the expression's next fire
+  time after `status.lastScheduleTime` (first fire after apply when
+  never fired) and stamps a Task when that time arrives (≤ 2s late, one
+  tick). Fires missed while px-server was down or the Schedule was
+  suspended compress to ONE task — the newest missed time fires, the
+  backlog does not replay. A schedule that can never fire (e.g. `0 0
+  31 2 *`) is rejected at apply: the parser runs a 4-year lookahead, so
+  an expression with no next time within it fails validation instead of
+  wedging a reconcile tick in a doomed loop.
+- Generated tasks are named `<schedule>-<unix-seconds-of-fire-time>`
+  (schedule names longer than 52 chars are truncated to keep the total
+  within DNS-1123; fire times are minute-resolution so the seconds
+  suffix cannot collide within one schedule). Ownership is marked in
+  `status.scheduleOwner` — on Status, not Spec, because apply never
+  accepts a status block: a user cannot forge membership in a
+  schedule's history, and the history cleanup can trust it.
+- `spec.historyLimit` (default 3, max 100) prunes the schedule's own
+  history: the controller destroys finished generated tasks
+  (RequestDestroy, riding the normal delete path so containers,
+  forwards and default sessions clean up) beyond the limit; non-terminal
+  tasks never count and are never pruned. Without this a daily schedule
+  accumulates records forever. 0 means default (parity with
+  ttlSecondsAfterFinished; "keep zero history" is not offered — an
+  uninspectable run is a support hole, not a feature).
+- `spec.suspend: true` stops firing without deleting the definition;
+  `status.lastScheduleTime` holds across the suspension, so resume
+  treats the suspended window like any outage — missed fires compress
+  into one run of the newest missed time. CLI sugar `px suspend
+  schedule NAME` / `px resume schedule NAME` flips the field with a
+  single-statement json_set; apply remains the declarative way.
+- Delete is immediate and definition-only (declarative config, like
+  Workspace/Model): the Schedule row drops, already-generated tasks and
+  their containers stay (they are normal tasks now — inspect or delete
+  them like any other), and no future task fires.
+- Store: a `schedules` table (name, spec, status, created_at) with
+  Workspace-style upsert (spec only — status is the controller's);
+  `MarkScheduleFired` and `MarkScheduleSuspend` are single-statement
+  json_sets per the Mark* discipline.
+- API: schedules ride the existing `POST /v1/apply` (new kind case) and
+  gain `GET /v1/schedules`, `GET /v1/schedules/{name}`, `DELETE
+  /v1/schedules/{name}`, `POST /v1/schedules/{name}/suspend`, `POST
+  /v1/schedules/{name}/resume`.
+- CLI: `px get schedules` (NAME, SCHEDULE, SUSPEND, LAST, AGE), `px
+  describe schedule NAME` (spec, status, the generated task list
+  resolved from live tasks), `px delete schedule NAME`, the
+  suspend/resume sugar above. `px describe task` shows scheduleOwner
+  when set; `px get tasks` stays column-unchanged.
+- Metrics/events: a `px_schedules` gauge joins the store gauges; each
+  generated task records a `Scheduled` event ("fired by schedule X for
+  <cron time>") as its first event, so `px events` shows the schedule's
+  footprint through its tasks.
+- Explicitly out: concurrency policies (Forbid/Replace — one agent task
+  per window is the assumed shape; revisit if overlapping runs bite),
+  timezone/local-time expressions, @macros and seconds fields,
+  catching up missed fires as a replay, Schedule-level env/goal
+  templating (the template is static; a dynamic "as of" goal needs a
+  runner-side clock), watch integration for schedules.
+
+- [x] `Schedule` kind + validation (cron parse with no-fire lookahead,
+  historyLimit bounds, name length accounting)
+- [x] cron parser + Next (dom/dow OR rule, 7=Sunday, step/range/lists)
+- [x] controller: fire loop (missed-fire compression, suspend hold,
+  restart-safe lastScheduleTime), history pruning via RequestDestroy
+- [x] store: schedules table + Mark* discipline
+- [x] API endpoints + apply kind case; `px get/describe/delete
+  schedule`, suspend/resume sugar
+- [x] `px_schedules` gauge; Scheduled event on generated tasks
+- [x] Unit tests: parser matrix, Next correctness, fire/compress/suspend
+  paths, pruning, store round-trip, endpoint surface
+- [x] E2E on the real node (scripts/e2e-schedules.sh, 18/18 pass
+  2026-09-26): fire to a real Succeeded task (Scheduled event,
+  scheduleOwner, describe refs), suspend holds across a boundary, resume
+  compresses the missed window to one fire, historyLimit prunes, delete
+  leaves the generated tasks. Restart double-fire verified live by hand
+  (docs/e2e.md §4 item 4): the persisted lastScheduleTime suppressed the
+  duplicate and the suspended window compressed to exactly one fire.
+- [x] Dual-agent review (Codex + Claude, independent): fixed the cron
+  step clamp (a step near MaxInt64 overflowed the fire walk — a crafted
+  apply could panic the server), apply now rejects schedules whose names
+  share a TaskNamePrefix (they would claim identical fire names and
+  silently steal each other's fires), `px get schedules` AGE reads the
+  creation timestamp instead of resetting on every fire. Stale-reconcile
+  firing within one 2s tick of a suspend/delete accepted: the same
+  snapshot race k8s CronJob has, bounded at one extra fire, with the
+  partial-write recovery and foreign-owner checks already containing it.
+
 ## M7 — Port exposure (done 2026-09-26)
 
 Chosen 2026-09-26 from four candidates (port exposure, session

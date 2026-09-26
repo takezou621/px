@@ -19,6 +19,7 @@ type Manifest struct {
 	Workspace *WorkspaceSpec // non-nil when Kind == Workspace
 	Model     *ModelSpec     // non-nil when Kind == Model
 	Gateway   *GatewaySpec   // non-nil when Kind == Gateway
+	Schedule  *ScheduleSpec  // non-nil when Kind == Schedule
 }
 
 // ParseManifests parses a multi-document YAML manifest stream.
@@ -77,63 +78,7 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 		if err := strictDecode(spec, s); err != nil {
 			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
 		}
-		if s.Image == "" {
-			return nil, fmt.Errorf("task %q: spec.image is required", m.Metadata.Name)
-		}
-		if len(s.Runner.Command) == 0 {
-			return nil, fmt.Errorf("task %q: spec.runner.command is required", m.Metadata.Name)
-		}
-		if s.Runner.User != "" {
-			if err := ValidateUser(s.Runner.User); err != nil {
-				return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
-			}
-		}
-		var goalBytes = len(s.Goal)
-		if len(s.Workspaces) > MaxWorkspaces {
-			return nil, fmt.Errorf("task %q: spec.workspaces exceeds %d entries", m.Metadata.Name, MaxWorkspaces)
-		}
-		seenWS := map[string]bool{}
-		for i, ws := range s.Workspaces {
-			if ws.Name == "" {
-				return nil, fmt.Errorf("task %q: workspaces[%d].name is required", m.Metadata.Name, i)
-			}
-			// The reference name becomes a path segment (/workspace/<name>) in
-			// the boot script; validating here keeps that safety property
-			// local to the parser instead of relying on the Workspace kind
-			// having been validated too.
-			if err := ValidateName(ws.Name); err != nil {
-				return nil, fmt.Errorf("task %q: workspaces[%d].name: %w", m.Metadata.Name, i, err)
-			}
-			if seenWS[ws.Name] {
-				return nil, fmt.Errorf("task %q: workspaces[%d].name %q is duplicated", m.Metadata.Name, i, ws.Name)
-			}
-			seenWS[ws.Name] = true
-			goalBytes += len(ws.Goal)
-		}
-		if goalBytes > MaxGoalBytes {
-			return nil, fmt.Errorf("task %q: combined task and workspace goal exceeds %d bytes", m.Metadata.Name, MaxGoalBytes)
-		}
-		var cmdBytes int
-		for _, a := range s.Runner.Command {
-			cmdBytes += len(a) + 1
-		}
-		if cmdBytes > MaxCommandBytes {
-			return nil, fmt.Errorf("task %q: spec.runner.command exceeds %d bytes", m.Metadata.Name, MaxCommandBytes)
-		}
-		if s.Model != "" {
-			if err := ValidateName(s.Model); err != nil {
-				return nil, fmt.Errorf("task %q: spec.model: %w", m.Metadata.Name, err)
-			}
-		}
-		if s.Gateway != "" {
-			if err := ValidateName(s.Gateway); err != nil {
-				return nil, fmt.Errorf("task %q: spec.gateway: %w", m.Metadata.Name, err)
-			}
-		}
-		if err := ValidatePorts(s.Ports); err != nil {
-			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
-		}
-		if err := ValidateSession(s.Session); err != nil {
+		if err := ValidateTaskSpec(s); err != nil {
 			return nil, fmt.Errorf("task %q: %w", m.Metadata.Name, err)
 		}
 		m.Task = s
@@ -193,10 +138,90 @@ func decodeObject(raw map[string]any) (*Manifest, error) {
 			}
 		}
 		m.Gateway = s
+	case KindSchedule:
+		s := &ScheduleSpec{}
+		if err := strictDecode(spec, s); err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", m.Metadata.Name, err)
+		}
+		if err := ValidateSchedule(s); err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", m.Metadata.Name, err)
+		}
+		if err := ValidateTaskSpec(&s.TaskTemplate); err != nil {
+			return nil, fmt.Errorf("schedule %q: taskTemplate: %w", m.Metadata.Name, err)
+		}
+		m.Schedule = s
 	default:
 		return nil, fmt.Errorf("unknown kind %q", m.Kind)
 	}
 	return m, nil
+}
+
+// ValidateTaskSpec checks a task spec's required fields, size caps and
+// reference name shapes — everything an applied Task manifest is checked
+// for. Schedule taskTemplates go through the same function, so a generated
+// task can never carry what apply would reject. Error text names fields,
+// not objects: callers wrap it with their kind and name.
+func ValidateTaskSpec(s *TaskSpec) error {
+	if s.Image == "" {
+		return fmt.Errorf("spec.image is required")
+	}
+	if len(s.Runner.Command) == 0 {
+		return fmt.Errorf("spec.runner.command is required")
+	}
+	if s.Runner.User != "" {
+		if err := ValidateUser(s.Runner.User); err != nil {
+			return err
+		}
+	}
+	var goalBytes = len(s.Goal)
+	if len(s.Workspaces) > MaxWorkspaces {
+		return fmt.Errorf("spec.workspaces exceeds %d entries", MaxWorkspaces)
+	}
+	seenWS := map[string]bool{}
+	for i, ws := range s.Workspaces {
+		if ws.Name == "" {
+			return fmt.Errorf("workspaces[%d].name is required", i)
+		}
+		// The reference name becomes a path segment (/workspace/<name>) in
+		// the boot script; validating here keeps that safety property
+		// local to the parser instead of relying on the Workspace kind
+		// having been validated too.
+		if err := ValidateName(ws.Name); err != nil {
+			return fmt.Errorf("workspaces[%d].name: %w", i, err)
+		}
+		if seenWS[ws.Name] {
+			return fmt.Errorf("workspaces[%d].name %q is duplicated", i, ws.Name)
+		}
+		seenWS[ws.Name] = true
+		goalBytes += len(ws.Goal)
+	}
+	if goalBytes > MaxGoalBytes {
+		return fmt.Errorf("combined task and workspace goal exceeds %d bytes", MaxGoalBytes)
+	}
+	var cmdBytes int
+	for _, a := range s.Runner.Command {
+		cmdBytes += len(a) + 1
+	}
+	if cmdBytes > MaxCommandBytes {
+		return fmt.Errorf("spec.runner.command exceeds %d bytes", MaxCommandBytes)
+	}
+	if s.Model != "" {
+		if err := ValidateName(s.Model); err != nil {
+			return fmt.Errorf("spec.model: %w", err)
+		}
+	}
+	if s.Gateway != "" {
+		if err := ValidateName(s.Gateway); err != nil {
+			return fmt.Errorf("spec.gateway: %w", err)
+		}
+	}
+	if err := ValidatePorts(s.Ports); err != nil {
+		return err
+	}
+	if err := ValidateSession(s.Session); err != nil {
+		return err
+	}
+	return nil
 }
 
 // validateSecretValue rejects Model secret values that could not survive the

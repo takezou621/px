@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -61,6 +62,12 @@ func Open(path string) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS gateways (
 			name TEXT PRIMARY KEY,
 			spec TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS schedules (
+			name TEXT PRIMARY KEY,
+			spec TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
@@ -347,6 +354,97 @@ func (s *Store) DeleteWorkspace(name string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// UpsertSchedule stores the schedule spec, leaving status untouched: status
+// belongs to the controller (lastScheduleTime is restart safety, not user
+// intent), so re-applying a schedule must never reset its fire clock.
+func (s *Store) UpsertSchedule(sch *v1alpha1.Schedule) error {
+	spec, err := json.Marshal(sch.Spec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO schedules (name, spec) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET spec=excluded.spec`, sch.Metadata.Name, string(spec))
+	return err
+}
+
+func (s *Store) GetSchedule(name string) (*v1alpha1.Schedule, error) {
+	row := s.db.QueryRow(`SELECT name, spec, status, created_at FROM schedules WHERE name = ?`, name)
+	return scanSchedule(row)
+}
+
+func (s *Store) ListSchedules() ([]*v1alpha1.Schedule, error) {
+	rows, err := s.db.Query(`SELECT name, spec, status, created_at FROM schedules ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var schs []*v1alpha1.Schedule
+	for rows.Next() {
+		sch, err := scanSchedule(rows)
+		if err != nil {
+			return nil, err
+		}
+		schs = append(schs, sch)
+	}
+	return schs, rows.Err()
+}
+
+func (s *Store) DeleteSchedule(name string) error {
+	res, err := s.db.Exec(`DELETE FROM schedules WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkScheduleFired advances the schedule's fire clock past a stamped task:
+// lastScheduleTime is the scheduled moment (which may be minutes in the past
+// when missed fires compressed), lastTask the stamped record's name. Single
+// statement like the task Mark* family — the controller works on snapshots,
+// and a fire write must never resurrect a spec field an apply just changed.
+func (s *Store) MarkScheduleFired(name string, at time.Time, task string) error {
+	res, err := s.db.Exec(
+		`UPDATE schedules SET status = json_set(json_set(status, '$.lastScheduleTime', ?), '$.lastTask', ?)
+		 WHERE name = ?`,
+		at.UTC().Format(time.RFC3339Nano), task, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkScheduleSuspend flips spec.suspend without rewriting the whole spec:
+// the suspend/resume endpoints are API-side writes that reconcile observes
+// later, so they must never clobber a spec change an apply landed in
+// between. The bool goes through json() because json_set would otherwise
+// store the driver's int rendering (1/0), which unmarshals into Go's bool
+// as an error.
+func (s *Store) MarkScheduleSuspend(name string, suspend bool) error {
+	res, err := s.db.Exec(
+		`UPDATE schedules SET spec = json_set(spec, '$.suspend', json(?)) WHERE name = ?`,
+		strconv.FormatBool(suspend), name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CountSchedules backs the px_schedules gauge.
+func (s *Store) CountSchedules() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM schedules`).Scan(&n)
+	return n, err
 }
 
 // UpsertModel stores the model spec (including its API key — write-only at
@@ -732,4 +830,29 @@ func scanGateway(row rowScanner) (*v1alpha1.Gateway, error) {
 		return nil, fmt.Errorf("gateway %s spec: %w", g.Metadata.Name, err)
 	}
 	return g, nil
+}
+
+func scanSchedule(row rowScanner) (*v1alpha1.Schedule, error) {
+	sch := &v1alpha1.Schedule{APIVersion: v1alpha1.APIVersion, Kind: v1alpha1.KindSchedule}
+	var spec, status, created string
+	if err := row.Scan(&sch.Metadata.Name, &spec, &status, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if created != "" {
+		ts, err := time.Parse("2006-01-02 15:04:05", created) // SQLite datetime('now'): UTC
+		if err != nil {
+			return nil, fmt.Errorf("schedule %s created_at: %w", sch.Metadata.Name, err)
+		}
+		sch.Metadata.CreationTimestamp = ts
+	}
+	if err := json.Unmarshal([]byte(spec), &sch.Spec); err != nil {
+		return nil, fmt.Errorf("schedule %s spec: %w", sch.Metadata.Name, err)
+	}
+	if err := json.Unmarshal([]byte(status), &sch.Status); err != nil {
+		return nil, fmt.Errorf("schedule %s status: %w", sch.Metadata.Name, err)
+	}
+	return sch, nil
 }

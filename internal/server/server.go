@@ -62,6 +62,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
 	mux.HandleFunc("GET /v1/sessions/{name}", s.handleGetSession)
 	mux.HandleFunc("DELETE /v1/sessions/{name}", s.handleDeleteSession)
+	mux.HandleFunc("GET /v1/schedules", s.handleListSchedules)
+	mux.HandleFunc("GET /v1/schedules/{name}", s.handleGetSchedule)
+	mux.HandleFunc("DELETE /v1/schedules/{name}", s.handleDeleteSchedule)
+	mux.HandleFunc("POST /v1/schedules/{name}/suspend", s.handleScheduleSuspend)
+	mux.HandleFunc("POST /v1/schedules/{name}/resume", s.handleScheduleResume)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -130,6 +135,30 @@ type applyInvalidError struct{ msg string }
 
 func (e *applyInvalidError) Error() string { return e.msg }
 
+// checkScheduleFireNameCollision rejects a Schedule whose generated fire
+// task names would collide with a different schedule's: TaskNamePrefix
+// truncation makes two names sharing the first MaxSchedulePrefix characters
+// claim identical <prefix>-<unixsec> fire names, where the second schedule
+// would find a foreign owner and quietly lose its fires. Same-name applies
+// (re-apply of the same schedule) are fine.
+func checkScheduleFireNameCollision(st *store.Store, name string) error {
+	scheds, err := st.ListSchedules()
+	if err != nil {
+		return fmt.Errorf("list schedules: %w", err)
+	}
+	for _, existing := range scheds {
+		if existing.Metadata.Name == name {
+			continue
+		}
+		if v1alpha1.TaskNamePrefix(existing.Metadata.Name) == v1alpha1.TaskNamePrefix(name) {
+			return &applyConflictError{msg: fmt.Sprintf(
+				"schedule %q: its generated task names collide with schedule %q (names share the first %d characters); rename one",
+				name, existing.Metadata.Name, v1alpha1.MaxSchedulePrefix)}
+		}
+	}
+	return nil
+}
+
 // applyObjects persists every manifest in document order. It runs inside the
 // caller's transaction, so the reconcile loop cannot observe the batch
 // half-applied (e.g. a Task whose Workspace is not yet stored).
@@ -170,6 +199,25 @@ func applyObjects(st *store.Store, manifests []*v1alpha1.Manifest) ([]string, er
 				return nil, fmt.Errorf("upsert gateway %s: %w", m.Metadata.Name, err)
 			}
 			results = append(results, fmt.Sprintf("gateway.px.io/%s configured", m.Metadata.Name))
+		case v1alpha1.KindSchedule:
+			// Definition-only upsert: spec is replaced, status (the fire
+			// clock and last task) is controller-owned and survives.
+			// Fire names are <prefix>-<unixsec>, so two schedules whose
+			// names share TaskNamePrefix would claim the same fire names
+			// and silently steal each other's fires — reject that here.
+			if err := checkScheduleFireNameCollision(st, m.Metadata.Name); err != nil {
+				return nil, err
+			}
+			sch := &v1alpha1.Schedule{
+				APIVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindSchedule,
+				Metadata:   m.Metadata,
+				Spec:       *m.Schedule,
+			}
+			if err := st.UpsertSchedule(sch); err != nil {
+				return nil, fmt.Errorf("upsert schedule %s: %w", m.Metadata.Name, err)
+			}
+			results = append(results, fmt.Sprintf("schedule.px.io/%s configured", m.Metadata.Name))
 		case v1alpha1.KindTask:
 			// A session continuing from itself can never resolve — the
 			// source is this very task, unfinished by definition. The
@@ -675,6 +723,83 @@ func (s *Server) handleDeleteGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// Schedules are definitions, not work: delete drops the row and stops future
+// fires, but already-generated tasks keep running their course (delete them
+// directly if that is not wanted).
+func (s *Server) handleListSchedules(w http.ResponseWriter, _ *http.Request) {
+	schedules, err := s.store.ListSchedules()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if schedules == nil {
+		schedules = []*v1alpha1.Schedule{}
+	}
+	writeJSON(w, http.StatusOK, schedules)
+}
+
+func (s *Server) handleGetSchedule(w http.ResponseWriter, r *http.Request) {
+	sch, err := s.store.GetSchedule(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "schedule not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sch)
+}
+
+func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
+	err := s.store.DeleteSchedule(r.PathValue("name"))
+	if errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "schedule not found")
+		return
+	}
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// Schedule suspend/resume flips spec.suspend and lets reconcile notice on
+// its next tick — the same split (API records intent, controller acts) as
+// task suspend, minus the phase machinery since a schedule has no phases.
+func (s *Server) handleScheduleSuspend(w http.ResponseWriter, r *http.Request) {
+	s.setScheduleSuspend(w, r, true)
+}
+
+func (s *Server) handleScheduleResume(w http.ResponseWriter, r *http.Request) {
+	s.setScheduleSuspend(w, r, false)
+}
+
+func (s *Server) setScheduleSuspend(w http.ResponseWriter, r *http.Request, suspend bool) {
+	name := r.PathValue("name")
+	if _, err := s.store.GetSchedule(name); errors.Is(err, store.ErrNotFound) {
+		httpError(w, http.StatusNotFound, "schedule not found")
+		return
+	} else if err != nil {
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	if err := s.store.MarkScheduleSuspend(name, suspend); err != nil {
+		// Deleted between the existence check and this write.
+		if errors.Is(err, store.ErrNotFound) {
+			httpError(w, http.StatusNotFound, "schedule not found")
+			return
+		}
+		httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	status := "resumed"
+	if suspend {
+		status = "suspended"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
 }
 
 // redacted returns a copy of the model with the API key masked: the key is

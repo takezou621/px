@@ -73,6 +73,24 @@ type TaskWriter interface {
 	DeleteTask(name string) error
 }
 
+// ScheduleReader lists the Schedule definitions the controller fires from.
+type ScheduleReader interface {
+	ListSchedules() ([]*v1alpha1.Schedule, error)
+}
+
+// ScheduleWriter advances a schedule's fire clock. The Mark* methods are
+// single-statement updates: the controller works on snapshots, and a fire
+// write must never resurrect a spec field an apply just changed.
+type ScheduleWriter interface {
+	MarkScheduleFired(name string, at time.Time, task string) error
+}
+
+// TaskCreator stamps new task records (CreateTask fails on a taken name,
+// unlike UpsertTask) — how a Schedule materializes a fire into a Task.
+type TaskCreator interface {
+	CreateTask(*v1alpha1.Task) error
+}
+
 // EventRecorder appends one event to a task's history. Optional: a nil
 // Events field disables recording entirely (tests, embedders without a
 // store that carries events).
@@ -89,6 +107,9 @@ type Controller struct {
 		SessionReader
 		TaskWriter
 		SessionWriter
+		ScheduleReader
+		ScheduleWriter
+		TaskCreator
 	}
 	prov Provisioner
 	log  *slog.Logger
@@ -112,6 +133,9 @@ func New(store interface {
 	SessionReader
 	TaskWriter
 	SessionWriter
+	ScheduleReader
+	ScheduleWriter
+	TaskCreator
 }, prov Provisioner, log *slog.Logger) *Controller {
 	return &Controller{
 		store: store,
@@ -203,6 +227,7 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 	for _, t := range tasks {
 		c.reconcile(ctx, t)
 	}
+	c.reconcileSchedules(ctx, tasks)
 	c.Metrics.ObserveTick(c.now().Sub(start))
 }
 

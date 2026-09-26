@@ -17,11 +17,14 @@ const (
 	KindWorkspace = "Workspace"
 	KindModel     = "Model"
 	KindGateway   = "Gateway"
+	KindSchedule  = "Schedule"
 )
 
-// ObjectMeta identifies a manifest object.
+// ObjectMeta identifies a manifest object. CreationTimestamp is store-filled
+// (schedule apply takes the name only), read back from the row's created_at.
 type ObjectMeta struct {
-	Name string `json:"name" yaml:"name"`
+	Name             string    `json:"name" yaml:"name"`
+	CreationTimestamp time.Time `json:"creationTimestamp,omitempty" yaml:"creationTimestamp,omitempty"`
 }
 
 // TaskSpec declares an agent task run in an LXC sandbox.
@@ -196,6 +199,80 @@ type Gateway struct {
 	Spec       GatewaySpec `json:"spec" yaml:"spec"`
 }
 
+// History bounds for a Schedule's generated-task record. The default of 3
+// matches k8s's successfulJobsHistoryLimit; "keep zero history" is not an
+// option — an uninspectable run is a support hole. Applied HistoryLimit 0
+// means the default.
+const (
+	DefaultScheduleHistory = 3
+	MaxScheduleHistory     = 100
+)
+
+// ScheduleSpec declares recurring task generation: the controller stamps
+// a Task from TaskTemplate each time the cron expression fires, and the
+// generated task runs through everything a hand-run task does — no
+// special-casing anywhere downstream.
+type ScheduleSpec struct {
+	// Schedule is the fire expression, a standard 5-field cron string
+	// (minute hour dom month dow) evaluated in UTC — see ParseCron.
+	Schedule string `json:"schedule" yaml:"schedule"`
+	// TaskTemplate is the spec stamped into each generated task. It is a
+	// full TaskSpec and passes the same validation as an applied Task;
+	// the template is static (no templating of goal/env by fire time).
+	TaskTemplate TaskSpec `json:"taskTemplate" yaml:"taskTemplate"`
+	// Suspend pauses firing without deleting the definition.
+	Suspend bool `json:"suspend,omitempty" yaml:"suspend,omitempty"`
+	// HistoryLimit keeps at most this many finished generated tasks
+	// (0 = DefaultScheduleHistory): beyond it the controller destroys the
+	// oldest finished tasks this schedule stamped, riding the normal
+	// delete path.
+	HistoryLimit int `json:"historyLimit,omitempty" yaml:"historyLimit,omitempty"`
+}
+
+// ScheduleStatus is the controller's observed state of a Schedule.
+type ScheduleStatus struct {
+	// LastScheduleTime is the fire time of the newest generated task (not
+	// when the task ran — the scheduled moment). Survives restarts, so a
+	// px-server outage does not double-fire.
+	LastScheduleTime *time.Time `json:"lastScheduleTime,omitempty" yaml:"lastScheduleTime,omitempty"`
+	// LastTask is the newest generated task's name.
+	LastTask string `json:"lastTask,omitempty" yaml:"lastTask,omitempty"`
+}
+
+// Schedule is the API representation of a Schedule object.
+type Schedule struct {
+	APIVersion string         `json:"apiVersion" yaml:"apiVersion"`
+	Kind       string         `json:"kind" yaml:"kind"`
+	Metadata   ObjectMeta     `json:"metadata" yaml:"metadata"`
+	Spec       ScheduleSpec   `json:"spec" yaml:"spec"`
+	Status     ScheduleStatus `json:"status" yaml:"status,omitempty"`
+}
+
+// MaxSchedulePrefix bounds the schedule-name part of a generated task's
+// name: prefix + '-' + 10-digit unix seconds fills the DNS-1123 63-char
+// limit exactly.
+const MaxSchedulePrefix = 52
+
+// TaskNamePrefix returns the schedule-name part of a generated fire task's
+// name: the schedule's name, truncated so that prefix + '-' + 10-digit unix
+// seconds fills the DNS-1123 63-char limit exactly. Two schedules whose
+// names share this prefix would claim the same fire task names.
+func TaskNamePrefix(schedule string) string {
+	if len(schedule) > MaxSchedulePrefix {
+		return schedule[:MaxSchedulePrefix]
+	}
+	return schedule
+}
+
+// ScheduleTaskName returns the name a Schedule stamps the task it fires at
+// fireAt with: the schedule's name (truncated if long) plus the unix
+// seconds of the scheduled moment — not when the task actually started.
+// Fire times have minute resolution, so one schedule can never stamp two
+// tasks with the same name.
+func ScheduleTaskName(schedule string, fireAt time.Time) string {
+	return TaskNamePrefix(schedule) + "-" + strconv.FormatInt(fireAt.Unix(), 10)
+}
+
 // TaskPhase is the lifecycle phase of a Task.
 type TaskPhase string
 
@@ -210,6 +287,18 @@ const (
 	TaskFailed        TaskPhase = "Failed"
 	TaskProvisionFail TaskPhase = "ProvisionFailed"
 )
+
+// Terminal reports the phases a task never leaves. The controller's
+// session capture and TTL cleanup key off them, and so does a Schedule's
+// history pruning — a non-terminal task is never counted as history and
+// never pruned.
+func (p TaskPhase) Terminal() bool {
+	switch p {
+	case TaskSucceeded, TaskFailed, TaskProvisionFail:
+		return true
+	}
+	return false
+}
 
 // Task is the API representation of a Task object (manifest + status).
 // The yaml tags mirror the json ones: yaml.v3 marshals untagged fields by
@@ -264,6 +353,11 @@ type TaskStatus struct {
 	SessionSaved bool `json:"sessionSaved,omitempty" yaml:"sessionSaved,omitempty"`
 	// SessionBytes is the captured archive's size (0 = nothing to capture).
 	SessionBytes int `json:"sessionBytes,omitempty" yaml:"sessionBytes,omitempty"`
+	// ScheduleOwner is the Schedule that stamped this task, set by the
+	// controller at creation. It lives on Status, not Spec, because apply
+	// never accepts a status block — the schedule's history cleanup can
+	// trust the field, and a user cannot forge membership.
+	ScheduleOwner string `json:"scheduleOwner,omitempty" yaml:"scheduleOwner,omitempty"`
 }
 
 // PortStatus is the realized form of one spec.ports entry: the resolved
@@ -424,6 +518,26 @@ func (s *SessionSpec) CaptureName(task string) string {
 		return s.Name
 	}
 	return task
+}
+
+// ValidateSchedule checks a ScheduleSpec: the cron expression parses AND
+// fires at least once within the 4-year lookahead (a never-firing
+// expression like "0 0 31 2 *" is rejected at apply rather than wedging
+// reconcile in a doomed walk), and historyLimit is within bounds. The
+// taskTemplate is validated by the manifest parser alongside this (it is
+// the same code path as an applied Task).
+func ValidateSchedule(s *ScheduleSpec) error {
+	c, err := ParseCron(s.Schedule)
+	if err != nil {
+		return fmt.Errorf("spec.schedule: %w", err)
+	}
+	if _, ok := c.Next(time.Now()); !ok {
+		return fmt.Errorf("spec.schedule %q: matches no time within the 4-year lookahead", s.Schedule)
+	}
+	if s.HistoryLimit < 0 || s.HistoryLimit > MaxScheduleHistory {
+		return fmt.Errorf("spec.historyLimit %d: must be 0 (default %d) or 1-%d", s.HistoryLimit, DefaultScheduleHistory, MaxScheduleHistory)
+	}
+	return nil
 }
 
 // SessionInfo is the metadata form of a named capture. The archive

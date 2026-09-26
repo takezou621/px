@@ -370,6 +370,175 @@ func TestModelLifecycle(t *testing.T) {
 	}
 }
 
+func TestScheduleLifecycle(t *testing.T) {
+	st := openTestStore(t)
+
+	if _, err := st.GetSchedule("s1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound before upsert, got %v", err)
+	}
+	if err := st.MarkScheduleSuspend("s1", true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("suspend of unknown schedule: want ErrNotFound, got %v", err)
+	}
+	spec := v1alpha1.ScheduleSpec{
+		Schedule: "* * * * *",
+		TaskTemplate: v1alpha1.TaskSpec{
+			Image:  "tmpl",
+			Runner: v1alpha1.RunnerSpec{Command: []string{"true"}},
+		},
+	}
+	sch := &v1alpha1.Schedule{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindSchedule,
+		Metadata:   v1alpha1.ObjectMeta{Name: "s1"},
+		Spec:       spec,
+	}
+	if err := st.UpsertSchedule(sch); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSchedule("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Schedule != "* * * * *" || got.Spec.TaskTemplate.Image != "tmpl" {
+		t.Fatalf("spec not persisted: %+v", got.Spec)
+	}
+	if got.Kind != v1alpha1.KindSchedule {
+		t.Fatalf("Kind = %q", got.Kind)
+	}
+	if got.Metadata.CreationTimestamp.IsZero() {
+		t.Fatal("created_at not read back into CreationTimestamp")
+	}
+	if age := time.Since(got.Metadata.CreationTimestamp); age < 0 || age > 10*time.Second {
+		t.Fatalf("CreationTimestamp = %s, want ~now", got.Metadata.CreationTimestamp)
+	}
+	created := got.Metadata.CreationTimestamp
+
+	// The fire clock lives in status, which UpsertSchedule never writes —
+	// the controller owns it, applies must not reset it.
+	at := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	if err := st.MarkScheduleFired("s1", at, "s1-1790000000"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetSchedule("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastScheduleTime == nil || !got.Status.LastScheduleTime.Equal(at) {
+		t.Fatalf("clock = %v, want %s", got.Status.LastScheduleTime, at)
+	}
+	if got.Status.LastTask != "s1-1790000000" {
+		t.Fatalf("lastTask = %q", got.Status.LastTask)
+	}
+
+	// Re-apply replaces the spec and keeps clock and creation stamp.
+	spec.Schedule = "0 0 * * *"
+	spec.HistoryLimit = 7
+	sch.Spec = spec
+	if err := st.UpsertSchedule(sch); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetSchedule("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Schedule != "0 0 * * *" || got.Spec.HistoryLimit != 7 {
+		t.Fatalf("re-apply did not replace spec: %+v", got.Spec)
+	}
+	if got.Status.LastScheduleTime == nil || !got.Status.LastScheduleTime.Equal(at) {
+		t.Fatalf("re-apply reset the fire clock: %v", got.Status.LastScheduleTime)
+	}
+	if !got.Metadata.CreationTimestamp.Equal(created) {
+		t.Fatalf("re-apply moved the creation stamp: %s -> %s", created, got.Metadata.CreationTimestamp)
+	}
+
+	// Suspend flips only spec.suspend; the clock must survive both ways.
+	if err := st.MarkScheduleSuspend("s1", true); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.GetSchedule("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Spec.Suspend {
+		t.Fatal("suspend flag not set")
+	}
+	if got.Status.LastScheduleTime == nil || !got.Status.LastScheduleTime.Equal(at) {
+		t.Fatalf("suspend reset the fire clock: %v", got.Status.LastScheduleTime)
+	}
+	if err := st.MarkScheduleSuspend("s1", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = st.GetSchedule("s1"); err != nil {
+		t.Fatal(err)
+	} else if got.Spec.Suspend {
+		t.Fatal("resume flag not cleared")
+	}
+
+	schs, err := st.ListSchedules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schs) != 1 || schs[0].Metadata.Name != "s1" {
+		t.Fatalf("list = %+v, want [s1]", schs)
+	}
+
+	if err := st.DeleteSchedule("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteSchedule("s1"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// The fire clock must survive a restart, or every restart re-fires the
+// compressed window the schedule had already caught up on.
+func TestReopenPersistsScheduleClock(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir + "/px.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sch := &v1alpha1.Schedule{
+		APIVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindSchedule,
+		Metadata:   v1alpha1.ObjectMeta{Name: "s1"},
+		Spec: v1alpha1.ScheduleSpec{
+			Schedule: "* * * * *",
+			TaskTemplate: v1alpha1.TaskSpec{
+				Image:  "tmpl",
+				Runner: v1alpha1.RunnerSpec{Command: []string{"true"}},
+			},
+		},
+	}
+	if err := st.UpsertSchedule(sch); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	if err := st.MarkScheduleFired("s1", at, "s1-1790000000"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := Open(dir + "/px.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+
+	got, err := st2.GetSchedule("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.LastScheduleTime == nil || !got.Status.LastScheduleTime.Equal(at) {
+		t.Fatalf("fire clock lost across reopen: %v", got.Status.LastScheduleTime)
+	}
+	if got.Metadata.CreationTimestamp.IsZero() {
+		t.Fatal("creation stamp lost across reopen")
+	}
+}
+
 // Session archives are upsert-by-task (a task owns at most one capture) and
 // the row dies with the task record — continuations read the capture only
 // while the source task exists.

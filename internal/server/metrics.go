@@ -152,6 +152,14 @@ func (s *Server) metricsText() (string, error) {
 	b.WriteString("# TYPE px_sessions gauge\n")
 	fmt.Fprintf(&b, "px_sessions %d\n", ns)
 
+	nsch, err := s.store.CountSchedules()
+	if err != nil {
+		return "", err
+	}
+	b.WriteString("# HELP px_schedules Stored Schedule definitions.\n")
+	b.WriteString("# TYPE px_schedules gauge\n")
+	fmt.Fprintf(&b, "px_schedules %d\n", nsch)
+
 	nb, err := s.store.SessionBytesTotal()
 	if err != nil {
 		return "", err

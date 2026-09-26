@@ -1,6 +1,7 @@
 # Build artifacts
 /px
 /px-server
+/bin/
 /dist/
 
 # Local state

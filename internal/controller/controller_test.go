@@ -263,10 +263,12 @@ func (f *fakeProv) Owned(_ context.Context, taskName, _ string, vmid int) (bool,
 type memStore struct {
 	mu          sync.Mutex
 	failUpserts int // fail the next N UpsertTask calls, then succeed
+	failCreates int // fail the next N CreateTask calls, then succeed
 	tasks       map[string]*v1alpha1.Task
 	workspaces  map[string]*v1alpha1.Workspace
 	models      map[string]*v1alpha1.Model
 	gateways    map[string]*v1alpha1.Gateway
+	schedules       map[string]*v1alpha1.Schedule
 	sessions        map[string][]byte
 	sessionLast     map[string]string
 	sessionExplicit map[string]bool
@@ -278,10 +280,49 @@ func newMemStore() *memStore {
 		workspaces:      map[string]*v1alpha1.Workspace{},
 		models:          map[string]*v1alpha1.Model{},
 		gateways:        map[string]*v1alpha1.Gateway{},
+		schedules:       map[string]*v1alpha1.Schedule{},
 		sessions:        map[string][]byte{},
 		sessionLast:     map[string]string{},
 		sessionExplicit: map[string]bool{},
 	}
+}
+
+// CreateTask mirrors the real store's insert semantics: a taken name fails
+// instead of overwriting.
+func (m *memStore) CreateTask(t *v1alpha1.Task) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failCreates > 0 {
+		m.failCreates--
+		return errors.New("db broken")
+	}
+	if _, ok := m.tasks[t.Metadata.Name]; ok {
+		return store.ErrExists
+	}
+	m.tasks[t.Metadata.Name] = copyTask(t)
+	return nil
+}
+
+func (m *memStore) ListSchedules() ([]*v1alpha1.Schedule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*v1alpha1.Schedule
+	for _, sch := range m.schedules {
+		out = append(out, copySchedule(sch))
+	}
+	return out, nil
+}
+
+func (m *memStore) MarkScheduleFired(name string, at time.Time, task string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sch, ok := m.schedules[name]
+	if !ok {
+		return errors.New("not found")
+	}
+	sch.Status.LastScheduleTime = &at
+	sch.Status.LastTask = task
+	return nil
 }
 
 func (m *memStore) GetSession(task string) ([]byte, error) {
@@ -453,6 +494,16 @@ func copyTask(t *v1alpha1.Task) *v1alpha1.Task {
 	if t.Status.DeletionTimestamp != nil {
 		v := *t.Status.DeletionTimestamp
 		cp.Status.DeletionTimestamp = &v
+	}
+	return &cp
+}
+
+// copySchedule deep-copies the status timestamp a fire write mutates.
+func copySchedule(sch *v1alpha1.Schedule) *v1alpha1.Schedule {
+	cp := *sch
+	if sch.Status.LastScheduleTime != nil {
+		v := *sch.Status.LastScheduleTime
+		cp.Status.LastScheduleTime = &v
 	}
 	return &cp
 }

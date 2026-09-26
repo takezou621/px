@@ -1087,6 +1087,133 @@ func TestSessionsEndpoints(t *testing.T) {
 	}
 }
 
+func TestScheduleEndpoints(t *testing.T) {
+	ts, _, _, _ := newObsServer(t)
+
+	// An empty registry must read as [], not null.
+	if body := getBody(t, ts, "/v1/schedules"); strings.TrimSpace(body) != "[]" {
+		t.Fatalf("want [], got %s", body)
+	}
+	if code, _ := getStatus(t, ts, "/v1/schedules/nope"); code != http.StatusNotFound {
+		t.Fatalf("unknown schedule get: want 404, got %d", code)
+	}
+	if code, _, err := request(t, ts, http.MethodDelete, "/v1/schedules/nope"); err != nil || code != http.StatusNotFound {
+		t.Fatalf("unknown schedule delete: got %d (%v)", code, err)
+	}
+	if code, _, err := request(t, ts, http.MethodPost, "/v1/schedules/nope/suspend"); err != nil || code != http.StatusNotFound {
+		t.Fatalf("unknown schedule suspend: got %d (%v)", code, err)
+	}
+
+	const sched = `
+apiVersion: px.io/v1alpha1
+kind: Schedule
+metadata:
+  name: nightly
+spec:
+  schedule: "0 9 * * *"
+  taskTemplate:
+    image: tmpl
+    runner:
+      command: ["true"]
+`
+	res, err := http.Post(ts.URL+"/v1/apply", "application/yaml", strings.NewReader(sched))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("apply: want 201, got %d: %s", res.StatusCode, body)
+	}
+
+	var s v1alpha1.Schedule
+	if err := json.Unmarshal([]byte(getBody(t, ts, "/v1/schedules/nightly")), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Spec.Schedule != "0 9 * * *" || s.Spec.Suspend {
+		t.Fatalf("spec wrong: %+v", s.Spec)
+	}
+
+	if code, body, err := request(t, ts, http.MethodPost, "/v1/schedules/nightly/suspend"); err != nil || code != http.StatusOK || !strings.Contains(body, "suspended") {
+		t.Fatalf("suspend: got %d %s (%v)", code, body, err)
+	}
+	if err := json.Unmarshal([]byte(getBody(t, ts, "/v1/schedules/nightly")), &s); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Spec.Suspend {
+		t.Fatal("schedule still active after suspend")
+	}
+
+	if code, body, err := request(t, ts, http.MethodPost, "/v1/schedules/nightly/resume"); err != nil || code != http.StatusOK || !strings.Contains(body, "resumed") {
+		t.Fatalf("resume: got %d %s (%v)", code, body, err)
+	}
+	// A fresh decode: json.Unmarshal merges, and `suspend` is omitted when
+	// false, so reusing s would read the pre-resume true as still set.
+	var s2 v1alpha1.Schedule
+	if err := json.Unmarshal([]byte(getBody(t, ts, "/v1/schedules/nightly")), &s2); err != nil {
+		t.Fatal(err)
+	}
+	if s2.Spec.Suspend {
+		t.Fatal("schedule still suspended after resume")
+	}
+
+	if code, body, err := request(t, ts, http.MethodDelete, "/v1/schedules/nightly"); err != nil || code != http.StatusOK || !strings.Contains(body, "deleted") {
+		t.Fatalf("delete: got %d %s (%v)", code, body, err)
+	}
+	if code, _ := getStatus(t, ts, "/v1/schedules/nightly"); code != http.StatusNotFound {
+		t.Fatalf("after delete: want 404, got %d", code)
+	}
+}
+
+// Two schedules whose names share the first MaxSchedulePrefix characters
+// generate identical <prefix>-<unixsec> fire task names; the second would
+// find a foreign owner and silently lose its fires. Apply rejects the
+// pair instead.
+func TestScheduleFireNameCollisionRejected(t *testing.T) {
+	ts, _, _, _ := newObsServer(t)
+
+	mk := func(name string) string {
+		return fmt.Sprintf(`
+apiVersion: px.io/v1alpha1
+kind: Schedule
+metadata:
+  name: %s
+spec:
+  schedule: "0 9 * * *"
+  taskTemplate:
+    image: tmpl
+    runner:
+      command: ["true"]
+`, name)
+	}
+	first := strings.Repeat("a", 52) + "-aaaaa"
+	second := strings.Repeat("a", 52) + "-bbbbb"
+
+	applyCode := func(doc string) (int, string) {
+		res, err := http.Post(ts.URL+"/v1/apply", "application/yaml", strings.NewReader(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		return res.StatusCode, string(body)
+	}
+	if code, body := applyCode(mk(first)); code != http.StatusCreated {
+		t.Fatalf("first apply: want 201, got %d: %s", code, body)
+	}
+	// Re-applying the same schedule must not trip the collision check.
+	if code, body := applyCode(mk(first)); code != http.StatusCreated {
+		t.Fatalf("re-apply of the same name: want 201, got %d: %s", code, body)
+	}
+	code, body := applyCode(mk(second))
+	if code != http.StatusConflict || !strings.Contains(body, "collide") {
+		t.Fatalf("colliding apply: want 409 with collide, got %d: %s", code, body)
+	}
+	if c, _ := getStatus(t, ts, "/v1/schedules/"+second); c != http.StatusNotFound {
+		t.Fatalf("colliding schedule stored: want 404, got %d", c)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	ts, _, _, ctl := newObsServer(t)
 
@@ -1143,6 +1270,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(out, "px_sessions ") || !strings.Contains(out, "px_sessions_bytes ") {
 		t.Fatalf("session gauges missing:\n%s", out)
+	}
+	if !strings.Contains(out, "px_schedules ") {
+		t.Fatalf("px_schedules gauge missing:\n%s", out)
 	}
 }
 
