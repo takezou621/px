@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/metrics"
 	"github.com/kawai/px/internal/store"
 )
 
@@ -63,6 +64,13 @@ type TaskWriter interface {
 	DeleteTask(name string) error
 }
 
+// EventRecorder appends one event to a task's history. Optional: a nil
+// Events field disables recording entirely (tests, embedders without a
+// store that carries events).
+type EventRecorder interface {
+	RecordEvent(task string, at time.Time, reason, message string) error
+}
+
 type Controller struct {
 	store interface {
 		TaskReader
@@ -77,6 +85,14 @@ type Controller struct {
 	log  *slog.Logger
 	Tick time.Duration // reconcile interval
 	now  func() time.Time
+
+	// Events records lifecycle transitions as they happen (nil disables).
+	// A failed record only logs — an event is an observation, never a gate
+	// on the transition it describes.
+	Events EventRecorder
+	// Metrics accumulates the tick counters the /v1/metrics endpoint
+	// renders (nil disables collection).
+	Metrics *metrics.Metrics
 }
 
 func New(store interface {
@@ -120,7 +136,14 @@ func (c *Controller) Run(ctx context.Context) {
 // so it cannot clobber a VMID that reconcile persists concurrently. The mark
 // lives in the store, so an in-flight delete survives a px-server restart.
 func (c *Controller) RequestDestroy(name string) error {
-	return c.store.MarkTaskDeleted(name, c.now())
+	// Record before marking: the mark makes the task eligible for destroy,
+	// and a concurrent reconcile that completes it before eventf runs would
+	// leave the event unwritten (the store drops events for vanished tasks).
+	c.eventf(name, "Deleting", "delete requested")
+	if err := c.store.MarkTaskDeleted(name, c.now()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RequestSuspend persists the Suspending phase; reconcile drives the freeze
@@ -132,16 +155,37 @@ func (c *Controller) RequestDestroy(name string) error {
 // into Suspending. The mark lives in the store, so an in-flight suspend
 // survives a px-server restart.
 func (c *Controller) RequestSuspend(name string, expect v1alpha1.TaskPhase) error {
-	return c.store.MarkTaskPhase(name, expect, v1alpha1.TaskSuspending, "suspend requested")
+	if err := c.store.MarkTaskPhase(name, expect, v1alpha1.TaskSuspending, "suspend requested"); err != nil {
+		return err
+	}
+	c.eventf(name, "SuspendRequested", "suspend requested")
+	return nil
 }
 
 // RequestResume persists the Resuming phase; reconcile drives the thaw.
 // Same compare-and-set discipline as RequestSuspend.
 func (c *Controller) RequestResume(name string, expect v1alpha1.TaskPhase) error {
-	return c.store.MarkTaskPhase(name, expect, v1alpha1.TaskResuming, "resume requested")
+	if err := c.store.MarkTaskPhase(name, expect, v1alpha1.TaskResuming, "resume requested"); err != nil {
+		return err
+	}
+	c.eventf(name, "ResumeRequested", "resume requested")
+	return nil
+}
+
+// eventf records one lifecycle event for a task. Failure only logs: events
+// describe the transitions the controller makes, and must never gate them.
+func (c *Controller) eventf(task, reason, format string, args ...any) {
+	if c.Events == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if err := c.Events.RecordEvent(task, c.now(), reason, msg); err != nil {
+		c.log.Warn("record event", "task", task, "reason", reason, "err", err)
+	}
 }
 
 func (c *Controller) reconcileAll(ctx context.Context) {
+	start := c.now()
 	tasks, err := c.store.ListTasks()
 	if err != nil {
 		c.log.Error("list tasks", "err", err)
@@ -150,6 +194,7 @@ func (c *Controller) reconcileAll(ctx context.Context) {
 	for _, t := range tasks {
 		c.reconcile(ctx, t)
 	}
+	c.Metrics.ObserveTick(c.now().Sub(start))
 }
 
 func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
@@ -193,6 +238,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			t.Status.Phase = v1alpha1.TaskProvisionFail
 			t.Status.Reason = "provisioning interrupted by restart"
 			t.Status.EndedAt = nowPtr(c.now)
+			c.eventf(t.Metadata.Name, "ProvisionFailed", "restart recovery: no container was recorded, task failed without one")
 			c.persist(t)
 			return
 		}
@@ -219,6 +265,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			}
 			if !owned {
 				c.log.Warn("adoption skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container)
+				c.eventf(t.Metadata.Name, "ProvisionFailed", "restart recovery: container %d is not owned by the task, left alone", t.Status.Container)
 				t.Status.Container = 0
 				t.Status.Phase = v1alpha1.TaskProvisionFail
 				t.Status.Reason = "provisioning interrupted by restart: container is not owned by the task, left alone"
@@ -231,6 +278,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			t.Status.StartedAt = &now
 			t.Status.Reason = ""
 			c.log.Info("adopted interrupted provision", "task", t.Metadata.Name, "vmid", t.Status.Container)
+			c.eventf(t.Metadata.Name, "Running", "adopted container %d on %s after restart", t.Status.Container, t.Status.Node)
 			c.persist(t)
 			return
 		}
@@ -242,6 +290,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			// The VMID no longer names our clone; leave the foreign container
 			// alone and fail the task.
 			c.log.Warn("cleanup skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
+			c.eventf(t.Metadata.Name, "ProvisionFailed", "restart recovery: container %d is not owned by the task, left alone", t.Status.Container)
 			t.Status.Container = 0
 			t.Status.Phase = v1alpha1.TaskProvisionFail
 			t.Status.Reason = "provisioning interrupted by restart: container is not owned by the task, left alone"
@@ -249,6 +298,7 @@ func (c *Controller) reconcile(ctx context.Context, t *v1alpha1.Task) {
 			c.persist(t)
 			return
 		}
+		c.eventf(t.Metadata.Name, "ProvisionFailed", "restart recovery: container %d never booted a runner, cleaned up", t.Status.Container)
 		t.Status.Container = 0
 		t.Status.Phase = v1alpha1.TaskProvisionFail
 		t.Status.Reason = "provisioning interrupted by restart: container never booted a runner, cleaned up"
@@ -287,6 +337,7 @@ func (c *Controller) repairNode(ctx context.Context, t *v1alpha1.Task) {
 		t.Status.Phase = v1alpha1.TaskFailed
 		t.Status.Reason = "container vanished from the cluster: " + err.Error()
 		c.log.Warn("container vanished", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		c.eventf(t.Metadata.Name, "Failed", "container %d vanished from the cluster", t.Status.Container)
 		c.persist(t)
 	case err != nil:
 		// Cluster view unavailable; retry next tick.
@@ -445,6 +496,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	}
 	t.Status.Phase = v1alpha1.TaskProvisioning
 	t.Status.Reason = "cloning template and starting container"
+	c.eventf(t.Metadata.Name, "Provisioning", "cloning template and starting container")
 	c.persist(t)
 
 	node, err := c.prov.Schedule(ctx, t.Spec.Image)
@@ -453,6 +505,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 		return
 	}
 	t.Status.Node = node
+	c.eventf(t.Metadata.Name, "Scheduled", "scheduled to node %s", node)
 
 	vmid, err := c.prov.Allocate(ctx)
 	if err != nil {
@@ -488,6 +541,7 @@ func (c *Controller) provision(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.StartedAt = &now
 	t.Status.Reason = ""
 	c.log.Info("task running", "task", t.Metadata.Name, "vmid", vmid)
+	c.eventf(t.Metadata.Name, "Running", "runner started in container %d on %s", vmid, node)
 	c.persist(t)
 }
 
@@ -577,6 +631,8 @@ func (c *Controller) failProvision(t *v1alpha1.Task, err error) {
 	t.Status.Reason = err.Error()
 	t.Status.EndedAt = nowPtr(c.now)
 	c.log.Error("provision task", "task", t.Metadata.Name, "err", err)
+	c.eventf(t.Metadata.Name, "ProvisionFailed", "%s", err.Error())
+	c.Metrics.IncProvisionFailures()
 	c.persist(t)
 }
 
@@ -594,6 +650,7 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 			t.Status.Phase = v1alpha1.TaskFailed
 			t.Status.Reason = "container not running and no exit file: " + err.Error()
 			c.log.Warn("container died", "task", t.Metadata.Name, "vmid", t.Status.Container)
+			c.eventf(t.Metadata.Name, "ContainerDied", "container not running and no exit file: %s", err)
 			c.persist(t)
 			// Settle the capture in the same tick the terminal phase lands:
 			// a px run --continue issued the moment the phase is visible
@@ -619,6 +676,7 @@ func (c *Controller) poll(ctx context.Context, t *v1alpha1.Task) {
 		t.Status.Reason = "runner exited non-zero"
 	}
 	c.log.Info("task finished", "task", t.Metadata.Name, "exit", *code, "phase", t.Status.Phase)
+	c.eventf(t.Metadata.Name, string(t.Status.Phase), "runner exited %d", *code)
 	c.persist(t)
 	// Same-tick capture: see the container-died path above. A failed
 	// capture retries on the following terminal tick, unchanged.
@@ -635,6 +693,7 @@ func (c *Controller) reconcileRunning(ctx context.Context, t *v1alpha1.Task) {
 		t.Status.Phase = v1alpha1.TaskSuspended
 		t.Status.Reason = "adopted container found frozen"
 		c.log.Info("adopted frozen container as suspended", "task", t.Metadata.Name, "vmid", t.Status.Container)
+		c.eventf(t.Metadata.Name, "Suspended", "adopted container found frozen")
 		c.persist(t)
 		return
 	}
@@ -668,6 +727,7 @@ func (c *Controller) deadDuringSuspend(ctx context.Context, t *v1alpha1.Task, du
 	t.Status.Phase = v1alpha1.TaskFailed
 	t.Status.Reason = "container not running while " + during
 	c.log.Warn("container died", "task", t.Metadata.Name, "vmid", t.Status.Container, "during", during)
+	c.eventf(t.Metadata.Name, "ContainerDied", "container not running while %s", during)
 	c.persist(t)
 	return true
 }
@@ -694,6 +754,7 @@ func (c *Controller) reconcileSuspending(ctx context.Context, t *v1alpha1.Task) 
 	t.Status.Phase = v1alpha1.TaskSuspended
 	t.Status.Reason = "container frozen"
 	c.log.Info("task suspended", "task", t.Metadata.Name, "vmid", t.Status.Container)
+	c.eventf(t.Metadata.Name, "Suspended", "container frozen")
 	c.persist(t)
 }
 
@@ -740,6 +801,7 @@ func (c *Controller) reconcileResuming(ctx context.Context, t *v1alpha1.Task) {
 	t.Status.Phase = v1alpha1.TaskRunning
 	t.Status.Reason = "container thawed"
 	c.log.Info("task resumed", "task", t.Metadata.Name, "vmid", t.Status.Container)
+	c.eventf(t.Metadata.Name, "Resumed", "container thawed")
 	c.persist(t)
 }
 
@@ -772,6 +834,7 @@ func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool 
 	if !owned {
 		c.log.Warn("capture session skipped: container is not owned by the task", "task", t.Metadata.Name, "vmid", t.Status.Container)
 		t.Status.SessionSaved = true
+		c.eventf(t.Metadata.Name, "SessionSaved", "capture skipped: container not owned by the task")
 		c.persist(t)
 		return true
 	}
@@ -788,16 +851,19 @@ func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool 
 	if !running {
 		c.log.Warn("capture session skipped: container no longer running", "task", t.Metadata.Name, "vmid", t.Status.Container)
 		t.Status.SessionSaved = true
+		c.eventf(t.Metadata.Name, "SessionSaved", "capture skipped: container no longer running")
 		c.persist(t)
 		return true
 	}
 	data, err := c.prov.CaptureSession(ctx, t.Status.Node, t.Status.Container, t.Spec.Runner.User)
+	tooLarge := false
 	if errors.Is(err, ErrSessionTooLarge) {
 		// Settled, not retryable: the archive can never fit the cap, so
 		// waiting only pins the container. The log and the zero byte count
 		// record the loss.
 		c.log.Error("capture session over the size cap, storing nothing", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
 		data = nil
+		tooLarge = true
 	} else if err != nil {
 		c.log.Error("capture session", "task", t.Metadata.Name, "vmid", t.Status.Container, "err", err)
 		return false
@@ -811,6 +877,14 @@ func (c *Controller) captureSession(ctx context.Context, t *v1alpha1.Task) bool 
 	t.Status.SessionSaved = true
 	t.Status.SessionBytes = len(data)
 	c.persist(t)
+	switch {
+	case tooLarge:
+		c.eventf(t.Metadata.Name, "SessionSaved", "capture skipped: session exceeds the %d byte cap", v1alpha1.MaxSessionBytes)
+	case len(data) > 0:
+		c.eventf(t.Metadata.Name, "SessionSaved", "captured %d bytes of session", len(data))
+	default:
+		c.eventf(t.Metadata.Name, "SessionSaved", "nothing to capture")
+	}
 	return true
 }
 
@@ -858,6 +932,7 @@ func (c *Controller) cleanupAfterTTL(ctx context.Context, t *v1alpha1.Task) {
 	}
 	t.Status.Container = 0
 	t.Status.Reason += " (container cleaned up after TTL)"
+	c.eventf(t.Metadata.Name, "TTLDeleted", "container %d cleaned up after TTL", vmid)
 	c.persist(t)
 }
 

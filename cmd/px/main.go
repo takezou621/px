@@ -47,6 +47,10 @@ func main() {
 		err = cmdLogs(fs, args)
 	case "exec":
 		err = cmdExec(fs, args)
+	case "events":
+		err = cmdEvents(fs, args)
+	case "metrics":
+		err = cmdMetrics(fs, args)
 	case "watch":
 		err = cmdWatch(fs, args)
 	case "delete":
@@ -491,6 +495,18 @@ func cmdDescribe(fs *flag.FlagSet, args []string) error {
 			return err
 		}
 		printJSONIndent(t)
+		// Events live in their own table, not Task status — fetch the
+		// history and append it, so describe stays the one-stop
+		// "what happened to this task". Best-effort: the JSON body is
+		// the primary output and must survive an events read hiccup.
+		var evs []*v1alpha1.Event
+		if err := doJSON(http.MethodGet, "/v1/tasks/"+name+"/events", nil, &evs); err == nil && len(evs) > 0 {
+			fmt.Println("\nEvents:")
+			for i := len(evs) - 1; i >= 0; i-- {
+				ev := evs[i]
+				fmt.Printf("  %s  %-17s %s\n", ev.Time.Local().Format("2006-01-02 15:04:05"), ev.Reason, ev.Message)
+			}
+		}
 	case "workspace":
 		var ws *v1alpha1.Workspace
 		if err := doJSON(http.MethodGet, "/v1/workspaces/"+name, nil, &ws); err != nil {
@@ -727,6 +743,60 @@ func cmdSuspendResume(fs *flag.FlagSet, args []string, op string) error {
 	return nil
 }
 
+// cmdEvents prints the task event history. `px events NAME` reads one
+// task's whole history (capped server-side at MaxTaskEvents); bare
+// `px events` reads the recent feed across tasks, with -limit sizing the
+// page. Rows arrive newest first and print oldest first — a history reads
+// forward in time.
+func cmdEvents(fs *flag.FlagSet, args []string) error {
+	limit := fs.Int("limit", 500, "max events for the whole feed (1..1000)")
+	// Parse flags first, then take the name from what's left. popName would
+	// misread `px events -limit 50` — the flag's VALUE — as the task name.
+	// A second parse accepts flags placed after the name, `px events t1
+	// -limit=10`, the way the other commands' popName+Parse flow does not.
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	name := ""
+	if rest := fs.Args(); len(rest) > 0 {
+		name = rest[0]
+		if err := fs.Parse(rest[1:]); err != nil {
+			return err
+		}
+	}
+	path := fmt.Sprintf("/v1/events?limit=%d", *limit)
+	if name != "" {
+		path = "/v1/tasks/" + name + "/events"
+	}
+	var evs []*v1alpha1.Event
+	if err := doJSON(http.MethodGet, path, nil, &evs); err != nil {
+		return err
+	}
+	if len(evs) == 0 {
+		if name != "" {
+			fmt.Printf("No events for %s.\n", name)
+		} else {
+			fmt.Println("No events.")
+		}
+		return nil
+	}
+	fmt.Printf("%-20s %-24s %-17s %-8s %s\n", "TIME", "TASK", "REASON", "AGE", "MESSAGE")
+	for i := len(evs) - 1; i >= 0; i-- {
+		ev := evs[i]
+		t := ev.Time
+		fmt.Printf("%-20s %-24s %-17s %-8s %s\n",
+			t.Local().Format("2006-01-02 15:04:05"), ev.Task, ev.Reason, age(&t), ev.Message)
+	}
+	return nil
+}
+
+func cmdMetrics(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return stream(http.MethodGet, "/v1/metrics", os.Stdout)
+}
+
 func cmdWatch(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -918,6 +988,9 @@ Usage:
   px exec NAME -- CMD [ARG...]    Run a command in a running task's container
                                   (exits with the command's exit code)
   px watch                        Stream task phase transitions
+  px events [NAME]                Task lifecycle events: one task's history,
+                                  or (no NAME) the recent feed across tasks
+  px metrics                      Prometheus text metrics from the server
   px delete task NAME             Delete a task and its container
   px delete model NAME            Delete a model
   px delete gateway NAME          Delete a gateway

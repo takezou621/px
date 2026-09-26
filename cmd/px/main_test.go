@@ -260,3 +260,37 @@ func TestCmdRunContinueKeepsNameAndTTL(t *testing.T) {
 		t.Errorf("TTL = %d, want the flag's 120", m.Spec.TTLSecondsAfterFinished)
 	}
 }
+
+func TestCmdEventsArgParsing(t *testing.T) {
+	var gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.RequestURI()
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer ts.Close()
+
+	oldURL := serverURL
+	serverURL = ts.URL
+	defer func() { serverURL = oldURL }()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no args feeds the whole history", nil, "/v1/events?limit=500"},
+		{"-limit takes its value, not a task name", []string{"-limit", "50"}, "/v1/events?limit=50"},
+		{"joined form before the name", []string{"-limit=50", "t1"}, "/v1/tasks/t1/events"},
+		{"name only", []string{"t1"}, "/v1/tasks/t1/events"},
+		{"flags after the name", []string{"t1", "-limit=10"}, "/v1/tasks/t1/events"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := cmdEvents(flag.NewFlagSet("events", flag.ContinueOnError), tc.args); err != nil {
+				t.Fatalf("cmdEvents(%v): %v", tc.args, err)
+			}
+			if gotPath != tc.want {
+				t.Errorf("requested %q, want %q", gotPath, tc.want)
+			}
+		})
+	}
+}

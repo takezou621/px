@@ -13,6 +13,7 @@ import (
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/controller"
+	"github.com/kawai/px/internal/metrics"
 	"github.com/kawai/px/internal/store"
 )
 
@@ -23,6 +24,13 @@ type Server struct {
 	ctl   *controller.Controller
 	prov  controller.Provisioner
 	log   *slog.Logger
+
+	// Metrics is the shared counter set the controller feeds and
+	// /v1/metrics renders (nil renders zeros).
+	Metrics *metrics.Metrics
+	// DBPath locates the SQLite database for px_store_bytes; empty omits
+	// the gauge.
+	DBPath string
 }
 
 func New(st *store.Store, ctl *controller.Controller, prov controller.Provisioner, log *slog.Logger) *Server {
@@ -36,6 +44,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/tasks/{name}", s.handleGetTask)
 	mux.HandleFunc("DELETE /v1/tasks/{name}", s.handleDeleteTask)
 	mux.HandleFunc("GET /v1/tasks/{name}/logs", s.handleTaskLogs)
+	mux.HandleFunc("GET /v1/tasks/{name}/events", s.handleTaskEvents)
+	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.HandleFunc("POST /v1/tasks/{name}/exec", s.handleTaskExec)
 	mux.HandleFunc("POST /v1/tasks/{name}/suspend", s.handleTaskSuspend)
 	mux.HandleFunc("POST /v1/tasks/{name}/resume", s.handleTaskResume)
@@ -49,6 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/gateways/{name}", s.handleGetGateway)
 	mux.HandleFunc("DELETE /v1/gateways/{name}", s.handleDeleteGateway)
 	mux.HandleFunc("GET /v1/templates", s.handleListTemplates)
+	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/watch", s.handleWatch)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

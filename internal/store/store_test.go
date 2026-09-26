@@ -447,3 +447,123 @@ func TestCreateTaskClearsStaleSessionRow(t *testing.T) {
 		t.Fatalf("a fresh record must clear the stale session row, got %v", err)
 	}
 }
+
+func TestCreateTaskClearsStaleEvents(t *testing.T) {
+	st := openTestStore(t)
+
+	if err := st.CreateTask(testTask("t1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordEvent("t1", time.Now().UTC(), "Provisioning", "past life"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteTask("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(testTask("t1")); err != nil {
+		t.Fatal(err)
+	}
+	if evs, err := st.ListTaskEvents("t1"); err != nil || len(evs) != 0 {
+		t.Fatalf("a fresh record must clear stale events, got %d err=%v", len(evs), err)
+	}
+}
+
+// Events are append-only per task, newest first on read, pruned to
+// MaxTaskEvents per task, and they die with the task record: the delete is
+// the record's end, and its history must not outlive it.
+func TestEventLifecycle(t *testing.T) {
+	st := openTestStore(t)
+	_ = st.CreateTask(testTask("t1"))
+
+	if evs, err := st.ListTaskEvents("t1"); err != nil || len(evs) != 0 {
+		t.Fatalf("fresh task: want no events, got %v err=%v", evs, err)
+	}
+
+	base := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+
+	// A record racing a task's delete must not become an orphan row in the
+	// cross-task feed: recording for a vanished task is a silent no-op.
+	if err := st.RecordEvent("ghost", base, "Deleting", "no such task"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.CountEvents(); err != nil || n != 0 {
+		t.Fatalf("orphan record: CountEvents = %d err=%v, want 0", n, err)
+	}
+
+	for i, r := range []string{"Provisioning", "Scheduled", "Running"} {
+		if err := st.RecordEvent("t1", base.Add(time.Duration(i)*time.Second), r, "msg "+r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	evs, err := st.ListTaskEvents("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 3 || evs[0].Reason != "Running" || evs[2].Reason != "Provisioning" {
+		t.Fatalf("want newest-first [Running Scheduled Provisioning], got %+v", evs)
+	}
+	if evs[0].Task != "t1" || !evs[0].Time.Equal(base.Add(2*time.Second)) || evs[0].Message != "msg Running" {
+		t.Fatalf("event fields not round-tripped: %+v", evs[0])
+	}
+
+	// The cross-task feed honors the limit, taking the newest rows.
+	if err := st.RecordEvent("t1", base.Add(3*time.Second), "Succeeded", "msg Succeeded"); err != nil {
+		t.Fatal(err)
+	}
+	feed, err := st.ListEvents(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed) != 2 || feed[0].Reason != "Succeeded" || feed[1].Reason != "Running" {
+		t.Fatalf("feed must be the 2 newest, got %+v", feed)
+	}
+	if n, err := st.CountEvents(); err != nil || n != 4 {
+		t.Fatalf("CountEvents = %d err=%v, want 4", n, err)
+	}
+
+	// The per-task cap prunes the oldest rows, newest kept.
+	for i := 0; i < v1alpha1.MaxTaskEvents; i++ {
+		if err := st.RecordEvent("t1", base.Add(time.Duration(4+i)*time.Second), "Tick", "filler"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := st.CountEvents(); err != nil || n != v1alpha1.MaxTaskEvents {
+		t.Fatalf("after cap: CountEvents = %d err=%v, want %d", n, err, v1alpha1.MaxTaskEvents)
+	}
+	oldest, err := st.ListTaskEvents("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 4 real rows + 200 fillers = 204; the prune drops the 4 oldest.
+	if last := oldest[len(oldest)-1]; last.Reason != "Tick" {
+		t.Fatalf("prune must drop the oldest rows first, oldest kept = %s", last.Reason)
+	}
+
+	// Deleting the task drops its history.
+	if err := st.DeleteTask("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.CountEvents(); err != nil || n != 0 {
+		t.Fatalf("events must die with the task: CountEvents = %d err=%v", n, err)
+	}
+}
+
+// SessionBytesTotal backs px_sessions_bytes — the one number showing how
+// much of the store is conversation history.
+func TestSessionBytesTotal(t *testing.T) {
+	st := openTestStore(t)
+
+	if n, err := st.SessionBytesTotal(); err != nil || n != 0 {
+		t.Fatalf("empty store: got %d err=%v, want 0", n, err)
+	}
+	if err := st.SaveSession("t1", []byte("12345")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSession("t2", []byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.SessionBytesTotal(); err != nil || n != 8 {
+		t.Fatalf("got %d err=%v, want 8", n, err)
+	}
+}

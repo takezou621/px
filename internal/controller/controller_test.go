@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
+	"github.com/kawai/px/internal/metrics"
 	"github.com/kawai/px/internal/store"
 )
 
@@ -2244,5 +2246,162 @@ func TestDeleteCapturesSessionBeforeDestroy(t *testing.T) {
 	}
 	if _, ok := st.sessions["t1"]; ok {
 		t.Fatal("session row must die with the task record")
+	}
+}
+
+// eventLog is the EventRecorder fake: it captures (reason) order, which is
+// the contract under test — the store's own tests cover persistence.
+type eventLog struct {
+	mu     sync.Mutex
+	events []v1alpha1.Event
+}
+
+func (l *eventLog) RecordEvent(task string, at time.Time, reason, message string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, v1alpha1.Event{Task: task, Time: at, Reason: reason, Message: message})
+	return nil
+}
+
+func (l *eventLog) reasons() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.events))
+	for _, e := range l.events {
+		out = append(out, e.Reason)
+	}
+	return out
+}
+
+// A normal life must read forward in the event log: provisioning steps in
+// order, then the terminal phase, then the session capture settles in the
+// same tick that observed the exit — the history `px events NAME` prints.
+func TestEventsFollowLifecycle(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	var log eventLog
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+
+	runOnce(ctl) // Pending -> Running
+	prov.mu.Lock()
+	prov.exits[100] = 0
+	prov.mu.Unlock()
+	runOnce(ctl) // Running -> Succeeded
+
+	want := []string{"Provisioning", "Scheduled", "Running", "Succeeded", "SessionSaved"}
+	if got := log.reasons(); !slices.Equal(got, want) {
+		t.Fatalf("reasons = %v, want %v", got, want)
+	}
+}
+
+// A provision failure records ProvisionFailed (and bumps the counter);
+// the failure path must not leave a half-ordered history behind.
+func TestEventsOnProvisionFailure(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{createErr: context.DeadlineExceeded}
+	_ = st.UpsertTask(testTask(0))
+	var log eventLog
+	met := &metrics.Metrics{}
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+	ctl.Metrics = met
+
+	runOnce(ctl)
+
+	if got := met.ProvisionFails.Load(); got != 1 {
+		t.Fatalf("ProvisionFails = %d, want 1", got)
+	}
+	got := log.reasons()
+	if len(got) == 0 || got[len(got)-1] != "ProvisionFailed" {
+		t.Fatalf("want ProvisionFailed last, got %v", got)
+	}
+	for i, r := range got[:len(got)-1] {
+		if r == "ProvisionFailed" {
+			t.Fatalf("ProvisionFailed recorded twice (index %d): %v", i, got)
+		}
+	}
+}
+
+// Suspend and resume each leave one request event plus one settle event,
+// in that order — the request lands before the freeze reconcile observes.
+func TestEventsOnSuspendResume(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	var log eventLog
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestSuspend("t1", v1alpha1.TaskRunning); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // freeze
+	runOnce(ctl) // confirm on the next tick -> Suspended
+	if err := ctl.RequestResume("t1", v1alpha1.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // thaw
+	runOnce(ctl) // confirm on the next tick -> Running
+
+	want := []string{"Provisioning", "Scheduled", "Running", "SuspendRequested", "Suspended", "ResumeRequested", "Resumed"}
+	if got := log.reasons(); !slices.Equal(got, want) {
+		t.Fatalf("reasons = %v, want %v", got, want)
+	}
+}
+
+// The delete request is recorded before the deletion mark lands: once
+// marked, a concurrent reconcile can destroy the task before the record
+// runs, and events for a vanished task are dropped — the request would
+// leave no trace at all.
+func TestEventsOnDeleteRequest(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	var log eventLog
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Events = &log
+
+	runOnce(ctl) // -> Running
+	if err := ctl.RequestDestroy("t1"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce(ctl) // destroy + drop the record (the destroy tick also saves the session)
+
+	// The event log is a recorder-side slice: Deleting and SessionSaved
+	// survive the task record's own deletion.
+	want := []string{"Provisioning", "Scheduled", "Running", "Deleting", "SessionSaved"}
+	if got := log.reasons(); !slices.Equal(got, want) {
+		t.Fatalf("reasons = %v, want %v", got, want)
+	}
+}
+
+// The tick metrics count every reconcile pass and its wall time, and a
+// nil Events/Metrics wiring (the default for tests) keeps reconciling
+// silent and unharmed.
+func TestMetricsAndNilWiring(t *testing.T) {
+	st := newMemStore()
+	prov := &fakeProv{exits: map[int]int{}}
+	_ = st.UpsertTask(testTask(0))
+	met := &metrics.Metrics{}
+	ctl := New(st, prov, slog.New(slog.DiscardHandler))
+	ctl.Metrics = met
+
+	runOnce(ctl)
+	runOnce(ctl)
+	if got := met.TickCount.Load(); got != 2 {
+		t.Fatalf("TickCount = %d, want 2", got)
+	}
+	if met.TickNanos.Load() < 0 {
+		t.Fatalf("TickNanos went negative: %d", met.TickNanos.Load())
+	}
+
+	// nil Events (the store-less default): the same reconcile runs with
+	// no recorder attached, which must stay quiet and unharmed.
+	runOnce(ctl)
+	if task := get(t, st, "t1"); task.Status.Phase != v1alpha1.TaskRunning {
+		t.Fatalf("nil Events must not disturb reconcile, got %s", task.Status.Phase)
 	}
 }

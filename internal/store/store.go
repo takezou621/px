@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -66,6 +67,14 @@ func Open(path string) (*Store, error) {
 			data BLOB NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS events (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			task TEXT NOT NULL,
+			ts TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			message TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_task ON events (task, seq)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			return nil, fmt.Errorf("migrate: %w", err)
@@ -193,6 +202,11 @@ func (s *Store) CreateTask(t *v1alpha1.Task) error {
 	if _, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, t.Metadata.Name); err != nil {
 		return fmt.Errorf("clear stale session row for %s: %w", t.Metadata.Name, err)
 	}
+	// Same shape as the session row above: a predecessor's orphaned events
+	// must not read as the new task's history.
+	if _, err := s.db.Exec(`DELETE FROM events WHERE task = ?`, t.Metadata.Name); err != nil {
+		return fmt.Errorf("clear stale events for %s: %w", t.Metadata.Name, err)
+	}
 	return nil
 }
 
@@ -218,15 +232,25 @@ func (s *Store) ListTasks() ([]*v1alpha1.Task, error) {
 	return tasks, rows.Err()
 }
 
+// DeleteTask drops a task and its events in one transaction: torn halves
+// would leave orphan events that nothing ever cleans up (they'd surface in
+// the cross-task feed as history for a task that doesn't exist).
 func (s *Store) DeleteTask(name string) error {
-	res, err := s.db.Exec(`DELETE FROM tasks WHERE name = ?`, name)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.InTx(func(tx *Store) error {
+		res, err := tx.db.Exec(`DELETE FROM tasks WHERE name = ?`, name)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		// Events die with the task: they describe one record's life, and the
+		// delete is the record's end. Same idempotent shape as DeleteSession.
+		if _, err := tx.db.Exec(`DELETE FROM events WHERE task = ?`, name); err != nil {
+			return fmt.Errorf("drop events for %s: %w", name, err)
+		}
+		return nil
+	})
 }
 
 func (s *Store) UpsertWorkspace(w *v1alpha1.Workspace) error {
@@ -392,6 +416,102 @@ func (s *Store) GetSession(task string) ([]byte, error) {
 func (s *Store) DeleteSession(task string) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE task = ?`, task)
 	return err
+}
+
+// maxEventMessageBytes caps one event's message: a message is a summary
+// written by the controller, and a runaway error string (say, an embedded
+// panic dump) must not bloat the events table.
+const maxEventMessageBytes = 4096
+
+// RecordEvent appends one event for a task and prunes the task's history
+// down to v1alpha1.MaxTaskEvents (newest kept). Both statements run per
+// call rather than in a transaction: the prune is keyed on this INSERT's
+// own task, so a concurrent record only makes the prune slightly late.
+// The insert only lands when the task still exists; recording against a
+// deleted task is a silent no-op, not an error.
+func (s *Store) RecordEvent(task string, at time.Time, reason, message string) error {
+	if len(message) > maxEventMessageBytes {
+		// Back off to a rune boundary so the stored text stays valid UTF-8
+		// (JSON marshaling would otherwise swap the torn bytes for U+FFFD).
+		cut := maxEventMessageBytes
+		for cut > 0 && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		message = message[:cut]
+	}
+	// Conditional insert: a task delete can race an in-flight record (the
+	// controller records around the Mark* transitions), and the foreign key
+	// added here wouldn't retrofit onto an existing database anyway. An
+	// event whose task is gone must not become an orphan row; dropping the
+	// write silently is correct — the task's history died with it.
+	res, err := s.db.Exec(`INSERT INTO events (task, ts, reason, message)
+		SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM tasks WHERE name = ?)`,
+		task, at.UTC().Format(time.RFC3339Nano), reason, message, task)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil
+	}
+	_, err = s.db.Exec(`DELETE FROM events WHERE task = ? AND seq NOT IN
+		(SELECT seq FROM events WHERE task = ? ORDER BY seq DESC LIMIT ?)`,
+		task, task, v1alpha1.MaxTaskEvents)
+	return err
+}
+
+// ListTaskEvents returns one task's events, newest first.
+func (s *Store) ListTaskEvents(task string) ([]*v1alpha1.Event, error) {
+	rows, err := s.db.Query(`SELECT task, ts, reason, message FROM events WHERE task = ? ORDER BY seq DESC`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+// ListEvents returns up to limit recent events across all tasks, newest
+// first — the feed behind GET /v1/events.
+func (s *Store) ListEvents(limit int) ([]*v1alpha1.Event, error) {
+	rows, err := s.db.Query(`SELECT task, ts, reason, message FROM events ORDER BY seq DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+// CountEvents returns the number of stored events (all tasks).
+func (s *Store) CountEvents() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&n)
+	return n, err
+}
+
+func scanEvents(rows *sql.Rows) ([]*v1alpha1.Event, error) {
+	var evs []*v1alpha1.Event
+	for rows.Next() {
+		var ev v1alpha1.Event
+		var ts string
+		if err := rows.Scan(&ev.Task, &ts, &ev.Reason, &ev.Message); err != nil {
+			return nil, err
+		}
+		t, err := time.Parse(time.RFC3339Nano, ts)
+		if err != nil {
+			return nil, fmt.Errorf("event ts %q: %w", ts, err)
+		}
+		ev.Time = t
+		evs = append(evs, &ev)
+	}
+	return evs, rows.Err()
+}
+
+// SessionBytesTotal sums every captured session archive — the gauge behind
+// px_sessions_bytes, the one number showing how much of the store is
+// conversation history.
+func (s *Store) SessionBytesTotal() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(LENGTH(data)), 0) FROM sessions`).Scan(&n)
+	return n, err
 }
 
 type rowScanner interface{ Scan(dest ...any) error }

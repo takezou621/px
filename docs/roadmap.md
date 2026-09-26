@@ -198,6 +198,41 @@ requirements as a published contract — scope:
   named in the reason, and a user-authored minimal template built
   per the contract doc lists as PX-OK.
 
+## M10 — Observability: task events & metrics
+
+Chosen 2026-09-26 after M9 (candidates: observability, named sessions,
+scheduled tasks, session capture streaming) — the fourth time
+observability reached the shortlist. M3–M9's live debugging kept hitting
+the same wall: a task's path to ProvisionFailed exists only in
+px-server's stderr log. The record says what phase a task is in now, not
+how it got there — how many retries, which tick scheduled it onto which
+node, when the session was captured. Scope:
+
+- [x] `events` table in the store: (task, ts, reason, message) rows
+  written by the controller at phase transitions and the operational
+  moments around them (node scheduling, session capture, destroy-guard
+  refusal, TTL cleanup). Capped per task (newest N kept) and dropped
+  when the source task is deleted; never carried in Task Status (it is
+  re-persisted every tick — the M8 lesson).
+- [x] `GET /v1/tasks/{name}/events` and `GET /v1/events`; CLI `px
+  events` (cluster-wide; both endpoints return newest first, the CLI
+  prints oldest first so a history reads forward) and an Events section
+  in `px describe task`.
+- [x] `GET /v1/metrics`: hand-written Prometheus text (no client
+  library — single-binary axis) covering task counts by phase,
+  reconcile tick duration, store size, and event totals. Protected
+  like every other route when -token-file is set; task names never
+  appear.
+- [x] CLI `px metrics` (prints the server's metrics text).
+- [x] Unit tests: event round-trip + cap + delete cascade, events on
+  the transition paths, metrics text shape, handlers.
+- [x] E2E on the real node: a task's transitions appear as events in
+  order, a ProvisionFailed carries its reason, delete drops the
+  task's events, /metrics has the right shape.
+
+Explicitly out: distributed tracing, log aggregation, events in `px
+watch`, a Prometheus client dependency.
+
 ## M6 — First-class agent runtime (done)
 
 Chosen 2026-09-26 from four candidates (agent runtime, port exposure,
@@ -309,7 +344,7 @@ rather than add new surfaces. Order: workspace deletion first (user-visible
 - [x] `px.io/v1alpha1` types (Task, Workspace)
 - [x] Manifest parsing + validation
 
-## M1 — Single task on one node (MVP)
+## M1 — Single task on one node (MVP, done)
 
 Goal: `px apply` a Task and watch it run in an LXC container.
 
@@ -370,7 +405,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     json.Decoder (no 1 MiB line cap), and an empty snapshot keeps waiting
     so a watch started before `px apply` still works.
 
-## M3 — Sandbox hardening
+## M3 — Sandbox hardening (done)
 
 - [x] SSH host key pinning (today the first-seen key is accepted unverified)
   - Design: opt-in pinning, same shape as the M2 token auth. `-ssh-host-key F`
@@ -546,7 +581,7 @@ Goal: `px apply` a Task and watch it run in an LXC container.
     root SSH as the largest credential (pin it); destroy guards keep px's
     blast radius to containers it named.
 
-## M4 — Beyond one node
+## M4 — Beyond one node (done)
 
 - [x] `px exec` (run a debug command in a running task's container)
   - Design: `px exec NAME -- COMMAND [ARG...]` posts to

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kawai/px/internal/controller"
+	"github.com/kawai/px/internal/metrics"
 	"github.com/kawai/px/internal/proxmox"
 	"github.com/kawai/px/internal/server"
 	"github.com/kawai/px/internal/sshexec"
@@ -102,14 +103,20 @@ func main() {
 	}
 
 	prov := controller.NewProvisioner(pve, nodePVE, sshPool, *pveNode)
+	met := &metrics.Metrics{}
 	ctl := controller.New(st, prov, log)
 	ctl.Tick = *interval
+	ctl.Metrics = met
+	ctl.Events = st
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go ctl.Run(ctx)
 
-	handler := server.New(st, ctl, prov, log).Handler()
+	srv := server.New(st, ctl, prov, log)
+	srv.Metrics = met
+	srv.DBPath = *dbPath
+	handler := srv.Handler()
 	if *tokenFile != "" {
 		token, err := loadToken(*tokenFile)
 		if err != nil {
@@ -120,7 +127,7 @@ func main() {
 		log.Info("api token auth enabled", "token-file", *tokenFile)
 	}
 
-	srv := &http.Server{
+	httpSrv := &http.Server{
 		Addr:              *listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -129,7 +136,7 @@ func main() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
 	if *pveNode != "" {
@@ -137,7 +144,7 @@ func main() {
 	} else {
 		log.Info("px-server listening", "addr", *listen, "mode", "cluster")
 	}
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("server", "err", err)
 		os.Exit(1)
 	}

@@ -250,6 +250,23 @@ type PortStatus struct {
 	HostPort int    `json:"hostPort" yaml:"hostPort"`
 }
 
+// Event is one observed transition or operational moment in a task's life:
+// what phase it entered and why, that a schedule landed on a node, that a
+// session capture settled. Events live in their own store table and never
+// ride Task Status, which is re-persisted every reconcile tick.
+type Event struct {
+	Task    string    `json:"task" yaml:"task"`
+	Time    time.Time `json:"time" yaml:"time"`
+	Reason  string    `json:"reason" yaml:"reason"`
+	Message string    `json:"message" yaml:"message"`
+}
+
+// MaxTaskEvents caps the rows kept per task (newest kept). The controller
+// records every tick's observations only when something changed, so a task
+// stays far under this over a normal life; the cap exists so a pathological
+// loop cannot grow the database unbounded.
+const MaxTaskEvents = 200
+
 var nameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 // userRe accepts a container user name or a numeric uid (passed to pct exec).

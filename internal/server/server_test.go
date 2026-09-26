@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/kawai/px/internal/apis/v1alpha1"
 	"github.com/kawai/px/internal/controller"
+	"github.com/kawai/px/internal/metrics"
 	"github.com/kawai/px/internal/store"
 )
 
@@ -916,5 +920,249 @@ func TestListTemplatesPVEUnreachable(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status %d, want 502 (the PVE side is down, not px)", resp.StatusCode)
+	}
+}
+
+// newObsServer wires the observability path the way px-server main does:
+// the controller records into the same store the API reads, with live
+// metrics and a real on-disk database behind px_store_bytes.
+func newObsServer(t *testing.T) (*httptest.Server, *store.Store, *metrics.Metrics, *controller.Controller) {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/px.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	met := &metrics.Metrics{}
+	ctl := controller.New(st, nopProv{}, slog.New(slog.DiscardHandler))
+	ctl.Events = st
+	ctl.Metrics = met
+	srv := New(st, ctl, nopProv{}, slog.New(slog.DiscardHandler))
+	srv.Metrics = met
+	srv.DBPath = "" // no store gauge unless px-server passes its db path
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, st, met, ctl
+}
+
+func TestTaskEventsEndpoint(t *testing.T) {
+	ts, st, _, _ := newObsServer(t)
+
+	resp, err := http.Post(ts.URL+"/v1/apply", "application/yaml", strings.NewReader(manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// A real task with no history must read as an explicit empty list.
+	body := getBody(t, ts, "/v1/tasks/t1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(body) != "[]" {
+		t.Fatalf("want [], got %s", body)
+	}
+
+	base := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	if err := st.RecordEvent("t1", base, "Provisioning", "cloning"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordEvent("t1", base.Add(time.Second), "Running", "runner started"); err != nil {
+		t.Fatal(err)
+	}
+	body = getBody(t, ts, "/v1/tasks/t1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evs []v1alpha1.Event
+	if err := json.Unmarshal([]byte(body), &evs); err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 2 || evs[0].Reason != "Running" || evs[1].Reason != "Provisioning" {
+		t.Fatalf("want newest-first history, got %+v", evs)
+	}
+	if evs[0].Time.IsZero() || evs[0].Task != "t1" {
+		t.Fatalf("event JSON not round-tripped: %+v", evs[0])
+	}
+
+	// A mistyped name must not read as an empty history.
+	if code, _ := getStatus(t, ts, "/v1/tasks/nope/events"); code != http.StatusNotFound {
+		t.Fatalf("unknown task: want 404, got %d", code)
+	}
+}
+
+func TestEventsFeedLimit(t *testing.T) {
+	ts, st, _, _ := newObsServer(t)
+
+	// RecordEvent only lands for tasks that exist (an event must not
+	// outlive or predate its record), so create the task the events
+	// describe.
+	resp, err := http.Post(ts.URL+"/v1/apply", "application/yaml", strings.NewReader(manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	base := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if err := st.RecordEvent("t1", base.Add(time.Duration(i)*time.Second), "R", "m"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := getBody(t, ts, "/v1/events")
+	var evs []v1alpha1.Event
+	if err := json.Unmarshal([]byte(body), &evs); err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 3 || evs[0].Reason != "R" {
+		t.Fatalf("feed must carry all recent events newest first, got %+v", evs)
+	}
+
+	body = getBody(t, ts, "/v1/events?limit=2")
+	evs = nil
+	if err := json.Unmarshal([]byte(body), &evs); err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("limit=2 must return the 2 newest, got %d", len(evs))
+	}
+
+	for _, q := range []string{"?limit=0", "?limit=-1", "?limit=abc", "?limit=1001", "?limit="} {
+		if code, _ := getStatus(t, ts, "/v1/events"+q); code != http.StatusBadRequest {
+			t.Fatalf("%s: want 400, got %d", q, code)
+		}
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	ts, _, _, ctl := newObsServer(t)
+
+	resp, err := http.Post(ts.URL+"/v1/apply", "application/yaml", strings.NewReader(manifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	ctl.ReconcileOnce(context.Background())
+
+	res, err := http.Get(ts.URL + "/v1/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", ct)
+	}
+	text, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(text)
+
+	// Every phase appears exactly once, zero-filled, and the live task
+	// counts under its own phase.
+	for _, p := range taskPhases {
+		if got := strings.Count(out, fmt.Sprintf("px_tasks{phase=%q} ", string(p))); got != 1 {
+			t.Fatalf("px_tasks{phase=%q} appears %d times, want exactly 1 in:\n%s", p, got, out)
+		}
+	}
+	if !strings.Contains(out, `px_tasks{phase="Running"} 1`) {
+		t.Fatalf("the applied task must count under its reconciled phase:\n%s", out)
+	}
+	if !strings.Contains(out, "px_reconcile_tick_seconds_count") || !strings.Contains(out, "px_reconcile_tick_seconds_sum") {
+		t.Fatalf("tick counters missing:\n%s", out)
+	}
+	// The sum is in seconds; a regression to raw nanoseconds reads in the
+	// 1e9s, and a test run reconciles for far less than a minute.
+	var tickSum float64
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "px_reconcile_tick_seconds_sum "); ok {
+			tickSum, _ = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		}
+	}
+	if tickSum < 0 || tickSum >= 60 {
+		t.Fatalf("px_reconcile_tick_seconds_sum = %g, want a seconds-valued number near 0", tickSum)
+	}
+	if !strings.Contains(out, "px_events ") {
+		t.Fatalf("px_events gauge missing:\n%s", out)
+	}
+}
+
+// A server built without a Metrics (px-server wires it, but nothing in New
+// requires it) must still scrape, zero-filled — not 500.
+func TestMetricsEndpointWithoutMetrics(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/px.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctl := controller.New(st, nopProv{}, slog.New(slog.DiscardHandler))
+	srv := New(st, ctl, nopProv{}, slog.New(slog.DiscardHandler))
+	srv.DBPath = ""
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	body := getBody(t, ts, "/v1/metrics")
+	if !strings.Contains(body, "px_reconcile_tick_seconds_count 0") {
+		t.Fatalf("nil Metrics must render zero-filled:\n%s", body)
+	}
+}
+
+// getBody issues a GET and returns the body; a >=400 status fails the test
+// unless the caller opts out via getStatus.
+func getBody(t *testing.T, ts *httptest.Server, path string) string {
+	t.Helper()
+	res, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode >= 400 {
+		t.Fatalf("GET %s: %d: %s", path, res.StatusCode, data)
+	}
+	return string(data)
+}
+
+// getStatus returns just the status code, for tests asserting the error
+// shape rather than the body.
+func getStatus(t *testing.T, ts *httptest.Server, path string) (int, string) {
+	t.Helper()
+	res, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	data, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(data)
+}
+
+// storeBytes backs px_store_bytes: empty path or no database file on disk
+// omits the gauge; a real database sums db + wal + shm.
+func TestStoreBytes(t *testing.T) {
+	if _, ok := storeBytes(""); ok {
+		t.Fatal("empty path must omit the gauge")
+	}
+	if _, ok := storeBytes(t.TempDir() + "/absent.db"); ok {
+		t.Fatal("an absent database must omit the gauge")
+	}
+	dir := t.TempDir()
+	sizes := map[string]int{"px.db": 4, "px.db-wal": 2, "px.db-shm": 1}
+	want := 0
+	for name, size := range sizes {
+		if err := os.WriteFile(dir+"/"+name, bytes.Repeat([]byte("x"), size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		want += size
+	}
+	n, ok := storeBytes(dir + "/px.db")
+	if !ok || n != int64(want) {
+		t.Fatalf("storeBytes = %d ok=%v, want %d", n, ok, want)
 	}
 }
